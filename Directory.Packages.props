@@ -1,0 +1,19 @@
+﻿<Project>
+	<PropertyGroup>
+		<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+		<CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+		<!-- Using multiple feeds isn't supported by Maestro: https://github.com/dotnet/arcade/issues/14155. -->
+		<NoWarn>$(NoWarn);NU1507</NoWarn>
+	</PropertyGroup>
+
+	<ItemGroup>
+		
+	</ItemGroup>
+
+	<ItemGroup>
+	  <PackageVersion Include="EtabSharp" Version="0.2.0-beta" />
+	  <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.1" />
+	  <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.1" />
+	  <PackageVersion Include="System.CommandLine" Version="2.0.1" />
+	</ItemGroup>
+</Project>
