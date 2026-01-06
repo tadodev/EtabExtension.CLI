@@ -26,6 +26,13 @@ public static class ValidateCommand
         {
             var file = parseResult.GetValue(fileOption);
 
+            if (string.IsNullOrEmpty(file))
+            {
+                Console.WriteLine("Error: --file option is required");
+                Environment.Exit(1);
+                return;
+            }
+
             var service = services.GetRequiredService<IValidationService>();
             var result = await service.ValidateAsync(file);
 
