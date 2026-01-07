@@ -20,12 +20,13 @@ public class EtabsApiGenerateE2KFile : IEtabsApiGenerateE2KFile
         _fileOperations = fileOperations;
     }
 
-    public async Task<bool> GenerateE2KFileAsync(string edbFilePath, string e2KOutputPath)
+    public async Task<bool> GenerateE2KFileAsync(string edbFilePath, string e2kOutputPath)
     {
         await Task.CompletedTask;
 
         try
         {
+            // Ensure connected to ETABS
             if (!_connection.IsConnected)
             {
                 var connected = await _connection.TryConnectAsync();
@@ -38,11 +39,12 @@ public class EtabsApiGenerateE2KFile : IEtabsApiGenerateE2KFile
                 return false;
             }
 
-            // Ensure file is open
+            // Check if file is already open
             var isOpen = await _fileOperations.IsFileOpenAsync(edbFilePath);
 
             if (!isOpen)
             {
+                // Open the file first
                 var openResult = await _fileOperations.OpenModelAsync(edbFilePath);
                 if (!openResult.Success)
                 {
@@ -50,11 +52,24 @@ public class EtabsApiGenerateE2KFile : IEtabsApiGenerateE2KFile
                 }
             }
 
+            // Ensure output directory exists
+            var outputDirectory = Path.GetDirectoryName(e2kOutputPath);
+            if (!string.IsNullOrEmpty(outputDirectory) && !Directory.Exists(outputDirectory))
+            {
+                Directory.CreateDirectory(outputDirectory);
+            }
+
             // Export to .e2k format using TextFile type
             // According to ETABS API: eFileTypeIO.TextFile exports to .e2k format
-            int exportRet = app.Model.Files.ExportFile(e2KOutputPath, eFileTypeIO.TextFile);
+            int exportRet = app.Model.Files.ExportFile(e2kOutputPath, eFileTypeIO.TextFile);
 
-            return exportRet == 0;
+            // Verify the file was created
+            if (exportRet == 0 && File.Exists(e2kOutputPath))
+            {
+                return true;
+            }
+
+            return false;
         }
         catch
         {

@@ -1,4 +1,5 @@
 ﻿using System.CommandLine;
+using EtabExtension.CLI.Features.GenerateE2K;
 using EtabExtension.CLI.Features.Validation;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using Microsoft.Extensions.Hosting;
@@ -10,6 +11,7 @@ builder.Services.AddEtabsInfrastructure();
 
 //Register features
 builder.Services.AddValidationFeature();
+builder.Services.AddGenerateE2KFeature();
 
 var app = builder.Build();
 
@@ -21,5 +23,6 @@ var rootCommand = new RootCommand("EtabExtension.CLI - Etabs Automation CLI")
 
 // Add all feature commands
 rootCommand.Subcommands.Add(ValidateCommand.Create(app.Services));
+rootCommand.Subcommands.Add(GenerateE2KCommand.Create(app.Services));
 
 return await rootCommand.Parse(args).InvokeAsync();

@@ -18,9 +18,9 @@ public static class EtabsExtensions
         services.AddSingleton<IEtabsFileOperations, EtabsFileOperations.EtabsFileOperations>();
         
         // Register feature-specific implementations
-        services.AddSingleton<IEtabsApiValidation, EtabsApiValidation>();
-        services.AddSingleton<IEtabsApiGenerateE2KFile, EtabsApiGenerateE2KFile>();
-        services.AddSingleton<IEtabsApiExportResults, EtabsApiExportResults>();
+        services.AddScoped<IEtabsApiValidation, EtabsApiValidation>();
+        services.AddScoped<IEtabsApiGenerateE2KFile, EtabsApiGenerateE2KFile>();
+        services.AddScoped<IEtabsApiExportResults, EtabsApiExportResults>();
         
         return services;
     }
