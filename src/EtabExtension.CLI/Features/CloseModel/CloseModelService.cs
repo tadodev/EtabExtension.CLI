@@ -41,33 +41,64 @@ public class CloseModelService : ICloseModelService
 
     private static Result<CloseModelData> CloseOnApp(ETABSApplication app, bool save)
     {
-            var currentPath = app.Model.ModelInfo.GetModelFilepath();
-            var hasFile = !string.IsNullOrEmpty(currentPath);
+        var currentPath = app.Model.ModelInfo.GetModelFilepath();
+        var hasFile = !string.IsNullOrWhiteSpace(currentPath);
 
-            Console.Error.WriteLine($"ℹ Currently open: {(hasFile ? Path.GetFileName(currentPath) : "(none)")}");
+        Console.Error.WriteLine($"ℹ Currently open: {(hasFile ? Path.GetFileName(currentPath) : "(none)")}");
 
-            if (save && hasFile)
+        return CompleteClose(
+            currentPath,
+            save,
+            path =>
             {
                 Console.Error.WriteLine("ℹ Saving...");
-                int saveRet = app.Model.Files.SaveFile(currentPath!);
-                if (saveRet != 0)
-                    Console.Error.WriteLine($"⚠ Save returned {saveRet} — continuing");
-                else
+                var saveRet = app.Model.Files.SaveFile(path);
+                if (saveRet == 0)
+                {
                     Console.Error.WriteLine("✓ Saved");
-            }
-
-            // InitializeNewModel() confirmed: clears workspace without triggering
-            // Save dialog even on modified models. Rust decides save/no-save.
-            int initRet = app.Model.ModelInfo.InitializeNewModel(eUnits.kip_ft_F);
-            if (initRet != 0)
-                return Result.Fail<CloseModelData>($"InitializeNewModel failed (ret={initRet})");
-
-            Console.Error.WriteLine("✓ Workspace cleared");
-
-            return Result.Ok(new CloseModelData
+                }
+                return saveRet;
+            },
+            units =>
             {
-                ClosedFilePath = hasFile ? currentPath : null,
-                WasSaved = save && hasFile
+                // InitializeNewModel() confirmed: clears workspace without triggering
+                // Save dialog even on modified models. Rust decides save/no-save.
+                var initRet = app.Model.ModelInfo.InitializeNewModel(units);
+                if (initRet == 0)
+                {
+                    Console.Error.WriteLine("✓ Workspace cleared");
+                }
+                return initRet;
             });
+    }
+
+    internal static Result<CloseModelData> CompleteClose(
+        string? currentPath,
+        bool save,
+        Func<string, int> saveFile,
+        Func<eUnits, int> initializeNewModel)
+    {
+        var hasFile = !string.IsNullOrWhiteSpace(currentPath);
+        if (save && hasFile)
+        {
+            var saveRet = saveFile(currentPath!);
+            if (saveRet != 0)
+            {
+                return Result.Fail<CloseModelData>(
+                    $"SaveFile failed (ret={saveRet}); model remains open");
+            }
+        }
+
+        var initRet = initializeNewModel(eUnits.kip_ft_F);
+        if (initRet != 0)
+        {
+            return Result.Fail<CloseModelData>($"InitializeNewModel failed (ret={initRet})");
+        }
+
+        return Result.Ok(new CloseModelData
+        {
+            ClosedFilePath = hasFile ? currentPath : null,
+            WasSaved = save && hasFile
+        });
     }
 }
