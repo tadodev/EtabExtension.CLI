@@ -89,9 +89,30 @@ public sealed class ServeOperationDispatcherTests : IDisposable
 
         Assert.True(response.Data!.IsRunning);
         Assert.Equal(42, response.Data.Pid);
+        Assert.Equal(EtabsInstanceOwnership.Managed, response.Data.Ownership);
+        Assert.Equal([42], response.Data.ObservedPids);
         Assert.Equal(0, session.GetOrStartCalls);
         release.SetResult();
         await _manager.WaitAsync(started.Data!.OperationId, TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Get_status_reports_external_process_without_touching_com()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession(isStarted: false, processId: null);
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            new FakeProcesses(new EtabsProcessObservation([Identity(99)], 0)));
+
+        var response = Assert.IsType<Result<GetStatusData>>(await dispatcher.DispatchAsync(
+            "get-status", null, TestContext.Current.CancellationToken));
+
+        Assert.True(response.Data!.IsRunning);
+        Assert.Equal(EtabsInstanceOwnership.External, response.Data.Ownership);
+        Assert.Equal([99], response.Data.ObservedPids);
+        Assert.Equal(0, session.GetOrStartCalls);
     }
 
     [Fact]
@@ -163,7 +184,8 @@ public sealed class ServeOperationDispatcherTests : IDisposable
 
     private static ServeDispatcher CreateDispatcher(
         IOperationManager operations,
-        IEtabsSession? session = null) => new(
+        IEtabsSession? session = null,
+        IProcessInspector? processes = null) => new(
             session ?? null!,
             null!,
             null!,
@@ -178,7 +200,8 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             null!,
             null!,
             operations,
-            new CachedSessionStatus());
+            new CachedSessionStatus(),
+            processes ?? new FakeProcesses(new EtabsProcessObservation([], 0)));
 
     private static JsonElement Json(string value) => JsonSerializer.Deserialize<JsonElement>(value);
 
@@ -198,11 +221,16 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             execute(payload, context);
     }
 
-    private sealed class FakeSession : IEtabsSession
+    private static ManagedProcessIdentity Identity(int pid) => new(
+        pid,
+        new DateTimeOffset(2026, 8, 9, 1, 2, pid % 60, TimeSpan.Zero),
+        $@"C:\ETABS-{pid}\ETABS.exe");
+
+    private sealed class FakeSession(bool isStarted = true, int? processId = 42) : IEtabsSession
     {
         public int GetOrStartCalls { get; private set; }
-        public bool IsStarted => true;
-        public int? ProcessId => 42;
+        public bool IsStarted => isStarted;
+        public int? ProcessId => processId;
         public ETABSApplication GetOrStart()
         {
             GetOrStartCalls++;
@@ -211,5 +239,14 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
         public void Shutdown() { }
         public void Dispose() { }
+    }
+
+    private sealed class FakeProcesses(EtabsProcessObservation observation) : IProcessInspector
+    {
+        public EtabsProcessObservation ObserveEtabs() => observation;
+        public ManagedProcessIdentity? Find(int pid) =>
+            observation.Identified.FirstOrDefault(identity => identity.Pid == pid);
+        public void Terminate(int pid) => throw new NotSupportedException();
+        public bool WaitForExit(int pid, TimeSpan timeout) => throw new NotSupportedException();
     }
 }

@@ -44,6 +44,7 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly ISessionRecordStore _sessionRecords;
     private readonly IOperationManager _operations;
     private readonly ICachedSessionStatus _cachedStatus;
+    private readonly IProcessInspector _processes;
 
     public ServeDispatcher(
         IEtabsSession session,
@@ -60,7 +61,8 @@ public sealed class ServeDispatcher : IServeDispatcher
         IEtabsInspectionApiFactory inspectionApiFactory,
         ISessionRecordStore sessionRecords,
         IOperationManager operations,
-        ICachedSessionStatus cachedStatus)
+        ICachedSessionStatus cachedStatus,
+        IProcessInspector processes)
     {
         _session = session;
         _status = status;
@@ -77,6 +79,7 @@ public sealed class ServeDispatcher : IServeDispatcher
         _sessionRecords = sessionRecords;
         _operations = operations;
         _cachedStatus = cachedStatus;
+        _processes = processes;
     }
 
     public async Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
@@ -92,9 +95,11 @@ public sealed class ServeDispatcher : IServeDispatcher
                 }
                 return await _operations.ExecuteSynchronousAsync(() =>
                 {
+                    var observation = _processes.ObserveEtabs();
                     var current = _session.IsStarted
                         ? _status.GetStatusOnApp(_session.GetOrStart(), _session.ProcessId)
-                        : Result.Ok(new GetStatusData { IsRunning = false });
+                        : Result.Ok(new GetStatusData());
+                    current = DecorateStatus(current, observation, _session.ProcessId);
                     _cachedStatus.Update(current);
                     return Task.FromResult<object>(current);
                 });
@@ -248,4 +253,36 @@ public sealed class ServeDispatcher : IServeDispatcher
             ? Task.FromResult<object>(Result.Fail(
                 "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"))
             : _operations.ExecuteSynchronousAsync(action);
+
+    private static Result<GetStatusData> DecorateStatus(
+        Result<GetStatusData> status,
+        EtabsProcessObservation observation,
+        int? managedPid)
+    {
+        if (!status.Success || status.Data is null)
+        {
+            return status;
+        }
+
+        var ownership = EtabsOwnershipResolver.Resolve(observation, managedPid);
+        if (managedPid.HasValue && ownership == EtabsInstanceOwnership.None)
+        {
+            ownership = EtabsInstanceOwnership.Ambiguous;
+        }
+        var observedPids = observation.Identified
+            .Select(identity => identity.Pid)
+            .Distinct()
+            .Order()
+            .ToList();
+
+        return Result.Ok(status.Data with
+        {
+            IsRunning = ownership != EtabsInstanceOwnership.None,
+            Pid = ownership == EtabsInstanceOwnership.External
+                ? observedPids.SingleOrDefault()
+                : managedPid,
+            Ownership = ownership,
+            ObservedPids = observedPids
+        });
+    }
 }

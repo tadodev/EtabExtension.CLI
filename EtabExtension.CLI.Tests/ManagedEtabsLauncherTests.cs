@@ -1,3 +1,4 @@
+using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
 using Microsoft.Extensions.Configuration;
@@ -75,8 +76,8 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         var foreignIdentity = Identity(99);
         var owned = new FakeOwnedProcess(ownedIdentity);
         var processes = new FakeProcesses([
-            [],
-            [ownedIdentity, foreignIdentity]
+            Observation(),
+            Observation(ownedIdentity, foreignIdentity)
         ]);
         var connector = new FakeConnector(succeedOnAttempt: 1);
         var diagnostics = new StringWriter();
@@ -103,7 +104,7 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         var clock = new FakeClock();
         var launcher = CreateLauncher(
             owned,
-            new FakeProcesses([[], [owned.Identity]]),
+            new FakeProcesses([Observation(), Observation(owned.Identity)]),
             connector,
             new StringWriter(),
             clock);
@@ -119,7 +120,7 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
     public void AttachDeadlineFailureKillsAndDisposesOnlyTheOwnedProcess()
     {
         var owned = new FakeOwnedProcess(Identity(42));
-        var processes = new FakeProcesses([[], [Identity(99)]]);
+        var processes = new FakeProcesses([Observation(), Observation(Identity(99))]);
         var connector = new FakeConnector(succeedOnAttempt: null);
         var launcher = CreateLauncher(owned, processes, connector, new StringWriter());
 
@@ -131,6 +132,62 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         Assert.Equal(1, owned.WaitForExitCount);
         Assert.Equal(1, owned.DisposeCount);
         Assert.Empty(processes.TerminatedPids);
+    }
+
+    [Fact]
+    public void OwnershipResolverClassifiesObservedProcesses()
+    {
+        Assert.Equal(
+            EtabsInstanceOwnership.None,
+            EtabsOwnershipResolver.Resolve(Observation(), null));
+        Assert.Equal(
+            EtabsInstanceOwnership.External,
+            EtabsOwnershipResolver.Resolve(Observation(Identity(99)), null));
+        Assert.Equal(
+            EtabsInstanceOwnership.Managed,
+            EtabsOwnershipResolver.Resolve(Observation(Identity(42)), 42));
+        Assert.Equal(
+            EtabsInstanceOwnership.Ambiguous,
+            EtabsOwnershipResolver.Resolve(Observation(Identity(42), Identity(99)), 42));
+        Assert.Equal(
+            EtabsInstanceOwnership.Ambiguous,
+            EtabsOwnershipResolver.Resolve(new EtabsProcessObservation([], 1), null));
+    }
+
+    [Fact]
+    public void LaunchRejectsExternalProcessBeforeStartingEtabs()
+    {
+        var owned = new FakeOwnedProcess(Identity(42));
+        var starter = new FakeStarter(owned);
+        var launcher = CreateLauncher(
+            owned,
+            new FakeProcesses([Observation(Identity(99))]),
+            new FakeConnector(succeedOnAttempt: 1),
+            new StringWriter(),
+            starter: starter);
+
+        var error = Assert.Throws<EtabsLaunchException>(() => launcher.Launch());
+
+        Assert.Equal(EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance, error.Code);
+        Assert.Equal(0, starter.StartCount);
+    }
+
+    [Fact]
+    public void LaunchRejectsUnidentifiedProcessBeforeStartingEtabs()
+    {
+        var owned = new FakeOwnedProcess(Identity(42));
+        var starter = new FakeStarter(owned);
+        var launcher = CreateLauncher(
+            owned,
+            new FakeProcesses([new EtabsProcessObservation([], 1)]),
+            new FakeConnector(succeedOnAttempt: 1),
+            new StringWriter(),
+            starter: starter);
+
+        var error = Assert.Throws<EtabsLaunchException>(() => launcher.Launch());
+
+        Assert.Equal(EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance, error.Code);
+        Assert.Equal(0, starter.StartCount);
     }
 
     public void Dispose()
@@ -146,10 +203,11 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         FakeProcesses processes,
         FakeConnector connector,
         TextWriter diagnostics,
-        FakeClock? clock = null) => new(
+        FakeClock? clock = null,
+        FakeStarter? starter = null) => new(
             processes,
             new FixedResolver(@"C:\ETABS\ETABS.exe"),
-            new FakeStarter(owned),
+            starter ?? new FakeStarter(owned),
             connector,
             clock ?? new FakeClock(),
             diagnostics);
@@ -166,6 +224,9 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         pid,
         new DateTimeOffset(2026, 7, 18, 1, 2, pid % 60, TimeSpan.Zero),
         $@"C:\ETABS-{pid}\ETABS.exe");
+
+    private static EtabsProcessObservation Observation(params ManagedProcessIdentity[] identified) =>
+        new(identified, 0);
 
     private sealed class FakeDiscovery(
         IReadOnlyList<string> registry,
@@ -184,11 +245,13 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
     {
         public IOwnedEtabsProcess Start(string executablePath)
         {
+            StartCount++;
             StartedPath = executablePath;
             return process;
         }
 
         public string? StartedPath { get; private set; }
+        public int StartCount { get; private set; }
     }
 
     private sealed class FakeOwnedProcess(ManagedProcessIdentity identity) : IOwnedEtabsProcess
@@ -262,26 +325,26 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
 
     private sealed class FakeProcesses : IProcessInspector
     {
-        private readonly Queue<IReadOnlyList<ManagedProcessIdentity>> _snapshots;
-        private IReadOnlyList<ManagedProcessIdentity> _last = [];
+        private readonly Queue<EtabsProcessObservation> _observations;
+        private EtabsProcessObservation _last = Observation();
 
-        public FakeProcesses(IEnumerable<IReadOnlyList<ManagedProcessIdentity>> snapshots) =>
-            _snapshots = new(snapshots);
+        public FakeProcesses(IEnumerable<EtabsProcessObservation> observations) =>
+            _observations = new(observations);
 
         public List<int> TerminatedPids { get; } = [];
 
-        public IReadOnlyList<ManagedProcessIdentity> SnapshotEtabs()
+        public EtabsProcessObservation ObserveEtabs()
         {
-            if (_snapshots.Count > 0)
+            if (_observations.Count > 0)
             {
-                _last = _snapshots.Dequeue();
+                _last = _observations.Dequeue();
             }
 
             return _last;
         }
 
         public ManagedProcessIdentity? Find(int pid) =>
-            _last.FirstOrDefault(identity => identity.Pid == pid);
+            _last.Identified.FirstOrDefault(identity => identity.Pid == pid);
         public void Terminate(int pid) => TerminatedPids.Add(pid);
         public bool WaitForExit(int pid, TimeSpan timeout) => true;
     }

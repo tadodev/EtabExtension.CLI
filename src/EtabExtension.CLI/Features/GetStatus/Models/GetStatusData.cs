@@ -5,6 +5,14 @@ using System.Text.Json.Serialization;
 
 namespace EtabExtension.CLI.Features.GetStatus.Models;
 
+public enum EtabsInstanceOwnership
+{
+    None,
+    Managed,
+    External,
+    Ambiguous
+}
+
 public record GetStatusData
 {
     [JsonPropertyName("isRunning")]
@@ -12,6 +20,12 @@ public record GetStatusData
 
     [JsonPropertyName("pid")]
     public int? Pid { get; init; }
+
+    [JsonPropertyName("ownership")]
+    public EtabsInstanceOwnership Ownership { get; init; }
+
+    [JsonPropertyName("observedPids")]
+    public IReadOnlyList<int> ObservedPids { get; init; } = [];
 
     [JsonPropertyName("etabsVersion")]
     public string? EtabsVersion { get; init; }

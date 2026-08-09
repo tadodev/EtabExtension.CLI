@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabSharp.Core;
 using Microsoft.Extensions.Configuration;
 
@@ -11,6 +12,32 @@ public sealed record ManagedProcessIdentity(
     int Pid,
     DateTimeOffset ProcessStartTimeUtc,
     string ExecutablePath);
+
+public sealed record EtabsProcessObservation(
+    IReadOnlyList<ManagedProcessIdentity> Identified,
+    int UnidentifiedCount);
+
+public static class EtabsOwnershipResolver
+{
+    public static EtabsInstanceOwnership Resolve(
+        EtabsProcessObservation observation,
+        int? managedPid)
+    {
+        if (observation.UnidentifiedCount > 0 || observation.Identified.Count > 1)
+        {
+            return EtabsInstanceOwnership.Ambiguous;
+        }
+
+        if (observation.Identified.Count == 0)
+        {
+            return EtabsInstanceOwnership.None;
+        }
+
+        return managedPid.HasValue && observation.Identified[0].Pid == managedPid.Value
+            ? EtabsInstanceOwnership.Managed
+            : EtabsInstanceOwnership.External;
+    }
+}
 
 public sealed record ManagedEtabsSessionRecord(
     int SchemaVersion,
@@ -91,7 +118,7 @@ public sealed class JsonSessionRecordStore : ISessionRecordStore
 
 public interface IProcessInspector
 {
-    IReadOnlyList<ManagedProcessIdentity> SnapshotEtabs();
+    EtabsProcessObservation ObserveEtabs();
     ManagedProcessIdentity? Find(int pid);
     void Terminate(int pid);
     bool WaitForExit(int pid, TimeSpan timeout);
@@ -99,12 +126,25 @@ public interface IProcessInspector
 
 public sealed class WindowsProcessInspector : IProcessInspector
 {
-    public IReadOnlyList<ManagedProcessIdentity> SnapshotEtabs() =>
-        Process.GetProcessesByName("ETABS")
-            .Select(TryRead)
-            .Where(identity => identity is not null)
-            .Cast<ManagedProcessIdentity>()
-            .ToList();
+    public EtabsProcessObservation ObserveEtabs()
+    {
+        var identified = new List<ManagedProcessIdentity>();
+        var unidentifiedCount = 0;
+        foreach (var process in Process.GetProcessesByName("ETABS"))
+        {
+            var identity = TryRead(process);
+            if (identity is null)
+            {
+                unidentifiedCount++;
+            }
+            else
+            {
+                identified.Add(identity);
+            }
+        }
+
+        return new(identified, unidentifiedCount);
+    }
 
     public ManagedProcessIdentity? Find(int pid)
     {
@@ -310,42 +350,63 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         }
     }
 
-    private HashSet<int>? CaptureCrossCheckBaseline()
+    private HashSet<int> CaptureCrossCheckBaseline()
     {
+        EtabsProcessObservation observation;
         try
         {
-            return _processes.SnapshotEtabs().Select(identity => identity.Pid).ToHashSet();
+            observation = _processes.ObserveEtabs();
         }
         catch (Exception ex)
         {
-            _diagnostics.WriteLine($"⚠ Managed ETABS launch cross-check baseline unavailable: {ex.Message}");
-            return null;
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+                $"Could not verify that ETABS is absent before launch: {ex.Message}",
+                ex);
         }
+
+        if (observation.Identified.Count > 0 || observation.UnidentifiedCount > 0)
+        {
+            var pids = observation.Identified
+                .Select(identity => identity.Pid)
+                .Distinct()
+                .Order()
+                .ToList();
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+                "Refusing to start managed ETABS because an external or ambiguous " +
+                $"instance already exists: observedPids=[{string.Join(", ", pids)}], " +
+                $"unidentifiedCount={observation.UnidentifiedCount}.");
+        }
+
+        return observation.Identified.Select(identity => identity.Pid).ToHashSet();
     }
 
-    private void LogCrossCheckDisagreement(HashSet<int>? before, int ownedPid)
+    private void LogCrossCheckDisagreement(HashSet<int> before, int ownedPid)
     {
-        if (before is null)
-        {
-            return;
-        }
-
         try
         {
-            var candidates = _processes.SnapshotEtabs()
+            var observation = _processes.ObserveEtabs();
+            var candidates = observation.Identified
                 .Where(identity => !before.Contains(identity.Pid))
                 .Select(identity => identity.Pid)
                 .Distinct()
                 .Order()
                 .ToList();
-            if (candidates.Count == 1 && candidates[0] == ownedPid)
+            if (observation.UnidentifiedCount == 0
+                && candidates.Count == 1
+                && candidates[0] == ownedPid)
             {
                 return;
             }
 
+            var unidentified = observation.UnidentifiedCount == 0
+                ? string.Empty
+                : $", unidentifiedCount={observation.UnidentifiedCount}";
             _diagnostics.WriteLine(
                 $"⚠ Managed ETABS launch cross-check disagreed with authoritative owned PID {ownedPid}: " +
-                $"snapshot candidates=[{string.Join(", ", candidates)}]. Authoritative owned-process identity retained.");
+                $"snapshot candidates=[{string.Join(", ", candidates)}]{unidentified}. " +
+                "Authoritative owned-process identity retained.");
         }
         catch (Exception ex)
         {

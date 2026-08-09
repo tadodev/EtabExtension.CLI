@@ -32,14 +32,22 @@ public sealed class CachedSessionStatus : ICachedSessionStatus
                 return Result.Ok(_status.Data with
                 {
                     IsRunning = session.IsStarted,
-                    Pid = session.ProcessId
+                    Pid = session.ProcessId,
+                    Ownership = session.IsStarted
+                        ? EtabsInstanceOwnership.Managed
+                        : EtabsInstanceOwnership.None,
+                    ObservedPids = session.ProcessId is int cachedPid ? [cachedPid] : []
                 });
             }
 
             return Result.Ok(new GetStatusData
             {
                 IsRunning = session.IsStarted,
-                Pid = session.ProcessId
+                Pid = session.ProcessId,
+                Ownership = session.IsStarted
+                    ? EtabsInstanceOwnership.Managed
+                    : EtabsInstanceOwnership.None,
+                ObservedPids = session.ProcessId is int fallbackPid ? [fallbackPid] : []
             });
         }
     }

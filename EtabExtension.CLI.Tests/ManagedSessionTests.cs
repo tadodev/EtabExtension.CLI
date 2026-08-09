@@ -109,7 +109,8 @@ public class ManagedSessionTests
         public ManagedProcessIdentity? Live { get; set; }
         public int? TerminatedPid { get; set; }
         public int FindCount { get; private set; }
-        public IReadOnlyList<ManagedProcessIdentity> SnapshotEtabs() => Live is null ? [] : [Live];
+        public EtabsProcessObservation ObserveEtabs() =>
+            new(Live is null ? [] : [Live], 0);
         public ManagedProcessIdentity? Find(int pid) { FindCount++; return Live?.Pid == pid ? Live : null; }
         public void Terminate(int pid) => TerminatedPid = pid;
         public bool WaitForExit(int pid, TimeSpan timeout) => true;
