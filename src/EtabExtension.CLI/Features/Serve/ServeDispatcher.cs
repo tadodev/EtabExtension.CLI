@@ -11,6 +11,7 @@ using EtabExtension.CLI.Features.GetStatus;
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.OpenModel;
 using EtabExtension.CLI.Features.ReadModelMetadata;
+using EtabExtension.CLI.Features.RunAnalysis;
 using EtabExtension.CLI.Features.SnapshotExport;
 using EtabExtension.CLI.Features.SnapshotExport.Models;
 using EtabExtension.CLI.Features.UnlockModel;
@@ -45,6 +46,7 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly IOperationManager _operations;
     private readonly ICachedSessionStatus _cachedStatus;
     private readonly IProcessInspector _processes;
+    private readonly IRunAnalysisService _runAnalysis;
 
     public ServeDispatcher(
         IEtabsSession session,
@@ -62,7 +64,8 @@ public sealed class ServeDispatcher : IServeDispatcher
         ISessionRecordStore sessionRecords,
         IOperationManager operations,
         ICachedSessionStatus cachedStatus,
-        IProcessInspector processes)
+        IProcessInspector processes,
+        IRunAnalysisService runAnalysis)
     {
         _session = session;
         _status = status;
@@ -80,6 +83,7 @@ public sealed class ServeDispatcher : IServeDispatcher
         _operations = operations;
         _cachedStatus = cachedStatus;
         _processes = processes;
+        _runAnalysis = runAnalysis;
     }
 
     public async Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
@@ -191,6 +195,13 @@ public sealed class ServeDispatcher : IServeDispatcher
                 var req = Deserialize<ServeFileRequest>(request);
                 return await ExecuteComAsync(async () => await _metadata.ReadOnAppAsync(
                     _session.GetOrStart(), req.FilePath));
+            }
+
+            case "run-analysis":
+            {
+                var req = Deserialize<ServeRunAnalysisRequest>(request);
+                return await ExecuteComAsync(async () => await _runAnalysis.RunAnalysisOnAppAsync(
+                    _session.GetOrStart(), req.FilePath, req.Cases, req.Units));
             }
 
             case "get-model-state":

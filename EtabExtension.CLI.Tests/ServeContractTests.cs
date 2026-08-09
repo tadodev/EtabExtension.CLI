@@ -44,4 +44,17 @@ public class ServeContractTests
         Assert.Equal(@"C:\v1\model.edb", request.FilePath);
         Assert.True(request.SaveOnClose);
     }
+
+    [Fact]
+    public void Run_analysis_reads_the_flattened_shared_session_request()
+    {
+        var element = JsonSerializer.Deserialize<JsonElement>(
+            """{"filePath":"C:\\v1\\model.edb","cases":["DEAD"],"units":"SI_kN_m_C"}""");
+
+        var request = element.Deserialize<ServeRunAnalysisRequest>(Opts)!;
+
+        Assert.Equal(@"C:\v1\model.edb", request.FilePath);
+        Assert.Equal(["DEAD"], request.Cases);
+        Assert.Equal("SI_kN_m_C", request.Units);
+    }
 }

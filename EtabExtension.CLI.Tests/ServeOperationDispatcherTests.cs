@@ -1,6 +1,8 @@
 using System.Text.Json;
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 using EtabExtension.CLI.Features.GetStatus.Models;
+using EtabExtension.CLI.Features.RunAnalysis;
+using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Features.Serve.Operations;
 using EtabExtension.CLI.Shared.Common;
@@ -140,6 +142,28 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Equal(@"C:\results", response.Data.OutputDir);
     }
 
+    [Fact]
+    public async Task Run_analysis_uses_the_shared_serve_session()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var runAnalysis = new FakeRunAnalysisService();
+        var dispatcher = CreateDispatcher(_manager, session, runAnalysis: runAnalysis);
+
+        var response = Assert.IsType<Result<RunAnalysisData>>(await dispatcher.DispatchAsync(
+            "run-analysis",
+            Json("""{"filePath":"C:\\model.edb","cases":["DEAD"],"units":"SI_kN_m_C"}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.True(response.Success);
+        Assert.Equal(1, runAnalysis.SharedCalls);
+        Assert.Equal(0, runAnalysis.OneShotCalls);
+        Assert.Equal(1, session.GetOrStartCalls);
+        Assert.Equal(@"C:\model.edb", runAnalysis.FilePath);
+        Assert.Equal(["DEAD"], runAnalysis.Cases);
+        Assert.Equal("SI_kN_m_C", runAnalysis.Units);
+    }
+
     [Theory]
     [InlineData("get-model-state", null)]
     [InlineData("list-wall-properties", null)]
@@ -185,7 +209,8 @@ public sealed class ServeOperationDispatcherTests : IDisposable
     private static ServeDispatcher CreateDispatcher(
         IOperationManager operations,
         IEtabsSession? session = null,
-        IProcessInspector? processes = null) => new(
+        IProcessInspector? processes = null,
+        IRunAnalysisService? runAnalysis = null) => new(
             session ?? null!,
             null!,
             null!,
@@ -201,7 +226,8 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             null!,
             operations,
             new CachedSessionStatus(),
-            processes ?? new FakeProcesses(new EtabsProcessObservation([], 0)));
+            processes ?? new FakeProcesses(new EtabsProcessObservation([], 0)),
+            runAnalysis ?? null!);
 
     private static JsonElement Json(string value) => JsonSerializer.Deserialize<JsonElement>(value);
 
@@ -234,7 +260,7 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         public ETABSApplication GetOrStart()
         {
             GetOrStartCalls++;
-            throw new InvalidOperationException("COM must not be touched for cached status");
+            return null!;
         }
         public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
         public void Shutdown() { }
@@ -248,5 +274,36 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             observation.Identified.FirstOrDefault(identity => identity.Pid == pid);
         public void Terminate(int pid) => throw new NotSupportedException();
         public bool WaitForExit(int pid, TimeSpan timeout) => throw new NotSupportedException();
+    }
+
+    private sealed class FakeRunAnalysisService : IRunAnalysisService
+    {
+        public int OneShotCalls { get; private set; }
+        public int SharedCalls { get; private set; }
+        public string? FilePath { get; private set; }
+        public List<string>? Cases { get; private set; }
+        public string? Units { get; private set; }
+
+        public Task<Result<RunAnalysisData>> RunAnalysisAsync(
+            string filePath,
+            List<string>? cases,
+            string? units = null)
+        {
+            OneShotCalls++;
+            return Task.FromResult(Result.Ok(new RunAnalysisData { FilePath = filePath }));
+        }
+
+        public Task<Result<RunAnalysisData>> RunAnalysisOnAppAsync(
+            ETABSApplication app,
+            string filePath,
+            List<string>? cases,
+            string? units = null)
+        {
+            SharedCalls++;
+            FilePath = filePath;
+            Cases = cases;
+            Units = units;
+            return Task.FromResult(Result.Ok(new RunAnalysisData { FilePath = filePath }));
+        }
     }
 }

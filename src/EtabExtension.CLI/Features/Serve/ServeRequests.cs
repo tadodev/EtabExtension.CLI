@@ -47,3 +47,10 @@ public sealed class ServeGenerateE2KRequest
     [JsonPropertyName("outputFile")] public string OutputFile { get; init; } = string.Empty;
     [JsonPropertyName("overwrite")] public bool Overwrite { get; init; }
 }
+
+public sealed class ServeRunAnalysisRequest
+{
+    [JsonPropertyName("filePath")] public string FilePath { get; init; } = string.Empty;
+    [JsonPropertyName("cases")] public List<string>? Cases { get; init; }
+    [JsonPropertyName("units")] public string? Units { get; init; }
+}

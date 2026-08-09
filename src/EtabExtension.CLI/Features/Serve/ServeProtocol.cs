@@ -35,6 +35,7 @@ public static class ServeCapabilities
         "open-model",
         "read-model-metadata",
         "resolve-area-targets",
+        "run-analysis",
         "shutdown",
         "snapshot-export",
         "start-operation",
