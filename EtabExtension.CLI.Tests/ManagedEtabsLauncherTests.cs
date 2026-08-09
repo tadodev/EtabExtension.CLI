@@ -148,6 +148,9 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
             EtabsOwnershipResolver.Resolve(Observation(Identity(42)), 42));
         Assert.Equal(
             EtabsInstanceOwnership.Ambiguous,
+            EtabsOwnershipResolver.Resolve(Observation(Identity(99)), 42));
+        Assert.Equal(
+            EtabsInstanceOwnership.Ambiguous,
             EtabsOwnershipResolver.Resolve(Observation(Identity(42), Identity(99)), 42));
         Assert.Equal(
             EtabsInstanceOwnership.Ambiguous,

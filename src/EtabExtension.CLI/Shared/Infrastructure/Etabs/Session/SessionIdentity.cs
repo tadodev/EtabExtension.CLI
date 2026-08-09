@@ -33,9 +33,14 @@ public static class EtabsOwnershipResolver
             return EtabsInstanceOwnership.None;
         }
 
-        return managedPid.HasValue && observation.Identified[0].Pid == managedPid.Value
+        if (!managedPid.HasValue)
+        {
+            return EtabsInstanceOwnership.External;
+        }
+
+        return observation.Identified[0].Pid == managedPid.Value
             ? EtabsInstanceOwnership.Managed
-            : EtabsInstanceOwnership.External;
+            : EtabsInstanceOwnership.Ambiguous;
     }
 }
 
