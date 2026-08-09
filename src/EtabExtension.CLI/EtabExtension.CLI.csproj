@@ -58,6 +58,7 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="Parquet.Net" />
+    <PackageReference Include="Snappier" />
     <PackageReference Include="System.CommandLine" />
   </ItemGroup>
 

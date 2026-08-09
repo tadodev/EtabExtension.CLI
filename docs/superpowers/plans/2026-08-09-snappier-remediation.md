@@ -4,7 +4,7 @@
 
 **Goal:** Remove vulnerable `Snappier` 1.3.0 from every EtabExtension.CLI restore and self-contained publish while preserving the existing Parquet.Net behavior.
 
-**Architecture:** Keep `Parquet.Net` 5.5.0 and apply an explicit dependency override at both restore roots. Central package management owns the safe version, while the production and test projects declare direct references so no solution-wide transitive-pinning behavior changes.
+**Architecture:** Keep `Parquet.Net` 5.5.0 and apply an explicit dependency override at all three restore roots. Central package management owns the safe version, while the production, test, and visual-test projects declare direct references so no solution-wide transitive-pinning behavior changes.
 
 **Tech Stack:** .NET 10, Central Package Management, Parquet.Net 5.5.0, Snappier 1.3.1, xUnit v3
 
@@ -16,6 +16,7 @@
 - Modify: `Directory.Packages.props:8`
 - Modify: `src/EtabExtension.CLI/EtabExtension.CLI.csproj:57-61`
 - Modify: `EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj:16-23`
+- Modify: `EtabExtension.CLI.VisualTest/EtabExtension.CLI.VisualTest.csproj:14-21`
 
 - [ ] **Step 1: Reproduce the failing restore before editing**
 
@@ -56,7 +57,16 @@ Add this entry immediately after the existing `Parquet.Net` reference in
 <PackageReference Include="Snappier" />
 ```
 
-- [ ] **Step 5: Restore with the patched dependency**
+- [ ] **Step 5: Make the override explicit in the visual-test restore root**
+
+Add the same entry immediately after the existing `Parquet.Net` reference in
+`EtabExtension.CLI.VisualTest/EtabExtension.CLI.VisualTest.csproj`:
+
+```xml
+<PackageReference Include="Snappier" />
+```
+
+- [ ] **Step 6: Restore with the patched dependency**
 
 Run:
 
@@ -66,22 +76,23 @@ dotnet restore EtabExtension.CLI.slnx --force-evaluate
 
 Expected: PASS with no `NU1903` and no warning suppression.
 
-- [ ] **Step 6: Prove both package graphs exclude the vulnerable version**
+- [ ] **Step 7: Prove all package graphs exclude the vulnerable version**
 
 Run:
 
 ```powershell
 dotnet list src/EtabExtension.CLI/EtabExtension.CLI.csproj package --include-transitive
 dotnet list EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj package --include-transitive
+dotnet list EtabExtension.CLI.VisualTest/EtabExtension.CLI.VisualTest.csproj package --include-transitive
 ```
 
-Expected: both outputs list `Snappier` 1.3.1 as a top-level package. Neither
-output contains 1.3.0.
+Expected: all three outputs list `Snappier` 1.3.1 as a top-level package. None
+contains 1.3.0.
 
-- [ ] **Step 7: Commit the dependency override**
+- [ ] **Step 8: Commit the dependency override**
 
 ```powershell
-git add Directory.Packages.props src/EtabExtension.CLI/EtabExtension.CLI.csproj EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj
+git add Directory.Packages.props src/EtabExtension.CLI/EtabExtension.CLI.csproj EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj EtabExtension.CLI.VisualTest/EtabExtension.CLI.VisualTest.csproj docs/superpowers/specs/2026-08-09-snappier-remediation-design.md docs/superpowers/plans/2026-08-09-snappier-remediation.md
 git commit -m "fix: pin patched Snappier"
 ```
 
