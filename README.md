@@ -81,6 +81,18 @@ Show commands:
 dotnet run --project src\EtabExtension.CLI\EtabExtension.CLI.csproj -- --help
 ```
 
+## Runtime ETABS API Dependency
+
+The Alpha supports ETABS 23. `etab-cli` resolves `ETABSv1.dll` directly from
+the customer's ETABS 23 installation. Set `ETABS_INSTALL_DIR` only for a custom
+ETABS 23 install location; when set, it is authoritative and an invalid value
+does not fall back to the default Program Files installation.
+
+EtabSharp may copy `ETABSv1.dll` into local build and publish directories so
+the project can compile. That proprietary CSI file is not an installer input:
+desktop packaging must bundle `etab-cli.exe` and must exclude `ETABSv1.dll`.
+Do not embed, commit, or redistribute the DLL.
+
 Run the combined workflow:
 
 ```powershell
