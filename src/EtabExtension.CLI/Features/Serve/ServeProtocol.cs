@@ -25,15 +25,15 @@ public sealed record ServeHandshake(
     [property: JsonPropertyName("exePath")] string ExePath,
     [property: JsonPropertyName("capabilities")] IReadOnlyList<string> Capabilities)
 {
+    internal static Assembly MetadataAssembly => typeof(ServeHandshake).Assembly;
+
     public static ServeHandshake Current(IReadOnlyList<string> capabilities)
     {
-        var assembly = Assembly.GetEntryAssembly()
-            ?? throw new InvalidOperationException("Entry assembly is unavailable");
         var exePath = Environment.ProcessPath
             ?? throw new InvalidOperationException("Process executable path is unavailable");
 
         return FromAssembly(
-            assembly,
+            MetadataAssembly,
             Environment.ProcessId,
             Path.GetFullPath(exePath),
             capabilities);

@@ -90,11 +90,24 @@ public class ServeLoopTests
     }
 
     [Fact]
+    public void Current_reads_metadata_from_the_protocol_assembly()
+    {
+        Assert.Same(
+            typeof(ServeHandshake).Assembly,
+            ServeHandshake.MetadataAssembly);
+        var handshake = ServeHandshake.Current(["shutdown"]);
+
+        Assert.Equal("0.1.0", handshake.Version);
+        Assert.Equal("0.1.0+gtest", handshake.BuildId);
+        Assert.Equal(["shutdown"], handshake.Capabilities);
+    }
+
+    [Fact]
     public void Handshake_requires_explicit_assembly_metadata()
     {
         var error = Assert.Throws<InvalidOperationException>(() =>
             ServeHandshake.FromAssembly(
-                typeof(ServeLoopTests).Assembly,
+                typeof(string).Assembly,
                 Environment.ProcessId,
                 Path.GetFullPath(Environment.ProcessPath!),
                 ["shutdown"]));
