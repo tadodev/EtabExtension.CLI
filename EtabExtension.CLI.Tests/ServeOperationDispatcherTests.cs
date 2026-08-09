@@ -14,6 +14,29 @@ namespace EtabExtension.CLI.Tests;
 
 public sealed class ServeOperationDispatcherTests : IDisposable
 {
+    private static readonly string[] ExpectedCapabilities =
+    [
+        "analyze-and-extract",
+        "cancel-operation",
+        "close-model",
+        "extract-materials",
+        "extract-results",
+        "generate-e2k",
+        "get-model-state",
+        "get-operation-events",
+        "get-operation-status",
+        "get-status",
+        "inspect-wall-property",
+        "list-wall-properties",
+        "open-model",
+        "read-model-metadata",
+        "resolve-area-targets",
+        "run-analysis",
+        "snapshot-export",
+        "start-operation",
+        "unlock-model"
+    ];
+
     private readonly string _directory = Path.Combine(
         Path.GetTempPath(), "etab-cli-serve-operation-tests", Guid.NewGuid().ToString("N"));
     private OperationManager? _manager;
@@ -301,6 +324,23 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         new OperationEventJournalFactory(_directory, memoryCapacity: 4),
         new SystemOperationClock(),
         [definition]);
+
+    [Fact]
+    public async Task Capabilities_are_the_registered_dispatch_handlers()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) =>
+            Task.FromResult<object>(Result.Ok())));
+        var dispatcher = CreateDispatcher(_manager);
+
+        Assert.Equal(ExpectedCapabilities, dispatcher.Capabilities);
+
+        var unsupported = Assert.IsType<Result>(await dispatcher.DispatchAsync(
+            "not-a-command",
+            null,
+            TestContext.Current.CancellationToken));
+        Assert.False(unsupported.Success);
+        Assert.Contains("not supported", unsupported.Error, StringComparison.Ordinal);
+    }
 
     private static ServeDispatcher CreateDispatcher(
         IOperationManager operations,

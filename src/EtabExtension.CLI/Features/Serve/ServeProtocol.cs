@@ -16,33 +16,6 @@ public sealed class ServeRequest
     [JsonPropertyName("request")] public JsonElement? Request { get; init; }
 }
 
-public static class ServeCapabilities
-{
-    public static readonly IReadOnlyList<string> All =
-    [
-        "analyze-and-extract",
-        "cancel-operation",
-        "close-model",
-        "extract-materials",
-        "extract-results",
-        "generate-e2k",
-        "get-model-state",
-        "get-operation-events",
-        "get-operation-status",
-        "get-status",
-        "inspect-wall-property",
-        "list-wall-properties",
-        "open-model",
-        "read-model-metadata",
-        "resolve-area-targets",
-        "run-analysis",
-        "shutdown",
-        "snapshot-export",
-        "start-operation",
-        "unlock-model"
-    ];
-}
-
 public sealed record ServeHandshake(
     [property: JsonPropertyName("protocol")] string Protocol,
     [property: JsonPropertyName("protocolVersion")] int ProtocolVersion,
@@ -52,7 +25,7 @@ public sealed record ServeHandshake(
     [property: JsonPropertyName("exePath")] string ExePath,
     [property: JsonPropertyName("capabilities")] IReadOnlyList<string> Capabilities)
 {
-    public static ServeHandshake Current()
+    public static ServeHandshake Current(IReadOnlyList<string> capabilities)
     {
         var assembly = Assembly.GetEntryAssembly()
             ?? throw new InvalidOperationException("Entry assembly is unavailable");
@@ -63,7 +36,7 @@ public sealed record ServeHandshake(
             assembly,
             Environment.ProcessId,
             Path.GetFullPath(exePath),
-            ServeCapabilities.All);
+            capabilities);
     }
 
     internal static ServeHandshake FromAssembly(
@@ -121,5 +94,6 @@ internal static class ServeJson
 /// </summary>
 public interface IServeDispatcher
 {
+    IReadOnlyCollection<string> Capabilities { get; }
     Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct);
 }

@@ -17,17 +17,25 @@ namespace EtabExtension.CLI.Features.Serve;
 /// </summary>
 public sealed class ServeLoop
 {
+    internal const string ShutdownCommand = "shutdown";
+
     private readonly IServeDispatcher _dispatcher;
     private readonly ServeHandshake _handshake;
 
-    public ServeLoop(IServeDispatcher dispatcher) : this(dispatcher, ServeHandshake.Current())
+    public ServeLoop(IServeDispatcher dispatcher) : this(dispatcher, ServeHandshake.Current)
     {
     }
 
-    internal ServeLoop(IServeDispatcher dispatcher, ServeHandshake handshake)
+    internal ServeLoop(
+        IServeDispatcher dispatcher,
+        Func<IReadOnlyList<string>, ServeHandshake> handshakeFactory)
     {
         _dispatcher = dispatcher;
-        _handshake = handshake;
+        var capabilities = dispatcher.Capabilities
+            .Append(ShutdownCommand)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        _handshake = handshakeFactory(capabilities);
     }
 
     /// <summary>
@@ -67,7 +75,10 @@ public sealed class ServeLoop
 
                 id = request.Id;
 
-                if (string.Equals(request.Command, "shutdown", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(
+                    request.Command,
+                    ShutdownCommand,
+                    StringComparison.OrdinalIgnoreCase))
                 {
                     await WriteAsync(output, id, Result.Ok());
                     return; // graceful shutdown — caller disposes the session

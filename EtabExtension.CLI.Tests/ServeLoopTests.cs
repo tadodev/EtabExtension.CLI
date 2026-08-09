@@ -11,6 +11,8 @@ public class ServeLoopTests
 
     private sealed class FakeDispatcher : IServeDispatcher
     {
+        public IReadOnlyCollection<string> Capabilities { get; } =
+            ["boom", "get-status", "open-model"];
         public List<string> Commands { get; } = [];
 
         public Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
@@ -36,19 +38,20 @@ public class ServeLoopTests
     }
 
     private static ServeLoop CreateLoop(IServeDispatcher dispatcher) =>
-        new(dispatcher, TestHandshake());
+        new(dispatcher, TestHandshake);
 
-    private static ServeHandshake TestHandshake() => new(
+    private static ServeHandshake TestHandshake(IReadOnlyList<string> capabilities) => new(
         "etab-cli-serve",
         1,
         "0.1.0",
         "0.1.0+gtest",
         Environment.ProcessId,
         Path.GetFullPath(Environment.ProcessPath!),
-        ["get-status", "shutdown"]);
+        capabilities);
 
     private sealed class SerialProbeDispatcher : IServeDispatcher
     {
+        public IReadOnlyCollection<string> Capabilities { get; } = ["a", "b"];
         private int _inFlight;
         public int MaxInFlight { get; private set; }
         public async Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
@@ -81,9 +84,9 @@ public class ServeLoopTests
             Path.GetFullPath(first.GetProperty("exePath").GetString()!));
         var capabilities = first.GetProperty("capabilities")
             .EnumerateArray()
-            .Select(item => item.GetString());
-        Assert.Contains("get-status", capabilities);
-        Assert.Contains("shutdown", capabilities);
+            .Select(item => item.GetString()!)
+            .ToArray();
+        Assert.Equal(["boom", "get-status", "open-model", "shutdown"], capabilities);
     }
 
     [Fact]
