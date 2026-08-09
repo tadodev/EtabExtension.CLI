@@ -18,7 +18,7 @@
 - Modify: `EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj:16-23`
 - Modify: `EtabExtension.CLI.VisualTest/EtabExtension.CLI.VisualTest.csproj:14-21`
 
-- [ ] **Step 1: Reproduce the failing restore before editing**
+- [ ] **Step 1: Reproduce the vulnerable restore graph before editing**
 
 Run:
 
@@ -26,9 +26,9 @@ Run:
 dotnet restore EtabExtension.CLI.slnx --force-evaluate
 ```
 
-Expected: FAIL because warnings are errors, with `NU1903` naming `Snappier`
-1.3.0 and `GHSA-pggp-6c3x-2xmx`. Preserve the exact failure line in the worker
-report.
+Expected: exit 0 with one `NU1903` warning per restore root naming `Snappier`
+1.3.0 and `GHSA-pggp-6c3x-2xmx`. The Release publish promotes this warning to
+an error. Preserve the exact warning line in the worker report.
 
 - [ ] **Step 2: Add the centrally managed patched version**
 
@@ -145,15 +145,16 @@ dotnet publish src/EtabExtension.CLI/EtabExtension.CLI.csproj --configuration Re
 
 Expected: PASS and `artifacts/publish/cli-10/etab-cli.exe` exists.
 
-- [ ] **Step 5: Inspect the dependency manifest used by the single-file publish**
+- [ ] **Step 5: Inspect the manifest and embedded single-file dependency**
 
 Run:
 
 ```powershell
 rg -n 'Snappier/1\.3\.[01]' src/EtabExtension.CLI/obj/Release/net10.0/win-x64/etab-cli.deps.json
+rg -a -n -o 'Snappier/1\.3\.[01]' artifacts/publish/cli-10/etab-cli.exe
 ```
 
-Expected: one or more matches for `Snappier/1.3.1` and zero matches for
+Expected: both commands match `Snappier/1.3.1` and neither matches
 `Snappier/1.3.0`. Also inspect `artifacts/publish/cli-10` and confirm no
 standalone vulnerable `Snappier.dll` is present outside the single-file
 executable.
@@ -173,5 +174,6 @@ generated `obj`, `bin`, and `artifacts` output is ignored or unstaged.
 - [ ] **Step 7: Report the implementation evidence to the lead**
 
 Report the commit SHA, files changed, exact commands and outcomes, the
-pre-change `NU1903` line, the resolved package versions for both projects, and
-any uncertainty. Do not push, open a pull request, merge, or close issue #10.
+pre-change `NU1903` line, the resolved package versions for all three projects,
+and any uncertainty. Do not push, open a pull request, merge, or close issue
+#10.

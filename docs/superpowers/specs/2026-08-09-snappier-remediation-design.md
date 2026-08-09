@@ -8,9 +8,10 @@ Approved by the product owner on 2026-08-09 for EtabExtension.CLI issue #10.
 
 `Parquet.Net` 5.5.0 resolves `Snappier` 1.3.0 transitively. NuGet reports
 `NU1903` because that version is covered by high-severity advisory
-`GHSA-pggp-6c3x-2xmx`. Warnings are errors in this repository, so restore and
-the downstream Alpha sidecar build fail. The sidecar is self-contained, which
-also means the vulnerable dependency can become part of the shipped artifact.
+`GHSA-pggp-6c3x-2xmx`. An ordinary restore currently emits the warning while
+the Release publish promotes it to an error, which breaks the downstream Alpha
+sidecar build. The sidecar is self-contained, which also means the vulnerable
+dependency can become part of the shipped artifact.
 
 ## Decision
 
@@ -29,9 +30,10 @@ visual-test projects.
 - Do not suppress `NU1903`.
 - Do not upgrade `Parquet.Net` across a major-version boundary in this slice.
 
-Direct references are preferred over enabling central transitive pinning for
-the whole solution: they make the security override visible at each affected
-restore root without changing global dependency-resolution semantics.
+Central transitive pinning is already enabled in `Directory.Build.props`.
+Direct references keep this security override visible at every affected restore
+root and resilient to a later change in that global setting; they do not require
+changing solution-wide dependency-resolution semantics.
 
 ## Verification
 
@@ -44,8 +46,9 @@ The change is complete only when all of the following are true:
 4. `ParquetServiceTests` passes, proving that write/read behavior and custom
    metadata remain compatible.
 5. The full test project and solution build pass.
-6. A Release `win-x64` self-contained publish succeeds, and the publish input
-   dependency manifest contains `Snappier/1.3.1` with no `Snappier/1.3.0`.
+6. A Release `win-x64` self-contained publish succeeds, and both the publish
+   input dependency manifest and embedded single-file executable contain
+   `Snappier/1.3.1` with no `Snappier/1.3.0`.
 
 No live ETABS instance is required or permitted for this dependency-only work.
 
