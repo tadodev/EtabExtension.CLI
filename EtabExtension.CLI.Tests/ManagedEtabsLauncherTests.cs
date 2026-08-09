@@ -88,9 +88,31 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         Assert.Equal([42], connector.RequestedPids);
         Assert.Equal(1, connector.Managed!.ExitCount);
         Assert.Equal(1, connector.Managed.DisposeCount);
-        Assert.Equal(0, owned.KillCount);
+        Assert.Equal(1, owned.KillCount);
+        Assert.Equal(1, owned.WaitForExitCount);
         Assert.Equal(1, owned.DisposeCount);
         Assert.Empty(processes.TerminatedPids);
+    }
+
+    [Fact]
+    public void PostLaunchAmbiguityKillsOwnedProcessWhenComExitThrows()
+    {
+        var owned = new FakeOwnedProcess(Identity(42));
+        var processes = new FakeProcesses(
+            [Observation(), Observation(owned.Identity, Identity(99))]);
+        var connector = new FakeConnector(succeedOnAttempt: 1, throwOnExit: true);
+        var launcher = CreateLauncher(owned, processes, connector, new StringWriter());
+
+        var error = Assert.Throws<EtabsLaunchException>(() => launcher.Launch());
+
+        Assert.Equal(EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance, error.Code);
+        Assert.Equal(1, connector.Managed!.ExitCount);
+        Assert.Equal(1, owned.KillCount);
+        Assert.Equal(1, owned.WaitForExitCount);
+        Assert.Equal(1, connector.Managed.DisposeCount);
+        Assert.Equal(1, owned.DisposeCount);
+        Assert.Empty(processes.TerminatedPids);
+        Assert.DoesNotContain(99, processes.TerminatedPids);
     }
 
     [Fact]
@@ -277,7 +299,9 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         public void Dispose() => DisposeCount++;
     }
 
-    private sealed class FakeConnector(int? succeedOnAttempt) : IManagedEtabsConnector
+    private sealed class FakeConnector(
+        int? succeedOnAttempt,
+        bool throwOnExit = false) : IManagedEtabsConnector
     {
         public List<int> RequestedPids { get; } = [];
         public FakeManaged? Managed { get; private set; }
@@ -291,7 +315,7 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
             if (succeedOnAttempt == RequestedPids.Count)
             {
                 error = null;
-                Managed = new FakeManaged(process, launchRecordId);
+                Managed = new FakeManaged(process, launchRecordId, throwOnExit);
                 return Managed;
             }
 
@@ -302,7 +326,8 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
 
     private sealed class FakeManaged(
         IOwnedEtabsProcess process,
-        Guid launchRecordId) : IManagedEtabsApplication
+        Guid launchRecordId,
+        bool throwOnExit) : IManagedEtabsApplication
     {
         public ETABSApplication Application =>
             throw new InvalidOperationException("Fake must not expose COM");
@@ -310,7 +335,14 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         public Guid ManagedLaunchRecordId { get; } = launchRecordId;
         public int ExitCount { get; private set; }
         public int DisposeCount { get; private set; }
-        public void ExitWithoutSaving() => ExitCount++;
+        public void ExitWithoutSaving()
+        {
+            ExitCount++;
+            if (throwOnExit)
+            {
+                throw new InvalidOperationException("COM exit failed");
+            }
+        }
         public void Dispose()
         {
             DisposeCount++;

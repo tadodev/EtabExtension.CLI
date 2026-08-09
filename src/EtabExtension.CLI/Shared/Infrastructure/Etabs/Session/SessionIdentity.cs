@@ -326,15 +326,19 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 var managed = _connector.TryConnect(ownedProcess, launchRecordId, out lastError);
                 if (managed is not null)
                 {
-                    ownedProcess = null; // ownership transferred to the managed application
+                    var transferredProcess = ownedProcess
+                        ?? throw new InvalidOperationException(
+                            "Managed ETABS connector returned without an owned process handle");
                     try
                     {
                         VerifyPostLaunchOwnership(managed.Identity.Pid);
+                        ownedProcess = null; // ownership transferred after verification
                         return managed;
                     }
                     catch
                     {
-                        CleanUpManagedApplication(managed);
+                        CleanUpManagedApplication(managed, transferredProcess);
+                        ownedProcess = null; // managed cleanup disposed the transferred handle
                         throw;
                     }
                 }
@@ -428,7 +432,9 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             $"unidentifiedCount={observation.UnidentifiedCount}.");
     }
 
-    private void CleanUpManagedApplication(IManagedEtabsApplication managed)
+    private void CleanUpManagedApplication(
+        IManagedEtabsApplication managed,
+        IOwnedEtabsProcess ownedProcess)
     {
         try
         {
@@ -439,6 +445,8 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             _diagnostics.WriteLine(
                 $"⚠ Could not exit managed ETABS PID {managed.Identity.Pid} after ownership failure: {ex.Message}");
         }
+
+        StopOwnedProcess(ownedProcess, "ownership failure");
 
         try
         {
@@ -455,24 +463,32 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     {
         try
         {
+            StopOwnedProcess(ownedProcess, "launch failure");
+        }
+        finally
+        {
+            ownedProcess.Dispose();
+        }
+    }
+
+    private void StopOwnedProcess(IOwnedEtabsProcess ownedProcess, string context)
+    {
+        try
+        {
             if (!ownedProcess.HasExited)
             {
                 ownedProcess.Kill();
                 if (!ownedProcess.WaitForExit(TimeSpan.FromSeconds(10)))
                 {
                     _diagnostics.WriteLine(
-                        $"⚠ Timed out waiting for owned ETABS PID {ownedProcess.Identity.Pid} to exit after launch failure.");
+                        $"⚠ Timed out waiting for owned ETABS PID {ownedProcess.Identity.Pid} to exit after {context}.");
                 }
             }
         }
         catch (Exception ex)
         {
             _diagnostics.WriteLine(
-                $"⚠ Could not clean up owned ETABS PID {ownedProcess.Identity.Pid} after launch failure: {ex.Message}");
-        }
-        finally
-        {
-            ownedProcess.Dispose();
+                $"⚠ Could not stop owned ETABS PID {ownedProcess.Identity.Pid} after {context}: {ex.Message}");
         }
     }
 }
