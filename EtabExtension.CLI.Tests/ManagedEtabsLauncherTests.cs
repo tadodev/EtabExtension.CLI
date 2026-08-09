@@ -69,31 +69,28 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         Assert.Contains(EtabsExecutableResolver.ConfigurationKey, error.Message, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void LaunchRecordsOwnedIdentityEvenWhenForeignEtabsAppears()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PostLaunchAmbiguityCleansOnlyOwnedApplication(bool unidentified)
     {
-        var ownedIdentity = Identity(42);
-        var foreignIdentity = Identity(99);
-        var owned = new FakeOwnedProcess(ownedIdentity);
-        var processes = new FakeProcesses([
-            Observation(),
-            Observation(ownedIdentity, foreignIdentity)
-        ]);
+        var owned = new FakeOwnedProcess(Identity(42));
+        var secondObservation = unidentified
+            ? new EtabsProcessObservation([owned.Identity], 1)
+            : Observation(owned.Identity, Identity(99));
+        var processes = new FakeProcesses([Observation(), secondObservation]);
         var connector = new FakeConnector(succeedOnAttempt: 1);
-        var diagnostics = new StringWriter();
-        var launcher = CreateLauncher(owned, processes, connector, diagnostics);
+        var launcher = CreateLauncher(owned, processes, connector, new StringWriter());
 
-        using var result = launcher.Launch();
+        var error = Assert.Throws<EtabsLaunchException>(() => launcher.Launch());
 
-        Assert.Equal(ownedIdentity, result.Identity);
+        Assert.Equal(EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance, error.Code);
         Assert.Equal([42], connector.RequestedPids);
+        Assert.Equal(1, connector.Managed!.ExitCount);
+        Assert.Equal(1, connector.Managed.DisposeCount);
         Assert.Equal(0, owned.KillCount);
+        Assert.Equal(1, owned.DisposeCount);
         Assert.Empty(processes.TerminatedPids);
-        Assert.Contains(
-            "⚠ Managed ETABS launch cross-check disagreed with authoritative owned PID 42: " +
-            "snapshot candidates=[42, 99]. Authoritative owned-process identity retained.",
-            diagnostics.ToString(),
-            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -283,6 +280,7 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
     private sealed class FakeConnector(int? succeedOnAttempt) : IManagedEtabsConnector
     {
         public List<int> RequestedPids { get; } = [];
+        public FakeManaged? Managed { get; private set; }
 
         public IManagedEtabsApplication? TryConnect(
             IOwnedEtabsProcess process,
@@ -293,7 +291,8 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
             if (succeedOnAttempt == RequestedPids.Count)
             {
                 error = null;
-                return new FakeManaged(process, launchRecordId);
+                Managed = new FakeManaged(process, launchRecordId);
+                return Managed;
             }
 
             error = "COM server not ready";
@@ -309,8 +308,14 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
             throw new InvalidOperationException("Fake must not expose COM");
         public ManagedProcessIdentity Identity => process.Identity;
         public Guid ManagedLaunchRecordId { get; } = launchRecordId;
-        public void ExitWithoutSaving() { }
-        public void Dispose() => process.Dispose();
+        public int ExitCount { get; private set; }
+        public int DisposeCount { get; private set; }
+        public void ExitWithoutSaving() => ExitCount++;
+        public void Dispose()
+        {
+            DisposeCount++;
+            process.Dispose();
+        }
     }
 
     private sealed class FakeClock : IEtabsLaunchClock

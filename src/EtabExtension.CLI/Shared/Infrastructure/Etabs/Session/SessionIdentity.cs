@@ -309,7 +309,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 
     public IManagedEtabsApplication Launch()
     {
-        var before = CaptureCrossCheckBaseline();
+        CaptureCrossCheckBaseline();
         var executablePath = _executableResolver.Resolve();
         IOwnedEtabsProcess? ownedProcess = null;
         try
@@ -326,9 +326,17 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 var managed = _connector.TryConnect(ownedProcess, launchRecordId, out lastError);
                 if (managed is not null)
                 {
-                    LogCrossCheckDisagreement(before, ownedProcess.Identity.Pid);
                     ownedProcess = null; // ownership transferred to the managed application
-                    return managed;
+                    try
+                    {
+                        VerifyPostLaunchOwnership(managed.Identity.Pid);
+                        return managed;
+                    }
+                    catch
+                    {
+                        CleanUpManagedApplication(managed);
+                        throw;
+                    }
                 }
 
                 if (ownedProcess.HasExited)
@@ -355,7 +363,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         }
     }
 
-    private HashSet<int> CaptureCrossCheckBaseline()
+    private void CaptureCrossCheckBaseline()
     {
         EtabsProcessObservation observation;
         try
@@ -384,39 +392,62 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 $"unidentifiedCount={observation.UnidentifiedCount}.");
         }
 
-        return observation.Identified.Select(identity => identity.Pid).ToHashSet();
     }
 
-    private void LogCrossCheckDisagreement(HashSet<int> before, int ownedPid)
+    private void VerifyPostLaunchOwnership(int ownedPid)
+    {
+        EtabsProcessObservation observation;
+        try
+        {
+            observation = _processes.ObserveEtabs();
+        }
+        catch (Exception ex)
+        {
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+                $"Could not verify exclusive ownership after starting managed ETABS PID {ownedPid}: {ex.Message}",
+                ex);
+        }
+
+        if (observation.UnidentifiedCount == 0
+            && observation.Identified.Count == 1
+            && observation.Identified[0].Pid == ownedPid)
+        {
+            return;
+        }
+
+        var pids = observation.Identified
+            .Select(identity => identity.Pid)
+            .Distinct()
+            .Order()
+            .ToList();
+        throw new EtabsLaunchException(
+            EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+            "Managed ETABS lost exclusive ownership after launch: " +
+            $"ownedPid={ownedPid}, observedPids=[{string.Join(", ", pids)}], " +
+            $"unidentifiedCount={observation.UnidentifiedCount}.");
+    }
+
+    private void CleanUpManagedApplication(IManagedEtabsApplication managed)
     {
         try
         {
-            var observation = _processes.ObserveEtabs();
-            var candidates = observation.Identified
-                .Where(identity => !before.Contains(identity.Pid))
-                .Select(identity => identity.Pid)
-                .Distinct()
-                .Order()
-                .ToList();
-            if (observation.UnidentifiedCount == 0
-                && candidates.Count == 1
-                && candidates[0] == ownedPid)
-            {
-                return;
-            }
-
-            var unidentified = observation.UnidentifiedCount == 0
-                ? string.Empty
-                : $", unidentifiedCount={observation.UnidentifiedCount}";
-            _diagnostics.WriteLine(
-                $"⚠ Managed ETABS launch cross-check disagreed with authoritative owned PID {ownedPid}: " +
-                $"snapshot candidates=[{string.Join(", ", candidates)}]{unidentified}. " +
-                "Authoritative owned-process identity retained.");
+            managed.ExitWithoutSaving();
         }
         catch (Exception ex)
         {
             _diagnostics.WriteLine(
-                $"⚠ Managed ETABS launch cross-check unavailable for authoritative owned PID {ownedPid}: {ex.Message}");
+                $"⚠ Could not exit managed ETABS PID {managed.Identity.Pid} after ownership failure: {ex.Message}");
+        }
+
+        try
+        {
+            managed.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _diagnostics.WriteLine(
+                $"⚠ Could not dispose managed ETABS PID {managed.Identity.Pid} after ownership failure: {ex.Message}");
         }
     }
 
