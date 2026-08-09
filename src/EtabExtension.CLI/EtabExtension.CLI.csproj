@@ -7,7 +7,8 @@
     <Nullable>enable</Nullable>
     <AssemblyName>etab-cli</AssemblyName>
     <Version>0.1.0</Version>
-    <SidecarBuildId Condition="'$(SidecarBuildId)' == ''">0.1.0+gdev</SidecarBuildId>
+    <SidecarVersion>$(Version)</SidecarVersion>
+    <SidecarBuildId Condition="'$(SidecarBuildId)' == '' and '$(Configuration)' == 'Debug'">0.1.0+gdev</SidecarBuildId>
     <Description>A command-line tool for automating ETABS operations, designed to be called from a Rust Tauri backend application.</Description>
 
     <!-- Enable Code Analysis -->
@@ -44,6 +45,12 @@
     
   </PropertyGroup>
 
+  <Target Name="RequireReleaseSidecarBuildId"
+          BeforeTargets="GenerateAssemblyInfo"
+          Condition="'$(Configuration)' == 'Release' and '$(SidecarBuildId)' == ''">
+    <Error Text="Release builds require -p:SidecarBuildId=&lt;immutable-build-id&gt;." />
+  </Target>
+
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <UseSystemResourceKeys>true</UseSystemResourceKeys>
     <DebugType>none</DebugType>
@@ -56,6 +63,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <AssemblyMetadata Include="SidecarVersion" Value="$(SidecarVersion)" />
     <AssemblyMetadata Include="SidecarBuildId" Value="$(SidecarBuildId)" />
   </ItemGroup>
 

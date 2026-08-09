@@ -18,8 +18,17 @@ namespace EtabExtension.CLI.Features.Serve;
 public sealed class ServeLoop
 {
     private readonly IServeDispatcher _dispatcher;
+    private readonly ServeHandshake _handshake;
 
-    public ServeLoop(IServeDispatcher dispatcher) => _dispatcher = dispatcher;
+    public ServeLoop(IServeDispatcher dispatcher) : this(dispatcher, ServeHandshake.Current())
+    {
+    }
+
+    internal ServeLoop(IServeDispatcher dispatcher, ServeHandshake handshake)
+    {
+        _dispatcher = dispatcher;
+        _handshake = handshake;
+    }
 
     /// <summary>
     /// Runs until stdin EOF, a <c>shutdown</c> command, or cancellation. Never
@@ -29,7 +38,7 @@ public sealed class ServeLoop
     public async Task RunAsync(TextReader input, TextWriter output, CancellationToken ct = default)
     {
         await output.WriteLineAsync(JsonSerializer.Serialize(
-            ServeHandshake.Current(), ServeJson.Options));
+            _handshake, ServeJson.Options));
         await output.FlushAsync(ct);
         Console.Error.WriteLine("ℹ etab-cli serve: ready (line-delimited JSON on stdin/stdout)");
 

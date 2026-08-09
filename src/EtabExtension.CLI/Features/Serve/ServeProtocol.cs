@@ -56,23 +56,43 @@ public sealed record ServeHandshake(
     {
         var assembly = Assembly.GetEntryAssembly()
             ?? throw new InvalidOperationException("Entry assembly is unavailable");
-        var version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
-            ?.InformationalVersion
-            ?? throw new InvalidOperationException("Adapter version is unavailable");
-        var buildId = assembly.GetCustomAttributes<AssemblyMetadataAttribute>()
-            .SingleOrDefault(attribute => attribute.Key == "SidecarBuildId")?.Value
-            ?? $"{version}+gdev";
         var exePath = Environment.ProcessPath
             ?? throw new InvalidOperationException("Process executable path is unavailable");
 
-        return new(
-            "etab-cli-serve",
-            1,
-            version,
-            buildId,
+        return FromAssembly(
+            assembly,
             Environment.ProcessId,
             Path.GetFullPath(exePath),
             ServeCapabilities.All);
+    }
+
+    internal static ServeHandshake FromAssembly(
+        Assembly assembly,
+        int pid,
+        string exePath,
+        IReadOnlyList<string> capabilities)
+    {
+        return new(
+            "etab-cli-serve",
+            1,
+            RequiredMetadata(assembly, "SidecarVersion"),
+            RequiredMetadata(assembly, "SidecarBuildId"),
+            pid,
+            Path.GetFullPath(exePath),
+            capabilities);
+    }
+
+    private static string RequiredMetadata(Assembly assembly, string key)
+    {
+        var value = assembly.GetCustomAttributes<AssemblyMetadataAttribute>()
+            .SingleOrDefault(attribute => attribute.Key == key)?.Value;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new InvalidOperationException(
+                $"Required assembly metadata '{key}' is missing or blank");
+        }
+
+        return value;
     }
 }
 

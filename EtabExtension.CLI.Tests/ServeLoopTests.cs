@@ -27,13 +27,25 @@ public class ServeLoopTests
     {
         using var reader = new StringReader(input);
         await using var writer = new StringWriter();
-        await new ServeLoop(dispatcher).RunAsync(reader, writer);
+        await CreateLoop(dispatcher).RunAsync(reader, writer);
         return writer.ToString()
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(line => JsonSerializer.Deserialize<JsonElement>(line))
             .Where(element => element.TryGetProperty("id", out _))
             .ToList();
     }
+
+    private static ServeLoop CreateLoop(IServeDispatcher dispatcher) =>
+        new(dispatcher, TestHandshake());
+
+    private static ServeHandshake TestHandshake() => new(
+        "etab-cli-serve",
+        1,
+        "0.1.0",
+        "0.1.0+gtest",
+        Environment.ProcessId,
+        Path.GetFullPath(Environment.ProcessPath!),
+        ["get-status", "shutdown"]);
 
     private sealed class SerialProbeDispatcher : IServeDispatcher
     {
@@ -54,15 +66,15 @@ public class ServeLoopTests
     {
         using var reader = new StringReader("{\"id\":1,\"command\":\"get-status\"}\n");
         await using var writer = new StringWriter();
-        await new ServeLoop(new FakeDispatcher()).RunAsync(
+        await CreateLoop(new FakeDispatcher()).RunAsync(
             reader, writer, TestContext.Current.CancellationToken);
         var first = JsonSerializer.Deserialize<JsonElement>(
             writer.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)[0]);
 
         Assert.Equal("etab-cli-serve", first.GetProperty("protocol").GetString());
         Assert.Equal(1, first.GetProperty("protocolVersion").GetInt32());
-        Assert.False(string.IsNullOrWhiteSpace(first.GetProperty("version").GetString()));
-        Assert.False(string.IsNullOrWhiteSpace(first.GetProperty("buildId").GetString()));
+        Assert.Equal("0.1.0", first.GetProperty("version").GetString());
+        Assert.Equal("0.1.0+gtest", first.GetProperty("buildId").GetString());
         Assert.True(first.GetProperty("pid").GetInt32() > 0);
         Assert.Equal(
             Path.GetFullPath(Environment.ProcessPath!),
@@ -75,13 +87,26 @@ public class ServeLoopTests
     }
 
     [Fact]
+    public void Handshake_requires_explicit_assembly_metadata()
+    {
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            ServeHandshake.FromAssembly(
+                typeof(ServeLoopTests).Assembly,
+                Environment.ProcessId,
+                Path.GetFullPath(Environment.ProcessPath!),
+                ["shutdown"]));
+
+        Assert.Contains("SidecarVersion", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Never_overlaps_dispatches()
     {
         var dispatcher = new SerialProbeDispatcher();
         using var reader = new StringReader(
             "{\"id\":1,\"command\":\"a\",\"request\":{}}\n{\"id\":2,\"command\":\"b\",\"request\":{}}\n");
         await using var writer = new StringWriter();
-        await new ServeLoop(dispatcher).RunAsync(reader, writer, TestContext.Current.CancellationToken);
+        await CreateLoop(dispatcher).RunAsync(reader, writer, TestContext.Current.CancellationToken);
         Assert.Equal(1, dispatcher.MaxInFlight);
     }
 
