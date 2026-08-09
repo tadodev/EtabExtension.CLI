@@ -95,17 +95,28 @@ public sealed class ServeDispatcher : IServeDispatcher
                 // calls. Report the most recent worker-owned snapshot instead.
                 if (_operations.HasActiveOperation)
                 {
-                    return _cachedStatus.Read(_session);
+                    return ReadActiveStatus();
                 }
                 return await _operations.ExecuteSynchronousAsync(() =>
                 {
-                    var observation = _processes.ObserveEtabs();
-                    var current = _session.IsStarted
-                        ? _status.GetStatusOnApp(_session.GetOrStart(), _session.ProcessId)
-                        : Result.Ok(new GetStatusData());
-                    current = DecorateStatus(current, observation, _session.ProcessId);
-                    _cachedStatus.Update(current);
-                    return Task.FromResult<object>(current);
+                    try
+                    {
+                        var observation = _processes.ObserveEtabs();
+                        var current = _session.IsStarted
+                            ? _status.GetStatusOnApp(_session.GetOrStart(), _session.ProcessId)
+                            : Result.Ok(new GetStatusData());
+                        current = EtabsStatusOwnership.Decorate(
+                            current,
+                            observation,
+                            _session.ProcessId);
+                        _cachedStatus.Update(current);
+                        return Task.FromResult<object>(current);
+                    }
+                    catch (Exception ex)
+                    {
+                        return Task.FromResult<object>(Result.Fail<GetStatusData>(
+                            $"ETABS process observation failed: {ex.Message}"));
+                    }
                 });
 
             case "start-operation":
@@ -265,35 +276,16 @@ public sealed class ServeDispatcher : IServeDispatcher
                 "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"))
             : _operations.ExecuteSynchronousAsync(action);
 
-    private static Result<GetStatusData> DecorateStatus(
-        Result<GetStatusData> status,
-        EtabsProcessObservation observation,
-        int? managedPid)
+    private Result<GetStatusData> ReadActiveStatus()
     {
-        if (!status.Success || status.Data is null)
+        try
         {
-            return status;
+            return _cachedStatus.Read(_session, _processes.ObserveEtabs());
         }
-
-        var ownership = EtabsOwnershipResolver.Resolve(observation, managedPid);
-        if (managedPid.HasValue && ownership == EtabsInstanceOwnership.None)
+        catch (Exception ex)
         {
-            ownership = EtabsInstanceOwnership.Ambiguous;
+            return Result.Fail<GetStatusData>(
+                $"ETABS process observation failed: {ex.Message}");
         }
-        var observedPids = observation.Identified
-            .Select(identity => identity.Pid)
-            .Distinct()
-            .Order()
-            .ToList();
-
-        return Result.Ok(status.Data with
-        {
-            IsRunning = ownership != EtabsInstanceOwnership.None,
-            Pid = ownership == EtabsInstanceOwnership.External
-                ? observedPids.SingleOrDefault()
-                : managedPid,
-            Ownership = ownership,
-            ObservedPids = observedPids
-        });
     }
 }

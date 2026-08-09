@@ -82,7 +82,10 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             return Result.Ok();
         }));
         var session = new FakeSession();
-        var dispatcher = CreateDispatcher(_manager, session);
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            new FakeProcesses(new EtabsProcessObservation([Identity(42)], 0)));
         var started = _manager.Start("analyze-and-extract", Json("{}"));
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
@@ -96,6 +99,99 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Equal(0, session.GetOrStartCalls);
         release.SetResult();
         await _manager.WaitAsync(started.Data!.OperationId, TestContext.Current.CancellationToken);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Active_status_reports_process_ambiguity_without_com(bool unidentified)
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager = CreateManager(new DelegateOperation(async (_, context) =>
+        {
+            await context.RunStepAsync(1, 1, "Fake.CsiCall", async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return true;
+            });
+            return Result.Ok();
+        }));
+        var session = new FakeSession();
+        var observation = unidentified
+            ? new EtabsProcessObservation([Identity(42)], 1)
+            : new EtabsProcessObservation([Identity(42), Identity(99)], 0);
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            new FakeProcesses(observation));
+        var started = _manager.Start("analyze-and-extract", Json("{}"));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        try
+        {
+            var response = Assert.IsType<Result<GetStatusData>>(await dispatcher.DispatchAsync(
+                "get-status", null, TestContext.Current.CancellationToken));
+
+            Assert.True(response.Success);
+            Assert.Equal(EtabsInstanceOwnership.Ambiguous, response.Data!.Ownership);
+            Assert.Equal(
+                unidentified ? [42] : [42, 99],
+                response.Data.ObservedPids);
+            Assert.Equal(0, session.GetOrStartCalls);
+        }
+        finally
+        {
+            release.SetResult();
+            await _manager.WaitAsync(
+                started.Data!.OperationId,
+                TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task Active_status_preserves_cached_failure()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager = CreateManager(new DelegateOperation(async (_, context) =>
+        {
+            await context.RunStepAsync(1, 1, "Fake.CsiCall", async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return true;
+            });
+            return Result.Ok();
+        }));
+        var session = new FakeSession();
+        var cachedStatus = new CachedSessionStatus();
+        cachedStatus.Update(Result.Fail<GetStatusData>("cached status failed"));
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            new FakeProcesses(new EtabsProcessObservation([Identity(42)], 0)),
+            cachedStatus: cachedStatus);
+        var started = _manager.Start("analyze-and-extract", Json("{}"));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        try
+        {
+            var response = Assert.IsType<Result<GetStatusData>>(await dispatcher.DispatchAsync(
+                "get-status", null, TestContext.Current.CancellationToken));
+
+            Assert.False(response.Success);
+            Assert.Equal("cached status failed", response.Error);
+            Assert.Equal(0, session.GetOrStartCalls);
+        }
+        finally
+        {
+            release.SetResult();
+            await _manager.WaitAsync(
+                started.Data!.OperationId,
+                TestContext.Current.CancellationToken);
+        }
     }
 
     [Fact]
@@ -210,7 +306,8 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         IOperationManager operations,
         IEtabsSession? session = null,
         IProcessInspector? processes = null,
-        IRunAnalysisService? runAnalysis = null) => new(
+        IRunAnalysisService? runAnalysis = null,
+        ICachedSessionStatus? cachedStatus = null) => new(
             session ?? null!,
             null!,
             null!,
@@ -225,7 +322,7 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             null!,
             null!,
             operations,
-            new CachedSessionStatus(),
+            cachedStatus ?? new CachedSessionStatus(),
             processes ?? new FakeProcesses(new EtabsProcessObservation([], 0)),
             runAnalysis ?? null!);
 
