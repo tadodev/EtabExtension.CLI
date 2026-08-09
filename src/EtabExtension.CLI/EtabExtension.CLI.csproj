@@ -6,6 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>etab-cli</AssemblyName>
+    <Version>0.1.0</Version>
+    <SidecarBuildId Condition="'$(SidecarBuildId)' == ''">0.1.0+gdev</SidecarBuildId>
     <Description>A command-line tool for automating ETABS operations, designed to be called from a Rust Tauri backend application.</Description>
 
     <!-- Enable Code Analysis -->
@@ -52,6 +54,10 @@
     <DebugType>portable</DebugType>
     <DebugSymbols>true</DebugSymbols>
   </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="SidecarBuildId" Value="$(SidecarBuildId)" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="EtabSharp" />

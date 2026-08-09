@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -15,9 +16,64 @@ public sealed class ServeRequest
     [JsonPropertyName("request")] public JsonElement? Request { get; init; }
 }
 
+public static class ServeCapabilities
+{
+    public static readonly IReadOnlyList<string> All =
+    [
+        "analyze-and-extract",
+        "cancel-operation",
+        "close-model",
+        "extract-materials",
+        "extract-results",
+        "generate-e2k",
+        "get-model-state",
+        "get-operation-events",
+        "get-operation-status",
+        "get-status",
+        "inspect-wall-property",
+        "list-wall-properties",
+        "open-model",
+        "read-model-metadata",
+        "resolve-area-targets",
+        "shutdown",
+        "snapshot-export",
+        "start-operation",
+        "unlock-model"
+    ];
+}
+
 public sealed record ServeHandshake(
     [property: JsonPropertyName("protocol")] string Protocol,
-    [property: JsonPropertyName("version")] int Version);
+    [property: JsonPropertyName("protocolVersion")] int ProtocolVersion,
+    [property: JsonPropertyName("version")] string Version,
+    [property: JsonPropertyName("buildId")] string BuildId,
+    [property: JsonPropertyName("pid")] int Pid,
+    [property: JsonPropertyName("exePath")] string ExePath,
+    [property: JsonPropertyName("capabilities")] IReadOnlyList<string> Capabilities)
+{
+    public static ServeHandshake Current()
+    {
+        var assembly = Assembly.GetEntryAssembly()
+            ?? throw new InvalidOperationException("Entry assembly is unavailable");
+        var version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+            ?.InformationalVersion
+            ?? throw new InvalidOperationException("Adapter version is unavailable");
+        var buildId = assembly.GetCustomAttributes<AssemblyMetadataAttribute>()
+            .SingleOrDefault(attribute => attribute.Key == "SidecarBuildId")?.Value
+            ?? $"{version}+gdev";
+        var exePath = Environment.ProcessPath
+            ?? throw new InvalidOperationException("Process executable path is unavailable");
+
+        return new(
+            "etab-cli-serve",
+            1,
+            version,
+            buildId,
+            Environment.ProcessId,
+            Path.GetFullPath(exePath),
+            ServeCapabilities.All);
+    }
+}
 
 /// <summary>
 /// JSON options for the line-delimited serve protocol. Mirrors

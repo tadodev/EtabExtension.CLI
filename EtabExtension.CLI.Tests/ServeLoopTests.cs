@@ -56,8 +56,22 @@ public class ServeLoopTests
         await using var writer = new StringWriter();
         await new ServeLoop(new FakeDispatcher()).RunAsync(
             reader, writer, TestContext.Current.CancellationToken);
-        var first = writer.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)[0].TrimEnd('\r');
-        Assert.Equal("{\"protocol\":\"etab-cli-serve\",\"version\":1}", first);
+        var first = JsonSerializer.Deserialize<JsonElement>(
+            writer.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)[0]);
+
+        Assert.Equal("etab-cli-serve", first.GetProperty("protocol").GetString());
+        Assert.Equal(1, first.GetProperty("protocolVersion").GetInt32());
+        Assert.False(string.IsNullOrWhiteSpace(first.GetProperty("version").GetString()));
+        Assert.False(string.IsNullOrWhiteSpace(first.GetProperty("buildId").GetString()));
+        Assert.True(first.GetProperty("pid").GetInt32() > 0);
+        Assert.Equal(
+            Path.GetFullPath(Environment.ProcessPath!),
+            Path.GetFullPath(first.GetProperty("exePath").GetString()!));
+        var capabilities = first.GetProperty("capabilities")
+            .EnumerateArray()
+            .Select(item => item.GetString());
+        Assert.Contains("get-status", capabilities);
+        Assert.Contains("shutdown", capabilities);
     }
 
     [Fact]
