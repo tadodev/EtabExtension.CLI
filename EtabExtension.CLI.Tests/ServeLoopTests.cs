@@ -190,7 +190,7 @@ public class ServeLoopTests
     }
 
     [Fact]
-    public async Task Shutdown_waits_for_cleanup_then_writes_one_success_with_terminal_data_and_stops_reading()
+    public async Task ShutdownWaitsForCleanupThenWritesOneSuccessWithTerminalDataAndStopsReading()
     {
         var dispatcher = new FakeDispatcher();
         var coordinator = new ShutdownCoordinator();
@@ -200,7 +200,7 @@ public class ServeLoopTests
         await using var writer = new StringWriter();
         var loop = new ServeLoop(dispatcher, coordinator, TestHandshake, TextWriter.Null);
 
-        var running = loop.RunAsync(reader, writer);
+        var running = loop.RunAsync(reader, writer, TestContext.Current.CancellationToken);
         await coordinator.Called;
 
         Assert.Empty(ResponseLines(writer));
@@ -224,7 +224,7 @@ public class ServeLoopTests
     }
 
     [Fact]
-    public async Task Shutdown_waits_for_cleanup_then_writes_typed_failure_with_populated_data()
+    public async Task ShutdownWaitsForCleanupThenWritesTypedFailureWithPopulatedData()
     {
         var coordinator = new ShutdownCoordinator();
         using var reader = new CountingReader(
@@ -238,7 +238,7 @@ public class ServeLoopTests
             TextWriter.Null);
         var failure = ShutdownFailure();
 
-        var running = loop.RunAsync(reader, writer);
+        var running = loop.RunAsync(reader, writer, TestContext.Current.CancellationToken);
         await coordinator.Called;
         Assert.Empty(ResponseLines(writer));
 
@@ -260,7 +260,7 @@ public class ServeLoopTests
     }
 
     [Fact]
-    public async Task Stdin_eof_converges_on_shutdown_coordinator()
+    public async Task StdinEofConvergesOnShutdownCoordinator()
     {
         var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
         using var reader = new StringReader(string.Empty);
@@ -270,14 +270,14 @@ public class ServeLoopTests
             new FakeDispatcher(),
             coordinator,
             TestHandshake,
-            TextWriter.Null).RunAsync(reader, writer);
+            TextWriter.Null).RunAsync(reader, writer, TestContext.Current.CancellationToken);
 
         Assert.Equal(1, coordinator.CallCount);
         Assert.Equal(1, coordinator.UnderlyingStartCount);
     }
 
     [Fact]
-    public async Task Cancellation_cleans_up_then_preserves_original_cancellation()
+    public async Task CancellationCleansUpThenPreservesOriginalCancellation()
     {
         var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
         using var reader = new BlockingReader();
@@ -297,7 +297,7 @@ public class ServeLoopTests
     }
 
     [Fact]
-    public async Task Fatal_reader_error_is_preserved_after_cleanup_failure_is_bounded_and_logged()
+    public async Task FatalReaderErrorIsPreservedAfterCleanupFailureIsBoundedAndLogged()
     {
         var coordinator = ShutdownCoordinator.Completed(ShutdownFailure());
         using var reader = new FatalReader(new IOException("reader failed"));
@@ -309,7 +309,8 @@ public class ServeLoopTests
             TestHandshake,
             diagnostics);
 
-        var error = await Assert.ThrowsAsync<IOException>(() => loop.RunAsync(reader, writer));
+        var error = await Assert.ThrowsAsync<IOException>(
+            () => loop.RunAsync(reader, writer, TestContext.Current.CancellationToken));
 
         Assert.Equal("reader failed", error.Message);
         Assert.Contains(
@@ -323,7 +324,7 @@ public class ServeLoopTests
     }
 
     [Fact]
-    public async Task Fatal_reader_error_is_preserved_when_cleanup_itself_throws()
+    public async Task FatalReaderErrorIsPreservedWhenCleanupItselfThrows()
     {
         var coordinator = new ThrowingCoordinator(
             new InvalidOperationException("cleanup exploded\r\n"));
@@ -336,7 +337,8 @@ public class ServeLoopTests
             TestHandshake,
             diagnostics);
 
-        var error = await Assert.ThrowsAsync<IOException>(() => loop.RunAsync(reader, writer));
+        var error = await Assert.ThrowsAsync<IOException>(
+            () => loop.RunAsync(reader, writer, TestContext.Current.CancellationToken));
 
         Assert.Equal("reader failed", error.Message);
         Assert.Contains(
@@ -350,7 +352,7 @@ public class ServeLoopTests
     }
 
     [Fact]
-    public async Task Fatal_dispatch_error_is_preserved_after_cleanup()
+    public async Task FatalDispatchErrorIsPreservedAfterCleanup()
     {
         var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
         using var reader = new StringReader("{\"id\":61,\"command\":\"explode\"}\n");
@@ -362,7 +364,7 @@ public class ServeLoopTests
             TextWriter.Null);
 
         var error = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => loop.RunAsync(reader, writer));
+            () => loop.RunAsync(reader, writer, TestContext.Current.CancellationToken));
 
         Assert.Equal("dispatch failed", error.Message);
         Assert.Empty(ResponseLines(writer));
@@ -370,7 +372,7 @@ public class ServeLoopTests
     }
 
     [Fact]
-    public async Task Fatal_handshake_writer_error_is_preserved_after_cleanup()
+    public async Task FatalHandshakeWriterErrorIsPreservedAfterCleanup()
     {
         var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
         using var reader = new StringReader(string.Empty);
@@ -382,13 +384,13 @@ public class ServeLoopTests
             TextWriter.Null);
 
         var error = await Assert.ThrowsAsync<IOException>(
-            () => loop.RunAsync(reader, writer));
+            () => loop.RunAsync(reader, writer, TestContext.Current.CancellationToken));
 
         Assert.Equal("handshake failed", error.Message);
         Assert.Equal(1, coordinator.CallCount);
     }
 
-    private static IReadOnlyList<JsonElement> ResponseLines(StringWriter writer) =>
+    private static List<JsonElement> ResponseLines(StringWriter writer) =>
         writer.ToString()
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(line => JsonSerializer.Deserialize<JsonElement>(line))

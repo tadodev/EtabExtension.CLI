@@ -49,7 +49,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_writes_recovery_record_before_exact_once_initialization_and_reuses_ready_session()
+    public void SessionWritesRecoveryRecordBeforeExactOnceInitializationAndReusesReadySession()
     {
         var events = new List<string>();
         var launchId = Guid.NewGuid();
@@ -81,7 +81,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_initialization_nonzero_uses_strong_cleanup_and_does_not_relaunch()
+    public void SessionInitializationNonzeroUsesStrongCleanupAndDoesNotRelaunch()
     {
         var events = new List<string>();
         var launchId = Guid.NewGuid();
@@ -131,7 +131,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_initialization_exception_retains_record_when_process_exit_is_unconfirmed()
+    public void SessionInitializationExceptionRetainsRecordWhenProcessExitIsUnconfirmed()
     {
         var events = new List<string>();
         var launchId = Guid.NewGuid();
@@ -173,7 +173,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_dispose_converges_through_shutdown_once_and_is_idempotent()
+    public void SessionDisposeConvergesThroughShutdownOnceAndIsIdempotent()
     {
         var events = new List<string>();
         var launchId = Guid.NewGuid();
@@ -207,7 +207,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_record_write_failure_with_matching_partial_record_cleans_gracefully_and_preserves_original_error()
+    public void SessionRecordWriteFailureWithMatchingPartialRecordCleansGracefullyAndPreservesOriginalError()
     {
         var fixture = RecordWriteFailureFixture.Create(
             waitResults: [true],
@@ -230,7 +230,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_record_write_failure_without_record_forces_exact_owned_handle_and_confirms_exit()
+    public void SessionRecordWriteFailureWithoutRecordForcesExactOwnedHandleAndConfirmsExit()
     {
         var fixture = RecordWriteFailureFixture.Create(waitResults: [false, true]);
 
@@ -252,7 +252,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_record_write_failure_with_unconfirmed_exit_retains_matching_partial_record()
+    public void SessionRecordWriteFailureWithUnconfirmedExitRetainsMatchingPartialRecord()
     {
         var fixture = RecordWriteFailureFixture.Create(
             waitResults: [false, false],
@@ -274,7 +274,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_record_write_failure_cleans_owned_handle_but_preserves_nonmatching_preexisting_record()
+    public void SessionRecordWriteFailureCleansOwnedHandleButPreservesNonmatchingPreexistingRecord()
     {
         var preexisting = Record(Guid.NewGuid()) with
         {
@@ -300,7 +300,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Shutdown_exit_zero_and_graceful_process_exit_succeeds_and_clears_record()
+    public void ShutdownExitZeroAndGracefulProcessExitSucceedsAndClearsRecord()
     {
         var fixture = ShutdownFixture.Create(waitResults: [true]);
 
@@ -321,7 +321,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Shutdown_nonzero_exit_remains_failure_after_forced_confirmed_cleanup()
+    public void ShutdownNonzeroExitRemainsFailureAfterForcedConfirmedCleanup()
     {
         var fixture = ShutdownFixture.Create(exitReturnCode: 7, waitResults: [false, true]);
 
@@ -346,7 +346,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Shutdown_exit_exception_remains_bounded_failure_after_confirmed_cleanup()
+    public void ShutdownExitExceptionRemainsBoundedFailureAfterConfirmedCleanup()
     {
         var fixture = ShutdownFixture.Create(
             exitException: new TestException(
@@ -372,7 +372,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Shutdown_exit_zero_but_live_process_forces_exact_handle_and_succeeds()
+    public void ShutdownExitZeroButLiveProcessForcesExactHandleAndSucceeds()
     {
         var fixture = ShutdownFixture.Create(waitResults: [false, true]);
 
@@ -390,7 +390,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Shutdown_second_wait_timeout_retains_recovery_record()
+    public void ShutdownSecondWaitTimeoutRetainsRecoveryRecord()
     {
         var fixture = ShutdownFixture.Create(waitResults: [false, false]);
 
@@ -413,7 +413,7 @@ public sealed class ManagedSessionTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void Shutdown_identity_or_launch_id_mismatch_never_targets_process(bool launchIdMismatch)
+    public void ShutdownIdentityOrLaunchIdMismatchNeverTargetsProcess(bool launchIdMismatch)
     {
         var fixture = ShutdownFixture.Create();
         fixture.Store.Record = launchIdMismatch
@@ -437,7 +437,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_identity_mismatch_retains_in_memory_owned_identity_and_cached_result()
+    public void SessionIdentityMismatchRetainsInMemoryOwnedIdentityAndCachedResult()
     {
         var events = new List<string>();
         var launchId = Guid.NewGuid();
@@ -472,7 +472,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Shutdown_already_exited_process_skips_com_and_kill_then_clears_record()
+    public void ShutdownAlreadyExitedProcessSkipsComAndKillThenClearsRecord()
     {
         var fixture = ShutdownFixture.Create(hasExited: true);
 
@@ -491,7 +491,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Shutdown_already_exited_handle_with_identity_mismatch_retains_record()
+    public void ShutdownAlreadyExitedHandleWithIdentityMismatchRetainsRecord()
     {
         var fixture = ShutdownFixture.Create(hasExited: true);
         fixture.Store.Record = fixture.Store.Record! with
@@ -516,14 +516,14 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Managed_wrapper_contract_is_not_disposable()
+    public void ManagedWrapperContractIsNotDisposable()
     {
         Assert.False(typeof(IDisposable).IsAssignableFrom(typeof(IManagedEtabsApplication)));
         Assert.Null(typeof(IManagedEtabsApplication).GetMethod("Dispose"));
     }
 
     [Fact]
-    public void Orphan_cleanup_uses_one_exact_handle_operation_and_clears_after_confirmed_exit()
+    public void OrphanCleanupUsesOneExactHandleOperationAndClearsAfterConfirmedExit()
     {
         var store = new MemoryStore { Record = Record(Guid.NewGuid()) };
         var processes = new FakeProcesses
@@ -545,7 +545,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Orphan_cleanup_pid_reuse_identity_mismatch_never_kills_and_retains_record()
+    public void OrphanCleanupPidReuseIdentityMismatchNeverKillsAndRetainsRecord()
     {
         var store = new MemoryStore { Record = Record(Guid.NewGuid()) };
         var processes = new FakeProcesses
@@ -565,7 +565,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Orphan_cleanup_unreadable_identity_never_kills_and_retains_record()
+    public void OrphanCleanupUnreadableIdentityNeverKillsAndRetainsRecord()
     {
         var store = new MemoryStore { Record = Record(Guid.NewGuid()) };
         var processes = new FakeProcesses
@@ -584,7 +584,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Orphan_cleanup_exact_handle_exit_unconfirmed_retains_record()
+    public void OrphanCleanupExactHandleExitUnconfirmedRetainsRecord()
     {
         var store = new MemoryStore { Record = Record(Guid.NewGuid()) };
         var processes = new FakeProcesses
@@ -604,7 +604,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Orphan_cleanup_true_not_found_clears_record_without_kill()
+    public void OrphanCleanupTrueNotFoundClearsRecordWithoutKill()
     {
         var store = new MemoryStore { Record = Record(Guid.NewGuid()) };
         var processes = new FakeProcesses

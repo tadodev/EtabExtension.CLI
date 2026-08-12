@@ -118,7 +118,7 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
     }
 
     [Fact]
-    public void PostLaunchAmbiguity_does_not_release_handle_when_exit_is_unconfirmed()
+    public void PostLaunchAmbiguityDoesNotReleaseHandleWhenExitIsUnconfirmed()
     {
         var owned = new FakeOwnedProcess(Identity(42), waitForExitResult: false);
         var processes = new FakeProcesses(

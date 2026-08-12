@@ -8,7 +8,7 @@ namespace EtabExtension.CLI.Tests;
 public sealed class ServeCommandLifecycleTests
 {
     [Fact]
-    public async Task Startup_orphan_recovery_failure_fails_closed_before_loop_and_still_converges_cleanup()
+    public async Task StartupOrphanRecoveryFailureFailsClosedBeforeLoopAndStillConvergesCleanup()
     {
         var recoveryData = new ManagedEtabsShutdownData(
             ManagedEtabsShutdownState.IdentityMismatch,

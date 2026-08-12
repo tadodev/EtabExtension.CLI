@@ -10,7 +10,7 @@ namespace EtabExtension.CLI.Tests;
 public sealed class ServeShutdownCoordinatorTests
 {
     [Fact]
-    public async Task Concurrent_and_repeated_shutdown_is_one_sta_cleanup_then_one_worker_disposal()
+    public async Task ConcurrentAndRepeatedShutdownIsOneStaCleanupThenOneWorkerDisposal()
     {
         var events = new List<string>();
         var terminal = Success(forced: true);
@@ -56,7 +56,7 @@ public sealed class ServeShutdownCoordinatorTests
     }
 
     [Fact]
-    public async Task Typed_shutdown_failure_preserves_terminal_data_and_bounded_stable_error()
+    public async Task TypedShutdownFailurePreservesTerminalDataAndBoundedStableError()
     {
         var data = new ManagedEtabsShutdownData(
             ManagedEtabsShutdownState.ProcessExitUnconfirmed,
@@ -91,7 +91,7 @@ public sealed class ServeShutdownCoordinatorTests
     }
 
     [Fact]
-    public async Task Caller_cancellation_only_abandons_that_wait_and_does_not_cancel_safety_cleanup()
+    public async Task CallerCancellationOnlyAbandonsThatWaitAndDoesNotCancelSafetyCleanup()
     {
         var terminal = Success(forced: false);
         var session = new FakeSession(terminal, []);
@@ -116,7 +116,7 @@ public sealed class ServeShutdownCoordinatorTests
     }
 
     [Fact]
-    public async Task Dispose_async_starts_and_awaits_the_same_shutdown_path()
+    public async Task DisposeAsyncStartsAndAwaitsTheSameShutdownPath()
     {
         var session = new FakeSession(Success(forced: false), []);
         var worker = new ControlledWorker([]);
@@ -139,7 +139,7 @@ public sealed class ServeShutdownCoordinatorTests
     }
 
     [Fact]
-    public void Coordinator_registration_is_scoped()
+    public void CoordinatorRegistrationIsScoped()
     {
         var services = new ServiceCollection();
 

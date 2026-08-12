@@ -9,7 +9,7 @@ namespace EtabExtension.CLI.Tests;
 public sealed class EtabsApiDiagnosticFormatterTests
 {
     [Fact]
-    public void Exception_formats_fixed_hresult_normalizes_controls_and_ignores_deeper_inner()
+    public void ExceptionFormatsFixedHresultNormalizesControlsAndIgnoresDeeperInner()
     {
         var deeper = new InvalidOperationException("must-not-appear");
         var inner = new TestException("inner\r\n\t\u0001message", unchecked((int)0x80070005), deeper);
@@ -26,7 +26,7 @@ public sealed class EtabsApiDiagnosticFormatterTests
     }
 
     [Fact]
-    public void Exception_enforces_operation_type_message_and_total_limits()
+    public void ExceptionEnforcesOperationTypeMessageAndTotalLimits()
     {
         var operation = new string('o', EtabsApiDiagnosticFormatter.OperationLimit + 20);
         var longType = CreateExceptionWithTypeName(
@@ -45,7 +45,7 @@ public sealed class EtabsApiDiagnosticFormatterTests
     }
 
     [Fact]
-    public void Exception_caps_inner_components_independently()
+    public void ExceptionCapsInnerComponentsIndependently()
     {
         var inner = CreateExceptionWithTypeName(
             new string('I', EtabsApiDiagnosticFormatter.ExceptionTypeLimit + 40),
@@ -67,7 +67,7 @@ public sealed class EtabsApiDiagnosticFormatterTests
     }
 
     [Fact]
-    public void Api_return_preserves_exact_signed_code_and_bounds_operation()
+    public void ApiReturnPreservesExactSignedCodeAndBoundsOperation()
     {
         var diagnostic = EtabsApiDiagnosticFormatter.ApiReturn(
             new string('o', EtabsApiDiagnosticFormatter.OperationLimit + 1),

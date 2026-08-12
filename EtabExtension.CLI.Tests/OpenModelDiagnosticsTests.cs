@@ -10,7 +10,7 @@ public sealed class OpenModelDiagnosticsTests
     private const string CurrentPath = @"D:\Models\current.edb";
 
     [Fact]
-    public void Get_model_filename_exception_preserves_active_operation_and_bounded_com_evidence()
+    public void GetModelFilenameExceptionPreservesActiveOperationAndBoundedComEvidence()
     {
         var saveCalls = 0;
         var openCalls = 0;
@@ -39,7 +39,7 @@ public sealed class OpenModelDiagnosticsTests
     }
 
     [Fact]
-    public void Save_nonzero_returns_exact_bounded_api_diagnostic_and_does_not_open()
+    public void SaveNonzeroReturnsExactBoundedApiDiagnosticAndDoesNotOpen()
     {
         var openCalls = 0;
 
@@ -63,7 +63,7 @@ public sealed class OpenModelDiagnosticsTests
     }
 
     [Fact]
-    public void Save_exception_preserves_save_as_active_operation()
+    public void SaveExceptionPreservesSaveAsActiveOperation()
     {
         var exception = new TestException("save failed", unchecked((int)0x80070005));
 
@@ -80,7 +80,7 @@ public sealed class OpenModelDiagnosticsTests
     }
 
     [Fact]
-    public void Open_nonzero_returns_exact_bounded_api_diagnostic()
+    public void OpenNonzeroReturnsExactBoundedApiDiagnostic()
     {
         var result = OpenModelService.OpenOnAttachedModel(
             TargetPath,
@@ -101,7 +101,7 @@ public sealed class OpenModelDiagnosticsTests
     }
 
     [Fact]
-    public void Open_exception_preserves_open_as_active_operation()
+    public void OpenExceptionPreservesOpenAsActiveOperation()
     {
         var exception = new TestException("open failed", unchecked((int)0x8000FFFF));
 
@@ -118,7 +118,7 @@ public sealed class OpenModelDiagnosticsTests
     }
 
     [Fact]
-    public void Save_false_never_saves_and_success_preserves_existing_result_data()
+    public void SaveFalseNeverSavesAndSuccessPreservesExistingResultData()
     {
         var saveCalls = 0;
         var openCalls = 0;
