@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.Versioning;
 using EtabSharp.Core;
+using ETABSv1;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Win32;
 
@@ -222,6 +223,52 @@ public interface IOwnedEtabsProcess : IDisposable
 public interface IEtabsProcessStarter
 {
     IOwnedEtabsProcess Start(string executablePath);
+}
+
+public interface IManagedEtabsApplication : IDisposable
+{
+    ETABSApplication Application { get; }
+    ManagedProcessIdentity Identity { get; }
+    Guid ManagedLaunchRecordId { get; }
+    int InitializeNewModel();
+    int ExitWithoutSaving();
+    bool HasExited { get; }
+    bool WaitForExit(TimeSpan timeout);
+    void Kill();
+}
+
+public sealed class ManagedEtabsApplication(
+    ETABSApplication application,
+    ManagedProcessIdentity identity,
+    Guid launchRecordId,
+    IOwnedEtabsProcess ownedProcess) : IManagedEtabsApplication
+{
+    public ETABSApplication Application { get; } = application;
+    public ManagedProcessIdentity Identity { get; } = identity;
+    public Guid ManagedLaunchRecordId { get; } = launchRecordId;
+    public bool HasExited => ownedProcess.HasExited;
+
+    public int InitializeNewModel() =>
+        Application.Model.ModelInfo.InitializeNewModel(eUnits.kip_in_F);
+
+    public int ExitWithoutSaving() =>
+        Application.Application.ApplicationExit(false);
+
+    public bool WaitForExit(TimeSpan timeout) => ownedProcess.WaitForExit(timeout);
+
+    public void Kill() => ownedProcess.Kill();
+
+    public void Dispose()
+    {
+        try
+        {
+            Application.Dispose();
+        }
+        finally
+        {
+            ownedProcess.Dispose();
+        }
+    }
 }
 
 public sealed class WindowsEtabsProcessStarter : IEtabsProcessStarter

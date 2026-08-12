@@ -333,16 +333,21 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
             throw new InvalidOperationException("Fake must not expose COM");
         public ManagedProcessIdentity Identity => process.Identity;
         public Guid ManagedLaunchRecordId { get; } = launchRecordId;
+        public bool HasExited => process.HasExited;
         public int ExitCount { get; private set; }
         public int DisposeCount { get; private set; }
-        public void ExitWithoutSaving()
+        public int InitializeNewModel() => 0;
+        public int ExitWithoutSaving()
         {
             ExitCount++;
             if (throwOnExit)
             {
                 throw new InvalidOperationException("COM exit failed");
             }
+            return 0;
         }
+        public bool WaitForExit(TimeSpan timeout) => process.WaitForExit(timeout);
+        public void Kill() => process.Kill();
         public void Dispose()
         {
             DisposeCount++;

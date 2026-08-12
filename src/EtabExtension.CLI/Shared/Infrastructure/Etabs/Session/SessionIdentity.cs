@@ -3,7 +3,6 @@ using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using EtabExtension.CLI.Features.GetStatus.Models;
-using EtabSharp.Core;
 using Microsoft.Extensions.Configuration;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
@@ -191,75 +190,94 @@ public sealed class WindowsProcessInspector : IProcessInspector
 
 public interface IOrphanSessionCleaner
 {
-    void Clean();
+    ManagedEtabsShutdownResult Clean();
 }
 
 public sealed class OrphanSessionCleaner(
     ISessionRecordStore records,
     IProcessInspector processes) : IOrphanSessionCleaner
 {
-    public void Clean()
+    public ManagedEtabsShutdownResult Clean()
     {
         var record = records.Read();
         if (record is null)
         {
             records.Clear();
-            return;
+            return Succeeded(ownedPid: null, forced: false);
         }
 
         var live = processes.Find(record.Pid);
-        if (live is not null && IdentityMatches(record, live))
+        if (live is null)
         {
-            Console.Error.WriteLine(
-                $"⚠ Managed ETABS orphan detected (PID {record.Pid}, launch {record.ManagedLaunchRecordId}). " +
-                "Unsaved state is untrusted; terminating it. A clean reopen is required.");
-            processes.Terminate(record.Pid);
-            if (!processes.WaitForExit(record.Pid, TimeSpan.FromSeconds(10)))
-                Console.Error.WriteLine($"⚠ Timed out waiting for managed ETABS orphan PID {record.Pid} to exit.");
+            records.Clear();
+            return Succeeded(record.Pid, forced: false);
         }
-        else if (live is not null)
+
+        if (!IdentityMatches(record, live))
         {
-            Console.Error.WriteLine($"⚠ Stale ETABS session record for PID {record.Pid}; identity tuple did not match. Process was not targeted.");
+            return Failed(
+                ManagedEtabsShutdownState.IdentityMismatch,
+                ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                "Managed ETABS orphan identity tuple did not match; process was not targeted.",
+                record.Pid,
+                forced: false);
+        }
+
+        Console.Error.WriteLine(
+            $"⚠ Managed ETABS orphan detected (PID {record.Pid}, launch {record.ManagedLaunchRecordId}). " +
+            "Unsaved state is untrusted; terminating it. A clean reopen is required.");
+        processes.Terminate(record.Pid);
+        var exitConfirmed = processes.WaitForExit(record.Pid, TimeSpan.FromSeconds(10));
+        if (!exitConfirmed)
+            Console.Error.WriteLine($"⚠ Timed out waiting for managed ETABS orphan PID {record.Pid} to exit.");
+
+        if (!exitConfirmed)
+        {
+            return Failed(
+                ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                "Exact-identity orphan termination did not confirm process exit.",
+                record.Pid,
+                forced: true);
         }
 
         records.Clear();
+        return Succeeded(record.Pid, forced: true);
     }
+
+    private static ManagedEtabsShutdownResult Succeeded(int? ownedPid, bool forced) => new(
+        true,
+        null,
+        null,
+        new(
+            ManagedEtabsShutdownState.Succeeded,
+            ProcessExitConfirmed: true,
+            Forced: forced,
+            RecordRetained: false,
+            ApplicationExitReturnCode: null,
+            OwnedPid: ownedPid));
+
+    private static ManagedEtabsShutdownResult Failed(
+        ManagedEtabsShutdownState state,
+        string errorCode,
+        string error,
+        int ownedPid,
+        bool forced) => new(
+        false,
+        errorCode,
+        error,
+        new(
+            state,
+            ProcessExitConfirmed: false,
+            Forced: forced,
+            RecordRetained: true,
+            ApplicationExitReturnCode: null,
+            OwnedPid: ownedPid));
 
     internal static bool IdentityMatches(ManagedEtabsSessionRecord record, ManagedProcessIdentity live) =>
         record.Pid == live.Pid
         && record.ProcessStartTimeUtc.ToUniversalTime() == live.ProcessStartTimeUtc.ToUniversalTime()
         && string.Equals(Path.GetFullPath(record.ExecutablePath), Path.GetFullPath(live.ExecutablePath), StringComparison.OrdinalIgnoreCase);
-}
-
-public interface IManagedEtabsApplication : IDisposable
-{
-    ETABSApplication Application { get; }
-    ManagedProcessIdentity Identity { get; }
-    Guid ManagedLaunchRecordId { get; }
-    void ExitWithoutSaving();
-}
-
-public sealed class ManagedEtabsApplication(
-    ETABSApplication application,
-    ManagedProcessIdentity identity,
-    Guid launchRecordId,
-    IOwnedEtabsProcess ownedProcess) : IManagedEtabsApplication
-{
-    public ETABSApplication Application { get; } = application;
-    public ManagedProcessIdentity Identity { get; } = identity;
-    public Guid ManagedLaunchRecordId { get; } = launchRecordId;
-    public void ExitWithoutSaving() => Application.Application.ApplicationExit(false);
-    public void Dispose()
-    {
-        try
-        {
-            Application.Dispose();
-        }
-        finally
-        {
-            ownedProcess.Dispose();
-        }
-    }
 }
 
 public interface IManagedEtabsLauncher
@@ -438,7 +456,12 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     {
         try
         {
-            managed.ExitWithoutSaving();
+            var exitReturnCode = managed.ExitWithoutSaving();
+            if (exitReturnCode != 0)
+            {
+                _diagnostics.WriteLine(
+                    $"⚠ ApplicationExit(false) returned {exitReturnCode} for managed ETABS PID {managed.Identity.Pid} after ownership failure.");
+            }
         }
         catch (Exception ex)
         {
