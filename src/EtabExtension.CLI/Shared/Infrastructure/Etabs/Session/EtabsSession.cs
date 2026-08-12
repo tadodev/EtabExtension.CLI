@@ -8,18 +8,42 @@ public interface IEtabsSession : IDisposable
     IManagedEtabsApplication GetOrStartOwned();
     bool IsStarted { get; }
     int? ProcessId { get; }
-    void Shutdown();
+    ManagedEtabsShutdownResult Shutdown();
 }
 
-public sealed class EtabsSession(
-    IManagedEtabsLauncher launcher,
-    IProcessInspector processes,
-    ISessionRecordStore records) : IEtabsSession
+public sealed class EtabsSession : IEtabsSession
 {
+    private readonly IManagedEtabsLauncher _launcher;
+    private readonly IProcessInspector _processes;
+    private readonly ISessionRecordStore _records;
+    private readonly IManagedEtabsShutdownMachine _shutdownMachine;
     private readonly object _gate = new();
     private IManagedEtabsApplication? _owned;
+    private bool _ready;
+    private EtabsLaunchException? _launchFailure;
+    private ManagedEtabsShutdownResult? _shutdownResult;
 
-    public bool IsStarted { get { lock (_gate) return _owned is not null; } }
+    public EtabsSession(
+        IManagedEtabsLauncher launcher,
+        IProcessInspector processes,
+        ISessionRecordStore records)
+        : this(launcher, processes, records, new ManagedEtabsShutdownMachine(records))
+    {
+    }
+
+    internal EtabsSession(
+        IManagedEtabsLauncher launcher,
+        IProcessInspector processes,
+        ISessionRecordStore records,
+        IManagedEtabsShutdownMachine shutdownMachine)
+    {
+        _launcher = launcher;
+        _processes = processes;
+        _records = records;
+        _shutdownMachine = shutdownMachine;
+    }
+
+    public bool IsStarted { get { lock (_gate) return _owned is not null && _ready; } }
     public int? ProcessId { get { lock (_gate) return _owned?.Identity.Pid; } }
 
     public ETABSApplication GetOrStart() => GetOrStartOwned().Application;
@@ -28,44 +52,100 @@ public sealed class EtabsSession(
     {
         lock (_gate)
         {
+            if (_launchFailure is not null)
+            {
+                throw _launchFailure;
+            }
+
+            if (_shutdownResult is not null)
+            {
+                throw new InvalidOperationException(
+                    "Managed ETABS session has reached a terminal shutdown state.");
+            }
+
             if (_owned is null)
             {
                 Console.Error.WriteLine("ℹ Starting ETABS (hidden, shared serve session)...");
-                var launched = launcher.Launch();
+                var launched = _launcher.Launch();
+                _owned = launched;
                 try
                 {
-                    records.Write(ToRecord(launched));
-                    _owned = launched;
+                    _records.Write(ToRecord(launched));
                 }
                 catch
                 {
-                    try { launched.ExitWithoutSaving(); } catch { }
-                    try { launched.Dispose(); } catch { }
+                    var cleanup = _shutdownMachine.Shutdown(launched);
+                    _shutdownResult = cleanup;
+                    _owned = null;
                     throw;
                 }
+
+                var initializationFailure = Initialize(launched);
+                if (initializationFailure is not null)
+                {
+                    var cleanup = _shutdownMachine.Shutdown(launched);
+                    _shutdownResult = cleanup;
+                    _owned = null;
+                    _ready = false;
+                    _launchFailure = new EtabsLaunchException(
+                        EtabsLaunchErrorCodes.ModelInitializationFailed,
+                        $"{initializationFailure.Value.Diagnostic}; " +
+                        $"state={cleanup.Data.State}; " +
+                        $"processExitConfirmed={cleanup.Data.ProcessExitConfirmed}; " +
+                        $"forced={cleanup.Data.Forced}; " +
+                        $"recordRetained={cleanup.Data.RecordRetained}.",
+                        initializationFailure.Value.Exception);
+                    throw _launchFailure;
+                }
+
+                _ready = true;
                 Console.Error.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
             }
 
             try
             {
+                if (!_ready)
+                {
+                    throw new InvalidOperationException(
+                        "Managed ETABS session is owned but not API-ready.");
+                }
                 Verify(_owned);
                 return _owned;
             }
             catch
             {
-                try { _owned.ExitWithoutSaving(); } catch { }
-                try { _owned.Dispose(); } catch { }
+                _shutdownResult = _shutdownMachine.Shutdown(_owned);
                 _owned = null;
-                records.Clear();
+                _ready = false;
                 throw;
             }
         }
     }
 
+    private static (string Diagnostic, Exception? Exception)? Initialize(
+        IManagedEtabsApplication owned)
+    {
+        try
+        {
+            var returnCode = owned.InitializeNewModel();
+            return returnCode == 0
+                ? null
+                : (EtabsApiDiagnosticFormatter.ApiReturn(
+                    "cSapModel.InitializeNewModel",
+                    returnCode), null);
+        }
+        catch (Exception exception)
+        {
+            return (EtabsApiDiagnosticFormatter.Exception(
+                "cSapModel.InitializeNewModel",
+                exception), exception);
+        }
+    }
+
     private void Verify(IManagedEtabsApplication owned)
     {
-        var record = records.Read();
-        var live = processes.Find(owned.Identity.Pid);
+        var record = _records.Read();
+        var live = _processes.Find(owned.Identity.Pid);
         if (record is null || live is null
             || record.ManagedLaunchRecordId != owned.ManagedLaunchRecordId
             || !OrphanSessionCleaner.IdentityMatches(record, live)
@@ -76,22 +156,61 @@ public sealed class EtabsSession(
         }
     }
 
-    public void Shutdown()
+    public ManagedEtabsShutdownResult Shutdown()
     {
         lock (_gate)
         {
-            if (_owned is null) { records.Clear(); return; }
-            try { _owned.ExitWithoutSaving(); }
-            catch (Exception ex) { Console.Error.WriteLine($"⚠ ApplicationExit failed: {ex.Message}"); }
-            try { _owned.Dispose(); }
-            catch (Exception ex) { Console.Error.WriteLine($"⚠ Dispose failed: {ex.Message}"); }
+            if (_shutdownResult is not null)
+            {
+                return _shutdownResult;
+            }
+
+            if (_owned is null)
+            {
+                var record = _records.Read();
+                _shutdownResult = record is null
+                    ? NoOwnedProcessSuccess()
+                    : NoOwnedProcessFailure(record);
+                return _shutdownResult;
+            }
+
+            _shutdownResult = _shutdownMachine.Shutdown(_owned);
             _owned = null;
-            records.Clear();
+            _ready = false;
             Console.Error.WriteLine("ℹ Shared ETABS session shut down.");
+            return _shutdownResult;
         }
     }
 
-    public void Dispose() => Shutdown();
+    public void Dispose()
+    {
+        _ = Shutdown();
+    }
+
+    private static ManagedEtabsShutdownResult NoOwnedProcessSuccess() => new(
+        true,
+        null,
+        null,
+        new(
+            ManagedEtabsShutdownState.Succeeded,
+            ProcessExitConfirmed: true,
+            Forced: false,
+            RecordRetained: false,
+            ApplicationExitReturnCode: null,
+            OwnedPid: null));
+
+    private static ManagedEtabsShutdownResult NoOwnedProcessFailure(
+        ManagedEtabsSessionRecord record) => new(
+        false,
+        ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+        "A managed ETABS recovery record exists, but this session has no authoritative process handle.",
+        new(
+            ManagedEtabsShutdownState.IdentityMismatch,
+            ProcessExitConfirmed: false,
+            Forced: false,
+            RecordRetained: true,
+            ApplicationExitReturnCode: null,
+            OwnedPid: record.Pid));
 
     private static ManagedEtabsSessionRecord ToRecord(IManagedEtabsApplication owned) => new(
         1,

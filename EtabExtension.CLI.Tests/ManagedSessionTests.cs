@@ -49,6 +49,155 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
+    public void Session_writes_recovery_record_before_exact_once_initialization_and_reuses_ready_session()
+    {
+        var events = new List<string>();
+        var launchId = Guid.NewGuid();
+        var managed = new FakeManaged(
+            Identity,
+            launchId,
+            events,
+            exitReturnCode: 0,
+            exitException: null,
+            waitResults: [],
+            hasExited: false);
+        var launcher = new FakeLauncher(managed, events);
+        var store = new MemoryStore(events);
+        var processes = new FakeProcesses { Live = Identity };
+        var session = new EtabsSession(launcher, processes, store);
+
+        var first = session.GetOrStartOwned();
+        var second = session.GetOrStartOwned();
+
+        Assert.Same(managed, first);
+        Assert.Same(first, second);
+        Assert.Equal(1, launcher.LaunchCount);
+        Assert.Equal(1, managed.InitializeCount);
+        Assert.True(session.IsStarted);
+        Assert.NotNull(store.Record);
+        Assert.Equal(
+            ["launch", "ownership-proven", "record-write", "initialize"],
+            events);
+    }
+
+    [Fact]
+    public void Session_initialization_nonzero_uses_strong_cleanup_and_does_not_relaunch()
+    {
+        var events = new List<string>();
+        var launchId = Guid.NewGuid();
+        var managed = new FakeManaged(
+            Identity,
+            launchId,
+            events,
+            exitReturnCode: 0,
+            exitException: null,
+            waitResults: [true],
+            hasExited: false,
+            initializeReturnCode: 5);
+        var launcher = new FakeLauncher(managed, events);
+        var store = new MemoryStore(events);
+        var session = new EtabsSession(
+            launcher,
+            new FakeProcesses { Live = Identity },
+            store);
+
+        var first = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+        var second = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+
+        Assert.Equal("ETABS_MODEL_INITIALIZATION_FAILED", first.Code);
+        Assert.Equal(first.Message, second.Message);
+        Assert.Contains("cSapModel.InitializeNewModel", first.Message, StringComparison.Ordinal);
+        Assert.Contains("returnCode=5", first.Message, StringComparison.Ordinal);
+        Assert.Contains("processExitConfirmed=True", first.Message, StringComparison.Ordinal);
+        Assert.Equal(1, launcher.LaunchCount);
+        Assert.Equal(1, managed.InitializeCount);
+        Assert.Equal(1, managed.ExitCount);
+        Assert.Equal(0, managed.KillCount);
+        Assert.Equal(1, managed.DisposeCount);
+        Assert.Null(store.Record);
+        Assert.Equal(
+            [
+                "launch",
+                "ownership-proven",
+                "record-write",
+                "initialize",
+                "application-exit",
+                "wait-10",
+                "record-clear",
+                "dispose"
+            ],
+            events);
+    }
+
+    [Fact]
+    public void Session_initialization_exception_retains_record_when_process_exit_is_unconfirmed()
+    {
+        var events = new List<string>();
+        var launchId = Guid.NewGuid();
+        var managed = new FakeManaged(
+            Identity,
+            launchId,
+            events,
+            exitReturnCode: 0,
+            exitException: null,
+            waitResults: [false, false],
+            hasExited: false,
+            initializeException: new TestException("not ready\r\n", unchecked((int)0x80004005)));
+        var launcher = new FakeLauncher(managed, events);
+        var store = new MemoryStore(events);
+        var session = new EtabsSession(
+            launcher,
+            new FakeProcesses { Live = Identity },
+            store);
+
+        var error = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+
+        Assert.Equal("ETABS_MODEL_INITIALIZATION_FAILED", error.Code);
+        Assert.Contains("operation=cSapModel.InitializeNewModel", error.Message, StringComparison.Ordinal);
+        Assert.Contains("hresult=0x80004005", error.Message, StringComparison.Ordinal);
+        Assert.Contains("state=ProcessExitUnconfirmed", error.Message, StringComparison.Ordinal);
+        Assert.Contains("processExitConfirmed=False", error.Message, StringComparison.Ordinal);
+        Assert.Contains("recordRetained=True", error.Message, StringComparison.Ordinal);
+        Assert.Equal(1, launcher.LaunchCount);
+        Assert.Equal(1, managed.InitializeCount);
+        Assert.Equal(1, managed.ExitCount);
+        Assert.Equal(1, managed.KillCount);
+        Assert.Equal(1, managed.DisposeCount);
+        Assert.NotNull(store.Record);
+    }
+
+    [Fact]
+    public void Session_shutdown_returns_cached_terminal_result_without_repeating_side_effects()
+    {
+        var events = new List<string>();
+        var launchId = Guid.NewGuid();
+        var managed = new FakeManaged(
+            Identity,
+            launchId,
+            events,
+            exitReturnCode: 0,
+            exitException: null,
+            waitResults: [true],
+            hasExited: false);
+        var store = new MemoryStore(events);
+        var session = new EtabsSession(
+            new FakeLauncher(managed, events),
+            new FakeProcesses { Live = Identity },
+            store);
+        session.GetOrStartOwned();
+
+        var first = session.Shutdown();
+        var second = session.Shutdown();
+
+        Assert.Same(first, second);
+        Assert.True(first.Success);
+        Assert.True(first.Data.ProcessExitConfirmed);
+        Assert.Equal(1, managed.ExitCount);
+        Assert.Equal(1, managed.DisposeCount);
+        Assert.Null(store.Record);
+    }
+
+    [Fact]
     public void Shutdown_exit_zero_and_graceful_process_exit_succeeds_and_clears_record()
     {
         var fixture = ShutdownFixture.Create(waitResults: [true]);
@@ -352,11 +501,28 @@ public sealed class ManagedSessionTests
         }
     }
 
+    private sealed class FakeLauncher(
+        FakeManaged managed,
+        List<string> events) : IManagedEtabsLauncher
+    {
+        public int LaunchCount { get; private set; }
+
+        public IManagedEtabsApplication Launch()
+        {
+            LaunchCount++;
+            events.Add("launch");
+            events.Add("ownership-proven");
+            return managed;
+        }
+    }
+
     private sealed class FakeManaged : IManagedEtabsApplication
     {
         private readonly List<string> _events;
         private readonly int _exitReturnCode;
         private readonly Exception? _exitException;
+        private readonly int _initializeReturnCode;
+        private readonly Exception? _initializeException;
         private readonly Queue<bool> _waitResults;
 
         public FakeManaged(
@@ -366,13 +532,17 @@ public sealed class ManagedSessionTests
             int exitReturnCode,
             Exception? exitException,
             IEnumerable<bool> waitResults,
-            bool hasExited)
+            bool hasExited,
+            int initializeReturnCode = 0,
+            Exception? initializeException = null)
         {
             Identity = identity;
             ManagedLaunchRecordId = launchId;
             _events = events;
             _exitReturnCode = exitReturnCode;
             _exitException = exitException;
+            _initializeReturnCode = initializeReturnCode;
+            _initializeException = initializeException;
             _waitResults = new(waitResults);
             HasExited = hasExited;
         }
@@ -385,9 +555,19 @@ public sealed class ManagedSessionTests
         public int ExitCount { get; private set; }
         public int KillCount { get; private set; }
         public int DisposeCount { get; private set; }
+        public int InitializeCount { get; private set; }
         public List<TimeSpan> WaitTimeouts { get; } = [];
 
-        public int InitializeNewModel() => 0;
+        public int InitializeNewModel()
+        {
+            _events.Add("initialize");
+            InitializeCount++;
+            if (_initializeException is not null)
+            {
+                throw _initializeException;
+            }
+            return _initializeReturnCode;
+        }
 
         public int ExitWithoutSaving()
         {

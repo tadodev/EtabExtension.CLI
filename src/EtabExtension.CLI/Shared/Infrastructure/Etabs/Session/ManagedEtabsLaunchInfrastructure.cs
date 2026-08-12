@@ -16,6 +16,7 @@ public static class EtabsLaunchErrorCodes
     public const string ProcessIdentityFailed = "ETABS_PROCESS_IDENTITY_FAILED";
     public const string AttachTimeout = "ETABS_ATTACH_TIMEOUT";
     public const string ExternalOrAmbiguousInstance = "ETABS_EXTERNAL_OR_AMBIGUOUS_INSTANCE";
+    public const string ModelInitializationFailed = "ETABS_MODEL_INITIALIZATION_FAILED";
 }
 
 public sealed class EtabsLaunchException : InvalidOperationException

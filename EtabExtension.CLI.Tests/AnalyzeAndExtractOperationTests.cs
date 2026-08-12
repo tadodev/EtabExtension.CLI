@@ -108,7 +108,7 @@ public sealed class AnalyzeAndExtractOperationTests : IDisposable
             return null!;
         }
         public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
-        public void Shutdown() { }
+        public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
         public void Dispose() { }
     }
 }
