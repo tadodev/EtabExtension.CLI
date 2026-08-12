@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.OpenModel.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.OpenModel;
@@ -57,23 +58,51 @@ public class OpenModelService : IOpenModelService
         if (!filePath.EndsWith(".edb", StringComparison.OrdinalIgnoreCase))
             return Result.Fail<OpenModelData>("Only .edb files can be opened");
 
+        return OpenOnAttachedModel(
+            filePath,
+            save,
+            () => app.Model.ModelInfo.GetModelFilepath(),
+            currentPath => app.Model.Files.SaveFile(currentPath),
+            targetPath => app.Model.Files.OpenFile(targetPath));
+    }
+
+    internal static Result<OpenModelData> OpenOnAttachedModel(
+        string filePath,
+        bool save,
+        Func<string?> getCurrentPath,
+        Func<string, int> saveFile,
+        Func<string, int> openFile)
+    {
+        var activeOperation = "cSapModel.GetModelFilename";
         try
         {
-            var currentPath = app.Model.ModelInfo.GetModelFilepath();
+            var currentPath = getCurrentPath();
             var hasCurrentFile = !string.IsNullOrEmpty(currentPath);
 
             if (hasCurrentFile && save)
             {
                 Console.Error.WriteLine("ℹ Saving current file...");
-                int saveRet = app.Model.Files.SaveFile(currentPath!);
-                if (saveRet != 0)
-                    Console.Error.WriteLine($"⚠ SaveFile returned {saveRet} — continuing");
+                activeOperation = "cFile.Save";
+                var saveReturnCode = saveFile(currentPath!);
+                if (saveReturnCode != 0)
+                {
+                    return Result.Fail<OpenModelData>(
+                        EtabsApiDiagnosticFormatter.ApiReturn(
+                            activeOperation,
+                            saveReturnCode));
+                }
             }
 
             Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
-            int openRet = app.Model.Files.OpenFile(filePath);
-            if (openRet != 0)
-                return Result.Fail<OpenModelData>($"OpenFile failed (ret={openRet})");
+            activeOperation = "cFile.OpenFile";
+            var openReturnCode = openFile(filePath);
+            if (openReturnCode != 0)
+            {
+                return Result.Fail<OpenModelData>(
+                    EtabsApiDiagnosticFormatter.ApiReturn(
+                        activeOperation,
+                        openReturnCode));
+            }
 
             Console.Error.WriteLine($"✓ Opened: {Path.GetFileName(filePath)}");
             return Result.Ok(new OpenModelData
@@ -84,9 +113,12 @@ public class OpenModelService : IOpenModelService
                 OpenedInNewInstance = false
             });
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            return Result.Fail<OpenModelData>($"ETABS COM error: {ex.Message}");
+            return Result.Fail<OpenModelData>(
+                EtabsApiDiagnosticFormatter.Exception(
+                    activeOperation,
+                    exception));
         }
     }
 
