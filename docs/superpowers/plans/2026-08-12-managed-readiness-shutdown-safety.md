@@ -4,7 +4,7 @@
 
 **Goal:** Make a newly owned ETABS session API-ready before use and make every serve termination report truthfully only after exact-process cleanup reaches a terminal state.
 
-**Architecture:** `EtabsSession` writes recovery identity before exact-once initialization, then delegates every failure or normal exit to one `ManagedEtabsShutdownMachine` that retains the authoritative process handle through bounded graceful/forced cleanup. `ServeShutdownCoordinator` queues that same session shutdown on the existing STA worker, caches the result, disposes the worker afterward, and is awaited by every `ServeLoop` termination path before any explicit shutdown response is serialized.
+**Architecture:** `EtabsSession` writes recovery identity before exact-once initialization, then delegates every failure or normal exit to one `ManagedEtabsShutdownMachine` that retains the authoritative process handle through bounded graceful/forced cleanup. `ExitWithoutSaving()` is the sole CSI exit request: the machine never calls EtabSharp `ETABSApplication.Dispose()`, releases only the `IOwnedEtabsProcess` handle after confirmed exit, and retains the wrapper/handle/record on unsafe terminal states. `ServeShutdownCoordinator` queues that same session shutdown on the existing STA worker, caches the result, disposes the worker afterward, and is awaited by every `ServeLoop` termination path before any explicit shutdown response is serialized.
 
 **Tech Stack:** .NET 10, C# 14, System.Text.Json line protocol, EtabSharp/ETABSv1, xUnit, PowerShell release verification.
 
@@ -14,7 +14,7 @@
 
 - Create `src/EtabExtension.CLI/Shared/Infrastructure/Etabs/EtabsApiDiagnosticFormatter.cs`: stable error codes, bounded exception/API-return formatting, and control normalization.
 - Create `src/EtabExtension.CLI/Shared/Infrastructure/Etabs/Session/ManagedEtabsShutdown.cs`: terminal shutdown data and the sole exact-handle shutdown state machine.
-- Modify `src/EtabExtension.CLI/Shared/Infrastructure/Etabs/Session/ManagedEtabsLaunchInfrastructure.cs`: expose initialization, exit return codes, and authoritative process operations through `IManagedEtabsApplication` without releasing the handle early.
+- Modify `src/EtabExtension.CLI/Shared/Infrastructure/Etabs/Session/ManagedEtabsLaunchInfrastructure.cs`: expose initialization, the sole explicit CSI exit request, authoritative process operations, and a process-handle-only release through a non-`IDisposable` `IManagedEtabsApplication`.
 - Modify `src/EtabExtension.CLI/Shared/Infrastructure/Etabs/Session/SessionIdentity.cs`: remove the duplicate managed-application declaration and make orphan cleanup exact-identity/confirmed-exit safe.
 - Modify `src/EtabExtension.CLI/Shared/Infrastructure/Etabs/Session/EtabsSession.cs`: write record before exact-once initialization and route all cleanup through the shutdown machine.
 - Modify `src/EtabExtension.CLI/Features/OpenModel/OpenModelService.cs`: report bounded operation-specific COM/API diagnostics.
@@ -132,7 +132,15 @@ Required cases:
 - record/handle identity or launch ID mismatch: `ETABS_SHUTDOWN_IDENTITY_MISMATCH`, no COM exit, no wait/kill, record retained;
 - process already confirmed gone: no COM call/kill, record cleared;
 - no call ever passes `FileSave=true`;
-- handle `Dispose` occurs only after the terminal result has been determined;
+- EtabSharp `ETABSApplication.Dispose()` is never called because it would issue
+  an implicit second `ApplicationExit(false)`;
+- graceful, forced-confirmed, and API-failure/confirmed-exit cases make exactly
+  one explicit exit request and exactly one process-handle-only release;
+- identity mismatch makes zero explicit exits, kills, wrapper disposals, or
+  handle releases and retains the record plus in-memory owned identity;
+- exit unconfirmed makes exactly one explicit exit and one exact-handle kill,
+  makes zero wrapper disposals/handle releases, and retains the record plus
+  in-memory owned identity;
 - repeated state-machine calls through the session do not repeat side effects.
 
 - [ ] **Step 2: Run managed-session tests and verify RED**
@@ -156,17 +164,18 @@ int ExitWithoutSaving();
 bool HasExited { get; }
 bool WaitForExit(TimeSpan timeout);
 void Kill();
-void Dispose();
+void ReleaseOwnedProcessHandle();
 ```
 
 `ManagedEtabsApplication` delegates `InitializeNewModel()` to
 `Application.Model.ModelInfo.InitializeNewModel(eUnits.kip_in_F)`, delegates
 `ExitWithoutSaving()` to `Application.Application.ApplicationExit(false)`, and
 delegates process properties/actions to the retained `IOwnedEtabsProcess`.
-`Dispose()` releases COM and then the process handle, but the shutdown state
-machine is the only normal caller and invokes it after reaching a terminal
-outcome. Adapt launcher failure cleanup to consume the returned exit code while
-still killing/waiting on the same retained handle.
+`ReleaseOwnedProcessHandle()` calls only `IOwnedEtabsProcess.Dispose()` and never
+calls `ETABSApplication.Dispose()`. Adapt launcher failure cleanup to consume the
+returned exit code while still killing/waiting on the same retained handle; it
+releases that handle only after exit is confirmed and retains it if exit remains
+unconfirmed.
 
 - [ ] **Step 4: Implement `ManagedEtabsShutdownMachine`**
 
@@ -182,9 +191,11 @@ Use `GracefulExitTimeout = TimeSpan.FromSeconds(10)` and
 `ForcedExitTimeout = TimeSpan.FromSeconds(10)`. Validate the durable record
 against full identity plus `ManagedLaunchRecordId` before any COM/process
 action. Call exit, retain its nonzero/exception truth, wait, exact-handle kill if
-needed, wait again, decide the terminal data, then dispose. Clear the store only
-when `ProcessExitConfirmed=true`; otherwise leave it unchanged. Return failure
-with populated terminal data rather than a data-less error.
+needed, wait again, and decide the terminal data. If and only if
+`ProcessExitConfirmed=true`, release the authoritative process handle exactly
+once and clear a matching record. Do not use an unconditional `finally` release.
+On identity mismatch or unconfirmed exit, retain the wrapper, handle, and record.
+Return failure with populated terminal data rather than a data-less error.
 
 - [ ] **Step 5: Strengthen orphan recovery**
 
@@ -243,8 +254,13 @@ launch path: call launcher; assign the owned handle for recovery; write
 flag and return. On nonzero or exception, capture the stable bounded diagnostic,
 invoke the shared shutdown machine, cache its terminal cleanup result, and throw
 the initialization exception with both API failure and terminal safety facts.
-Reuse verifies identity and requires `_ready`; it never initializes again.
-Change `Shutdown()` to return the cached/current `ManagedEtabsShutdownResult`.
+Null `_owned` only when the terminal cleanup reports confirmed process exit; on
+identity mismatch or unconfirmed exit retain `_owned` so the authoritative
+wrapper/handle remains in memory while the cached terminal result prevents
+reuse. Reuse verifies identity and requires `_ready`; it never initializes
+again. Change `Shutdown()` to return the cached/current
+`ManagedEtabsShutdownResult`. `EtabsSession.Dispose()` only invokes `Shutdown()`
+and never calls wrapper disposal or handle release itself.
 
 - [ ] **Step 4: Run readiness tests GREEN**
 
@@ -481,11 +497,13 @@ session record. This smoke must not request any ETABS assembly or launch ETABS.
 
 **Files:** no code changes unless review finds a specification defect.
 
-- [ ] **Step 1: Review the exact implementation diff against all 16 spec matrix items**
+- [ ] **Step 1: Review the exact implementation diff against all 20 spec matrix items**
 
 Check handle lifetime, record ordering, return-code truth, terminal data on
-failure, forced flag, idempotency, STA ordering, EOF/cancellation/fatal cleanup,
-orphan exact identity, and numeric diagnostics.
+failure, forced flag, idempotency, zero EtabSharp-wrapper disposal, exactly one
+explicit CSI exit, confirmed-exit-only process-handle release, unsafe-state
+wrapper retention, STA ordering, EOF/cancellation/fatal cleanup, orphan exact
+identity, and numeric diagnostics.
 
 - [ ] **Step 2: Prepare the proposed supervised three-gate protocol**
 

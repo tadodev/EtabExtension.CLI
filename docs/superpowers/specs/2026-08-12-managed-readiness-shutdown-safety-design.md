@@ -42,6 +42,12 @@ The local Cardex ETABS 23 API cards are authoritative for the two CSI calls:
 - `cOAPI.ApplicationExit(bool FileSave)` returns zero on success and nonzero on
   failure. `FileSave` remains `false` for every managed cleanup path.
 
+EtabSharp `ETABSApplication.Dispose()` is not a passive COM-reference release:
+EtabSharp 0.3.5-beta documents that it calls `ApplicationExit(false)`. Managed
+shutdown therefore never calls `ETABSApplication.Dispose()`. The explicit
+`ExitWithoutSaving()` call is the sole CSI exit request, so every managed
+shutdown path issues zero or one `ApplicationExit(false)` calls, never two.
+
 No arbitrary delay or retry loop substitutes for either return-code contract.
 The only waits are bounded waits on the authoritative owned process handle.
 
@@ -80,10 +86,14 @@ machine uses only the authoritative owned process handle:
 2. Wait a bounded grace period for the exact process to exit.
 3. Force terminate that exact process handle if it remains alive.
 4. Wait for confirmed exit.
-5. Clear the recovery record only after confirmed exit.
+5. Release only the authoritative `IOwnedEtabsProcess` handle and clear the
+   recovery record, both only after confirmed exit.
 
 If exit cannot be confirmed, cleanup preserves the record and reports the
-unresolved process state. No PID obtained only from enumeration is terminated.
+unresolved process state. It also retains the in-memory managed wrapper and its
+authoritative process handle; no wrapper or handle release is permitted while
+process safety is unresolved. No PID obtained only from enumeration is
+terminated.
 
 ## Bounded OpenModel Diagnostics
 
@@ -132,14 +142,25 @@ With proven identity, shutdown executes:
 2. Wait up to 10 seconds for the exact owned process handle to report exit.
 3. If still alive, force terminate only that exact process handle.
 4. Wait up to 10 seconds for confirmed exit.
-5. Dispose COM/process resources and clear the recovery record only after exit
-   is confirmed.
+5. After confirmed exit, call the managed wrapper's process-handle-only release
+   operation exactly once and clear a matching recovery record. Never call
+   `ETABSApplication.Dispose()`.
 
 The authoritative process handle remains alive through both waits and until the
-state machine has produced its terminal result. `Dispose` cannot discard that
-handle earlier. When `ApplicationExit(false)` returns zero but exact-handle
-force termination is required, the successful terminal result records
-`forced=true`; it does not describe the exit as graceful.
+state machine has produced its terminal result. On `IdentityMismatch` or
+`ProcessExitUnconfirmed`, the state machine releases neither the ETABS wrapper
+nor the `IOwnedEtabsProcess` handle; `EtabsSession` retains that same in-memory
+owned wrapper plus the durable record while its cached terminal result prevents
+reuse or repeated cleanup. When `ApplicationExit(false)` returns zero but
+exact-handle force termination is required, the successful terminal result
+records `forced=true`; it does not describe the exit as graceful.
+
+This ownership split is numerically testable. A live, identity-proven shutdown
+makes exactly one explicit `ExitWithoutSaving()` call. A pre-exit identity
+mismatch makes zero. Graceful exit, forced confirmed exit, and CSI API failure
+followed by confirmed exit each make exactly one process-handle-only release.
+Identity mismatch and exit-unconfirmed outcomes make zero releases. Every path
+makes zero `ETABSApplication.Dispose()` calls.
 
 The terminal result separates CSI truth from process safety:
 
@@ -161,9 +182,11 @@ recovery record.
 ## Idempotency and Orphan Recovery
 
 The session caches its terminal shutdown result. Repeated shutdown calls do not
-repeat `ApplicationExit`, force termination, record deletion, or disposal and
-return the same meaningful terminal state. A never-started session with no
-record returns success without touching ETABS.
+repeat `ApplicationExit`, force termination, record deletion, or process-handle
+release and return the same meaningful terminal state. `EtabsSession.Dispose()`
+only invokes the cached `Shutdown()` path; it never disposes the EtabSharp
+wrapper. A never-started session with no record returns success without touching
+ETABS.
 
 Orphan recovery remains exact-identity-only. It terminates only a process whose
 PID, UTC start time, and executable path all match the durable record. It clears
@@ -215,7 +238,7 @@ ETABS-free tests cover:
 8. Unconfirmed forced termination fails with
    `ETABS_PROCESS_EXIT_UNCONFIRMED` and retains recovery evidence.
 9. Identity mismatch never calls `ApplicationExit` or terminates a process and
-   retains the record.
+   retains the record, in-memory wrapper, and authoritative process handle.
 10. The record is never cleared while the verified process remains alive.
 11. `shutdown` emits no response before STA-worker coordinator completion,
     serializes the coordinator's success or typed failure exactly once, and
@@ -232,6 +255,18 @@ ETABS-free tests cover:
 16. Explicit shutdown, stdin EOF/client disconnect, cancellation, normal
     disposal, and fatal loop exit all converge on the same idempotent
     coordinator; none depends on later disposal for process safety.
+17. Graceful exit, forced confirmed exit, and API failure followed by confirmed
+    exit each call `ExitWithoutSaving()` exactly once, release the authoritative
+    process handle exactly once, and never call `ETABSApplication.Dispose()`.
+18. Identity mismatch calls no CSI exit, kill, wrapper disposal, or process
+    handle release; exit-unconfirmed calls one CSI exit and one exact-handle kill
+    but no wrapper disposal or process-handle release. Both retain the record and
+    the same in-memory owned identity.
+19. Initialization-failure cleanup follows the same release rules: it releases
+    only the process handle after confirmed exit and retains the wrapper, handle,
+    and record when exit is unconfirmed.
+20. Repeated `Dispose()` and `Shutdown()` calls do not repeat CSI exit, kill,
+    record clearing, or process-handle release.
 
 ## Verification and Release Boundary
 
