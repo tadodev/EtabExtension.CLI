@@ -17,6 +17,7 @@ public static class EtabsLaunchErrorCodes
     public const string AttachTimeout = "ETABS_ATTACH_TIMEOUT";
     public const string ExternalOrAmbiguousInstance = "ETABS_EXTERNAL_OR_AMBIGUOUS_INSTANCE";
     public const string ModelInitializationFailed = "ETABS_MODEL_INITIALIZATION_FAILED";
+    public const string RecoveryRecordWriteFailed = "ETABS_RECOVERY_RECORD_WRITE_FAILED";
 }
 
 public sealed class EtabsLaunchException : InvalidOperationException

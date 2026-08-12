@@ -409,8 +409,9 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         public EtabsProcessObservation ObserveEtabs() => observation;
         public ManagedProcessIdentity? Find(int pid) =>
             observation.Identified.FirstOrDefault(identity => identity.Pid == pid);
-        public void Terminate(int pid) => throw new NotSupportedException();
-        public bool WaitForExit(int pid, TimeSpan timeout) => throw new NotSupportedException();
+        public ExactProcessTerminationResult TerminateExact(
+            ManagedProcessIdentity expected,
+            TimeSpan timeout) => throw new NotSupportedException();
     }
 
     private sealed class FakeRunAnalysisService : IRunAnalysisService

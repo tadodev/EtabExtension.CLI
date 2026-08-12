@@ -34,6 +34,8 @@ public sealed record ManagedEtabsShutdownResult(
 public interface IManagedEtabsShutdownMachine
 {
     ManagedEtabsShutdownResult Shutdown(IManagedEtabsApplication owned);
+    ManagedEtabsShutdownResult ShutdownAfterRecoveryRecordWriteFailure(
+        IManagedEtabsApplication owned);
 }
 
 public sealed class ManagedEtabsShutdownMachine(
@@ -43,15 +45,26 @@ public sealed class ManagedEtabsShutdownMachine(
     public static readonly TimeSpan ForcedExitTimeout = TimeSpan.FromSeconds(10);
 
     public ManagedEtabsShutdownResult Shutdown(IManagedEtabsApplication owned)
+        => ShutdownCore(owned, ShutdownAuthority.RequireMatchingRecoveryRecord);
+
+    public ManagedEtabsShutdownResult ShutdownAfterRecoveryRecordWriteFailure(
+        IManagedEtabsApplication owned)
+        => ShutdownCore(owned, ShutdownAuthority.AuthoritativeOwnedHandle);
+
+    private ManagedEtabsShutdownResult ShutdownCore(
+        IManagedEtabsApplication owned,
+        ShutdownAuthority authority)
     {
         ArgumentNullException.ThrowIfNull(owned);
 
         ManagedEtabsShutdownResult result;
         var record = records.Read();
+        var recordMatchesOwned = IdentityMatches(record, owned);
 
         try
         {
-            if (!IdentityMatches(record, owned))
+            if (authority == ShutdownAuthority.RequireMatchingRecoveryRecord
+                && !recordMatchesOwned)
             {
                 return Failed(
                     ManagedEtabsShutdownState.IdentityMismatch,
@@ -66,8 +79,12 @@ public sealed class ManagedEtabsShutdownMachine(
 
             if (owned.HasExited)
             {
-                result = Succeeded(owned.Identity.Pid, forced: false, applicationExitReturnCode: null);
-                records.Clear();
+                var recordRetained = ClearMatchingRecord(record, recordMatchesOwned);
+                result = Succeeded(
+                    owned.Identity.Pid,
+                    forced: false,
+                    applicationExitReturnCode: null,
+                    recordRetained);
                 return result;
             }
 
@@ -120,23 +137,29 @@ public sealed class ManagedEtabsShutdownMachine(
                     owned.Identity.Pid,
                     processExitConfirmed: false,
                     forced,
-                    recordRetained: true,
+                    recordRetained: record is not null,
                     applicationExitReturnCode);
                 return result;
             }
 
+            var confirmedRecordRetained = ClearMatchingRecord(record, recordMatchesOwned);
             result = applicationExitError is null
-                ? Succeeded(owned.Identity.Pid, forced, applicationExitReturnCode)
+                ? Succeeded(
+                    owned.Identity.Pid,
+                    forced,
+                    applicationExitReturnCode,
+                    confirmedRecordRetained)
                 : Failed(
                     ManagedEtabsShutdownState.ApplicationExitFailed,
                     ManagedEtabsShutdownErrorCodes.ApplicationExitFailed,
-                    applicationExitError,
+                    EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        applicationExitError,
+                        $"forced={forced.ToString().ToLowerInvariant()}; processExitConfirmed=true"),
                     owned.Identity.Pid,
                     processExitConfirmed: true,
                     forced,
-                    recordRetained: false,
+                    recordRetained: confirmedRecordRetained,
                     applicationExitReturnCode);
-            records.Clear();
             return result;
         }
         finally
@@ -152,6 +175,19 @@ public sealed class ManagedEtabsShutdownMachine(
                     exception));
             }
         }
+    }
+
+    private bool ClearMatchingRecord(
+        ManagedEtabsSessionRecord? record,
+        bool recordMatchesOwned)
+    {
+        if (recordMatchesOwned)
+        {
+            records.Clear();
+            return false;
+        }
+
+        return record is not null;
     }
 
     private static bool IdentityMatches(
@@ -179,7 +215,8 @@ public sealed class ManagedEtabsShutdownMachine(
     private static ManagedEtabsShutdownResult Succeeded(
         int ownedPid,
         bool forced,
-        int? applicationExitReturnCode) => new(
+        int? applicationExitReturnCode,
+        bool recordRetained) => new(
         true,
         null,
         null,
@@ -187,7 +224,7 @@ public sealed class ManagedEtabsShutdownMachine(
             ManagedEtabsShutdownState.Succeeded,
             ProcessExitConfirmed: true,
             Forced: forced,
-            RecordRetained: false,
+            RecordRetained: recordRetained,
             ApplicationExitReturnCode: applicationExitReturnCode,
             OwnedPid: ownedPid));
 
@@ -210,4 +247,10 @@ public sealed class ManagedEtabsShutdownMachine(
             recordRetained,
             applicationExitReturnCode,
             ownedPid));
+
+    private enum ShutdownAuthority
+    {
+        RequireMatchingRecoveryRecord,
+        AuthoritativeOwnedHandle
+    }
 }

@@ -390,7 +390,8 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
 
         public ManagedProcessIdentity? Find(int pid) =>
             _last.Identified.FirstOrDefault(identity => identity.Pid == pid);
-        public void Terminate(int pid) => TerminatedPids.Add(pid);
-        public bool WaitForExit(int pid, TimeSpan timeout) => true;
+        public ExactProcessTerminationResult TerminateExact(
+            ManagedProcessIdentity expected,
+            TimeSpan timeout) => throw new NotSupportedException();
     }
 }

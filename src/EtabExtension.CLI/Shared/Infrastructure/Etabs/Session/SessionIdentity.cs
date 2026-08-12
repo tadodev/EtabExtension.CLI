@@ -124,9 +124,22 @@ public interface IProcessInspector
 {
     EtabsProcessObservation ObserveEtabs();
     ManagedProcessIdentity? Find(int pid);
-    void Terminate(int pid);
-    bool WaitForExit(int pid, TimeSpan timeout);
+    ExactProcessTerminationResult TerminateExact(
+        ManagedProcessIdentity expected,
+        TimeSpan timeout);
 }
+
+public enum ExactProcessTerminationState
+{
+    NotFound,
+    ConfirmedGone,
+    IdentityMismatchOrUnidentified,
+    ExitUnconfirmed
+}
+
+public sealed record ExactProcessTerminationResult(
+    ExactProcessTerminationState State,
+    ManagedProcessIdentity? ObservedIdentity);
 
 public sealed class WindowsProcessInspector : IProcessInspector
 {
@@ -136,14 +149,17 @@ public sealed class WindowsProcessInspector : IProcessInspector
         var unidentifiedCount = 0;
         foreach (var process in Process.GetProcessesByName("ETABS"))
         {
-            var identity = TryRead(process);
-            if (identity is null)
+            using (process)
             {
-                unidentifiedCount++;
-            }
-            else
-            {
-                identified.Add(identity);
+                var identity = TryRead(process);
+                if (identity is null)
+                {
+                    unidentifiedCount++;
+                }
+                else
+                {
+                    identified.Add(identity);
+                }
             }
         }
 
@@ -152,39 +168,98 @@ public sealed class WindowsProcessInspector : IProcessInspector
 
     public ManagedProcessIdentity? Find(int pid)
     {
-        try { return TryRead(Process.GetProcessById(pid)); }
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return TryRead(process);
+        }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception)
         { return null; }
     }
 
-    public void Terminate(int pid)
+    public ExactProcessTerminationResult TerminateExact(
+        ManagedProcessIdentity expected,
+        TimeSpan timeout)
     {
-        // The target may exit between identity verification and this call;
-        // an already-gone process is a successful termination, not a crash.
-        try { Process.GetProcessById(pid).Kill(entireProcessTree: true); }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception) { }
-    }
+        ArgumentNullException.ThrowIfNull(expected);
 
-    public bool WaitForExit(int pid, TimeSpan timeout)
-    {
-        try { return Process.GetProcessById(pid).WaitForExit((int)timeout.TotalMilliseconds); }
-        catch (ArgumentException) { return true; }
+        Process process;
+        try
+        {
+            process = Process.GetProcessById(expected.Pid);
+        }
+        catch (ArgumentException)
+        {
+            return new(ExactProcessTerminationState.NotFound, ObservedIdentity: null);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+        {
+            return new(
+                ExactProcessTerminationState.IdentityMismatchOrUnidentified,
+                ObservedIdentity: null);
+        }
+
+        using (process)
+        {
+            var observed = TryRead(process);
+            if (observed is null || !IdentityMatches(expected, observed))
+            {
+                return new(
+                    ExactProcessTerminationState.IdentityMismatchOrUnidentified,
+                    observed);
+            }
+
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill();
+                }
+
+                return process.HasExited
+                    || process.WaitForExit(checked((int)timeout.TotalMilliseconds))
+                    ? new(ExactProcessTerminationState.ConfirmedGone, observed)
+                    : new(ExactProcessTerminationState.ExitUnconfirmed, observed);
+            }
+            catch (Exception ex) when (
+                ex is InvalidOperationException or Win32Exception or NotSupportedException)
+            {
+                return HasExited(process)
+                    ? new(ExactProcessTerminationState.ConfirmedGone, observed)
+                    : new(ExactProcessTerminationState.ExitUnconfirmed, observed);
+            }
+        }
     }
 
     private static ManagedProcessIdentity? TryRead(Process process)
     {
-        using (process)
+        try
         {
-            try
-            {
-                var path = process.MainModule?.FileName;
-                return string.IsNullOrWhiteSpace(path)
-                    ? null
-                    : new(process.Id, process.StartTime.ToUniversalTime(), Path.GetFullPath(path));
-            }
-            catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
-            { return null; }
+            var path = process.MainModule?.FileName;
+            return string.IsNullOrWhiteSpace(path)
+                ? null
+                : new(process.Id, process.StartTime.ToUniversalTime(), Path.GetFullPath(path));
         }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
+        { return null; }
+    }
+
+    private static bool IdentityMatches(
+        ManagedProcessIdentity expected,
+        ManagedProcessIdentity observed) =>
+        expected.Pid == observed.Pid
+        && expected.ProcessStartTimeUtc.ToUniversalTime()
+            == observed.ProcessStartTimeUtc.ToUniversalTime()
+        && string.Equals(
+            Path.GetFullPath(expected.ExecutablePath),
+            Path.GetFullPath(observed.ExecutablePath),
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasExited(Process process)
+    {
+        try { return process.HasExited; }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+        { return false; }
     }
 }
 
@@ -206,43 +281,37 @@ public sealed class OrphanSessionCleaner(
             return Succeeded(ownedPid: null, forced: false);
         }
 
-        var live = processes.Find(record.Pid);
-        if (live is null)
+        var expected = new ManagedProcessIdentity(
+            record.Pid,
+            record.ProcessStartTimeUtc,
+            record.ExecutablePath);
+        var termination = processes.TerminateExact(expected, TimeSpan.FromSeconds(10));
+        switch (termination.State)
         {
-            records.Clear();
-            return Succeeded(record.Pid, forced: false);
+            case ExactProcessTerminationState.NotFound:
+                records.Clear();
+                return Succeeded(record.Pid, forced: false);
+            case ExactProcessTerminationState.ConfirmedGone:
+                records.Clear();
+                return Succeeded(record.Pid, forced: true);
+            case ExactProcessTerminationState.IdentityMismatchOrUnidentified:
+                return Failed(
+                    ManagedEtabsShutdownState.IdentityMismatch,
+                    ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                    "Managed ETABS orphan identity was mismatched or unreadable; process was not targeted.",
+                    record.Pid,
+                    forced: false);
+            case ExactProcessTerminationState.ExitUnconfirmed:
+                return Failed(
+                    ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                    ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                    "Exact-handle orphan termination did not confirm process exit.",
+                    record.Pid,
+                    forced: true);
+            default:
+                throw new InvalidOperationException(
+                    $"Unknown exact process termination state: {termination.State}.");
         }
-
-        if (!IdentityMatches(record, live))
-        {
-            return Failed(
-                ManagedEtabsShutdownState.IdentityMismatch,
-                ManagedEtabsShutdownErrorCodes.IdentityMismatch,
-                "Managed ETABS orphan identity tuple did not match; process was not targeted.",
-                record.Pid,
-                forced: false);
-        }
-
-        Console.Error.WriteLine(
-            $"⚠ Managed ETABS orphan detected (PID {record.Pid}, launch {record.ManagedLaunchRecordId}). " +
-            "Unsaved state is untrusted; terminating it. A clean reopen is required.");
-        processes.Terminate(record.Pid);
-        var exitConfirmed = processes.WaitForExit(record.Pid, TimeSpan.FromSeconds(10));
-        if (!exitConfirmed)
-            Console.Error.WriteLine($"⚠ Timed out waiting for managed ETABS orphan PID {record.Pid} to exit.");
-
-        if (!exitConfirmed)
-        {
-            return Failed(
-                ManagedEtabsShutdownState.ProcessExitUnconfirmed,
-                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
-                "Exact-identity orphan termination did not confirm process exit.",
-                record.Pid,
-                forced: true);
-        }
-
-        records.Clear();
-        return Succeeded(record.Pid, forced: true);
     }
 
     private static ManagedEtabsShutdownResult Succeeded(int? ownedPid, bool forced) => new(

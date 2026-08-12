@@ -4,6 +4,7 @@ public static class EtabsApiErrorCodes
 {
     public const string ComOperationFailed = "ETABS_COM_OPERATION_FAILED";
     public const string ApiCallFailed = "ETABS_API_CALL_FAILED";
+    public const string InfrastructureOperationFailed = "ETABS_INFRASTRUCTURE_OPERATION_FAILED";
 }
 
 public static class EtabsApiDiagnosticFormatter
@@ -24,12 +25,30 @@ public static class EtabsApiDiagnosticFormatter
     }
 
     public static string Exception(string operation, Exception exception)
+        => ExceptionCore(EtabsApiErrorCodes.ComOperationFailed, operation, exception);
+
+    public static string InfrastructureException(string operation, Exception exception)
+        => ExceptionCore(EtabsApiErrorCodes.InfrastructureOperationFailed, operation, exception);
+
+    public static string AppendTerminalFacts(string diagnostic, string terminalFacts)
+    {
+        var suffix = Component(terminalFacts, TotalLimit);
+        var prefixLimit = TotalLimit - suffix.Length - 2;
+        return prefixLimit <= 0
+            ? suffix
+            : $"{Component(diagnostic, prefixLimit)}; {suffix}";
+    }
+
+    private static string ExceptionCore(
+        string errorCode,
+        string operation,
+        Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);
 
         var fields = new List<string>
         {
-            EtabsApiErrorCodes.ComOperationFailed,
+            errorCode,
             $"operation={Component(operation, OperationLimit)}",
             $"exceptionType={Component(ExceptionType(exception), ExceptionTypeLimit)}",
             $"hresult=0x{unchecked((uint)exception.HResult):X8}",

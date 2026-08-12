@@ -72,12 +72,22 @@ public sealed class EtabsSession : IEtabsSession
                 {
                     _records.Write(ToRecord(launched));
                 }
-                catch
+                catch (Exception recordWriteException)
                 {
-                    var cleanup = _shutdownMachine.Shutdown(launched);
+                    var cleanup = _shutdownMachine
+                        .ShutdownAfterRecoveryRecordWriteFailure(launched);
                     _shutdownResult = cleanup;
                     _owned = null;
-                    throw;
+                    _ready = false;
+                    _launchFailure = new EtabsLaunchException(
+                        EtabsLaunchErrorCodes.RecoveryRecordWriteFailed,
+                        WithTerminalFacts(
+                            EtabsApiDiagnosticFormatter.InfrastructureException(
+                                "ManagedEtabsSessionRecord.Write",
+                                recordWriteException),
+                            cleanup),
+                        recordWriteException);
+                    throw _launchFailure;
                 }
 
                 var initializationFailure = Initialize(launched);
@@ -89,11 +99,9 @@ public sealed class EtabsSession : IEtabsSession
                     _ready = false;
                     _launchFailure = new EtabsLaunchException(
                         EtabsLaunchErrorCodes.ModelInitializationFailed,
-                        $"{initializationFailure.Value.Diagnostic}; " +
-                        $"state={cleanup.Data.State}; " +
-                        $"processExitConfirmed={cleanup.Data.ProcessExitConfirmed}; " +
-                        $"forced={cleanup.Data.Forced}; " +
-                        $"recordRetained={cleanup.Data.RecordRetained}.",
+                        WithTerminalFacts(
+                            initializationFailure.Value.Diagnostic,
+                            cleanup),
                         initializationFailure.Value.Exception);
                     throw _launchFailure;
                 }
@@ -141,6 +149,16 @@ public sealed class EtabsSession : IEtabsSession
                 exception), exception);
         }
     }
+
+    private static string WithTerminalFacts(
+        string diagnostic,
+        ManagedEtabsShutdownResult cleanup) =>
+        EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+            diagnostic,
+            $"state={cleanup.Data.State}; " +
+            $"processExitConfirmed={cleanup.Data.ProcessExitConfirmed}; " +
+            $"forced={cleanup.Data.Forced}; " +
+            $"recordRetained={cleanup.Data.RecordRetained}");
 
     private void Verify(IManagedEtabsApplication owned)
     {
