@@ -167,7 +167,7 @@ public sealed class ManagedSessionTests
     }
 
     [Fact]
-    public void Session_shutdown_returns_cached_terminal_result_without_repeating_side_effects()
+    public void Session_dispose_converges_through_shutdown_once_and_is_idempotent()
     {
         var events = new List<string>();
         var launchId = Guid.NewGuid();
@@ -186,14 +186,16 @@ public sealed class ManagedSessionTests
             store);
         session.GetOrStartOwned();
 
-        var first = session.Shutdown();
-        var second = session.Shutdown();
+        session.Dispose();
+        session.Dispose();
+        var terminal = session.Shutdown();
 
-        Assert.Same(first, second);
-        Assert.True(first.Success);
-        Assert.True(first.Data.ProcessExitConfirmed);
+        Assert.True(terminal.Success);
+        Assert.True(terminal.Data.ProcessExitConfirmed);
         Assert.Equal(1, managed.ExitCount);
         Assert.Equal(1, managed.DisposeCount);
+        Assert.Equal(1, events.Count(item => item == "application-exit"));
+        Assert.Equal(1, events.Count(item => item == "dispose"));
         Assert.Null(store.Record);
     }
 

@@ -203,6 +203,7 @@ public sealed class EtabsSession : IEtabsSession
     public void Dispose()
     {
         _ = Shutdown();
+        _owned?.Dispose();
     }
 
     private static ManagedEtabsShutdownResult NoOwnedProcessSuccess() => new(
