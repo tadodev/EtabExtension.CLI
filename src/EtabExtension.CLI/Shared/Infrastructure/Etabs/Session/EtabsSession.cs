@@ -77,7 +77,10 @@ public sealed class EtabsSession : IEtabsSession
                     var cleanup = _shutdownMachine
                         .ShutdownAfterRecoveryRecordWriteFailure(launched);
                     _shutdownResult = cleanup;
-                    _owned = null;
+                    if (cleanup.Data.ProcessExitConfirmed)
+                    {
+                        _owned = null;
+                    }
                     _ready = false;
                     _launchFailure = new EtabsLaunchException(
                         EtabsLaunchErrorCodes.RecoveryRecordWriteFailed,
@@ -95,7 +98,10 @@ public sealed class EtabsSession : IEtabsSession
                 {
                     var cleanup = _shutdownMachine.Shutdown(launched);
                     _shutdownResult = cleanup;
-                    _owned = null;
+                    if (cleanup.Data.ProcessExitConfirmed)
+                    {
+                        _owned = null;
+                    }
                     _ready = false;
                     _launchFailure = new EtabsLaunchException(
                         EtabsLaunchErrorCodes.ModelInitializationFailed,
@@ -123,7 +129,10 @@ public sealed class EtabsSession : IEtabsSession
             catch
             {
                 _shutdownResult = _shutdownMachine.Shutdown(_owned);
-                _owned = null;
+                if (_shutdownResult.Data.ProcessExitConfirmed)
+                {
+                    _owned = null;
+                }
                 _ready = false;
                 throw;
             }
@@ -193,7 +202,10 @@ public sealed class EtabsSession : IEtabsSession
             }
 
             _shutdownResult = _shutdownMachine.Shutdown(_owned);
-            _owned = null;
+            if (_shutdownResult.Data.ProcessExitConfirmed)
+            {
+                _owned = null;
+            }
             _ready = false;
             Console.Error.WriteLine("ℹ Shared ETABS session shut down.");
             return _shutdownResult;
@@ -203,7 +215,6 @@ public sealed class EtabsSession : IEtabsSession
     public void Dispose()
     {
         _ = Shutdown();
-        _owned?.Dispose();
     }
 
     private static ManagedEtabsShutdownResult NoOwnedProcessSuccess() => new(

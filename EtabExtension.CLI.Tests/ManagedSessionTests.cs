@@ -113,7 +113,8 @@ public sealed class ManagedSessionTests
         Assert.Equal(1, managed.InitializeCount);
         Assert.Equal(1, managed.ExitCount);
         Assert.Equal(0, managed.KillCount);
-        Assert.Equal(1, managed.DisposeCount);
+        Assert.Equal(0, managed.WrapperDisposeCount);
+        Assert.Equal(1, managed.ProcessHandleReleaseCount);
         Assert.Null(store.Record);
         Assert.Equal(
             [
@@ -124,7 +125,7 @@ public sealed class ManagedSessionTests
                 "application-exit",
                 "wait-10",
                 "record-clear",
-                "dispose"
+                "process-handle-release"
             ],
             events);
     }
@@ -162,7 +163,9 @@ public sealed class ManagedSessionTests
         Assert.Equal(1, managed.InitializeCount);
         Assert.Equal(1, managed.ExitCount);
         Assert.Equal(1, managed.KillCount);
-        Assert.Equal(1, managed.DisposeCount);
+        Assert.Equal(0, managed.WrapperDisposeCount);
+        Assert.Equal(0, managed.ProcessHandleReleaseCount);
+        Assert.Equal(Identity.Pid, session.ProcessId);
         Assert.NotNull(store.Record);
     }
 
@@ -193,9 +196,10 @@ public sealed class ManagedSessionTests
         Assert.True(terminal.Success);
         Assert.True(terminal.Data.ProcessExitConfirmed);
         Assert.Equal(1, managed.ExitCount);
-        Assert.Equal(1, managed.DisposeCount);
+        Assert.Equal(0, managed.WrapperDisposeCount);
+        Assert.Equal(1, managed.ProcessHandleReleaseCount);
         Assert.Equal(1, events.Count(item => item == "application-exit"));
-        Assert.Equal(1, events.Count(item => item == "dispose"));
+        Assert.Equal(1, events.Count(item => item == "process-handle-release"));
         Assert.Null(store.Record);
     }
 
@@ -216,7 +220,8 @@ public sealed class ManagedSessionTests
         Assert.Contains("recordRetained=False", error.Message, StringComparison.Ordinal);
         Assert.Equal(1, fixture.Managed.ExitCount);
         Assert.Equal(0, fixture.Managed.KillCount);
-        Assert.Equal(1, fixture.Managed.DisposeCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Equal(0, fixture.Managed.InitializeCount);
         Assert.Null(fixture.Store.Record);
     }
@@ -235,6 +240,8 @@ public sealed class ManagedSessionTests
         Assert.Contains("forced=True", error.Message, StringComparison.Ordinal);
         Assert.Contains("recordRetained=False", error.Message, StringComparison.Ordinal);
         Assert.Equal(1, fixture.Managed.KillCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Equal(
             [ManagedEtabsShutdownMachine.GracefulExitTimeout, ManagedEtabsShutdownMachine.ForcedExitTimeout],
             fixture.Managed.WaitTimeouts);
@@ -257,6 +264,9 @@ public sealed class ManagedSessionTests
         Assert.Contains("forced=True", error.Message, StringComparison.Ordinal);
         Assert.Contains("recordRetained=True", error.Message, StringComparison.Ordinal);
         Assert.Equal(1, fixture.Managed.KillCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(0, fixture.Managed.ProcessHandleReleaseCount);
+        Assert.Equal(Identity.Pid, fixture.Session.ProcessId);
         Assert.NotNull(fixture.Store.Record);
     }
 
@@ -280,6 +290,8 @@ public sealed class ManagedSessionTests
         Assert.Contains("recordRetained=True", error.Message, StringComparison.Ordinal);
         Assert.Equal(1, fixture.Managed.ExitCount);
         Assert.Equal(0, fixture.Managed.KillCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Equal(preexisting, fixture.Store.Record);
         Assert.DoesNotContain("record-clear", fixture.Events);
     }
@@ -302,7 +314,7 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, fixture.Managed.KillCount);
         Assert.Equal([ManagedEtabsShutdownMachine.GracefulExitTimeout], fixture.Managed.WaitTimeouts);
         Assert.Null(fixture.Store.Record);
-        Assert.Equal(["application-exit", "wait-10", "record-clear", "dispose"], fixture.Events);
+        Assert.Equal(["application-exit", "wait-10", "record-clear", "process-handle-release"], fixture.Events);
     }
 
     [Fact]
@@ -320,6 +332,9 @@ public sealed class ManagedSessionTests
         Assert.False(result.Data.RecordRetained);
         Assert.Equal(7, result.Data.ApplicationExitReturnCode);
         Assert.Equal(1, fixture.Managed.KillCount);
+        Assert.Equal(1, fixture.Managed.ExitCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Contains("forced=true", result.Error, StringComparison.Ordinal);
         Assert.Equal(
             [ManagedEtabsShutdownMachine.GracefulExitTimeout, ManagedEtabsShutdownMachine.ForcedExitTimeout],
@@ -347,6 +362,9 @@ public sealed class ManagedSessionTests
         Assert.Contains("0x80004005", result.Error, StringComparison.Ordinal);
         Assert.DoesNotContain(result.Error!, char.IsControl);
         Assert.True(result.Error!.Length <= 2048);
+        Assert.Equal(1, fixture.Managed.ExitCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Null(fixture.Store.Record);
     }
 
@@ -362,6 +380,9 @@ public sealed class ManagedSessionTests
         Assert.True(result.Data.Forced);
         Assert.True(result.Data.ProcessExitConfirmed);
         Assert.Equal(1, fixture.Managed.KillCount);
+        Assert.Equal(1, fixture.Managed.ExitCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Null(fixture.Store.Record);
     }
 
@@ -380,7 +401,10 @@ public sealed class ManagedSessionTests
         Assert.True(result.Data.RecordRetained);
         Assert.NotNull(fixture.Store.Record);
         Assert.Equal(1, fixture.Managed.KillCount);
-        Assert.Equal("dispose", fixture.Events[^1]);
+        Assert.Equal(1, fixture.Managed.ExitCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(0, fixture.Managed.ProcessHandleReleaseCount);
+        Assert.Equal("wait-10", fixture.Events[^1]);
     }
 
     [Theory]
@@ -402,9 +426,46 @@ public sealed class ManagedSessionTests
         Assert.True(result.Data.RecordRetained);
         Assert.Equal(0, fixture.Managed.ExitCount);
         Assert.Equal(0, fixture.Managed.KillCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(0, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Empty(fixture.Managed.WaitTimeouts);
         Assert.NotNull(fixture.Store.Record);
-        Assert.Equal(["dispose"], fixture.Events);
+        Assert.Empty(fixture.Events);
+    }
+
+    [Fact]
+    public void Session_identity_mismatch_retains_in_memory_owned_identity_and_cached_result()
+    {
+        var events = new List<string>();
+        var launchId = Guid.NewGuid();
+        var managed = new FakeManaged(
+            Identity,
+            launchId,
+            events,
+            exitReturnCode: 0,
+            exitException: null,
+            waitResults: [],
+            hasExited: false);
+        var store = new MemoryStore(events);
+        var session = new EtabsSession(
+            new FakeLauncher(managed, events),
+            new FakeProcesses { Live = Identity },
+            store);
+        session.GetOrStartOwned();
+        store.Record = store.Record! with { ManagedLaunchRecordId = Guid.NewGuid() };
+
+        var first = session.Shutdown();
+        session.Dispose();
+        var repeated = session.Shutdown();
+
+        Assert.Same(first, repeated);
+        Assert.Equal(ManagedEtabsShutdownState.IdentityMismatch, first.Data.State);
+        Assert.Equal(Identity.Pid, session.ProcessId);
+        Assert.Equal(0, managed.ExitCount);
+        Assert.Equal(0, managed.KillCount);
+        Assert.Equal(0, managed.WrapperDisposeCount);
+        Assert.Equal(0, managed.ProcessHandleReleaseCount);
+        Assert.NotNull(store.Record);
     }
 
     [Fact]
@@ -419,9 +480,11 @@ public sealed class ManagedSessionTests
         Assert.False(result.Data.Forced);
         Assert.Equal(0, fixture.Managed.ExitCount);
         Assert.Equal(0, fixture.Managed.KillCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Empty(fixture.Managed.WaitTimeouts);
         Assert.Null(fixture.Store.Record);
-        Assert.Equal(["record-clear", "dispose"], fixture.Events);
+        Assert.Equal(["record-clear", "process-handle-release"], fixture.Events);
     }
 
     [Fact]
@@ -441,9 +504,19 @@ public sealed class ManagedSessionTests
         Assert.True(result.Data.RecordRetained);
         Assert.Equal(0, fixture.Managed.ExitCount);
         Assert.Equal(0, fixture.Managed.KillCount);
+        Assert.Equal(0, fixture.Managed.WrapperDisposeCount);
+        Assert.Equal(0, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Empty(fixture.Managed.WaitTimeouts);
         Assert.NotNull(fixture.Store.Record);
-        Assert.Equal(["dispose"], fixture.Events);
+        Assert.Empty(fixture.Events);
+
+    }
+
+    [Fact]
+    public void Managed_wrapper_contract_is_not_disposable()
+    {
+        Assert.False(typeof(IDisposable).IsAssignableFrom(typeof(IManagedEtabsApplication)));
+        Assert.Null(typeof(IManagedEtabsApplication).GetMethod("Dispose"));
     }
 
     [Fact]
@@ -750,7 +823,8 @@ public sealed class ManagedSessionTests
         public bool HasExited { get; private set; }
         public int ExitCount { get; private set; }
         public int KillCount { get; private set; }
-        public int DisposeCount { get; private set; }
+        public int WrapperDisposeCount { get; private set; }
+        public int ProcessHandleReleaseCount { get; private set; }
         public int InitializeCount { get; private set; }
         public List<TimeSpan> WaitTimeouts { get; } = [];
 
@@ -796,8 +870,14 @@ public sealed class ManagedSessionTests
 
         public void Dispose()
         {
-            _events.Add("dispose");
-            DisposeCount++;
+            _events.Add("wrapper-dispose");
+            WrapperDisposeCount++;
+        }
+
+        public void ReleaseOwnedProcessHandle()
+        {
+            _events.Add("process-handle-release");
+            ProcessHandleReleaseCount++;
         }
     }
 

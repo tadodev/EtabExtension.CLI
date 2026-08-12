@@ -87,7 +87,8 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         Assert.Equal(EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance, error.Code);
         Assert.Equal([42], connector.RequestedPids);
         Assert.Equal(1, connector.Managed!.ExitCount);
-        Assert.Equal(1, connector.Managed.DisposeCount);
+        Assert.Equal(0, connector.Managed.WrapperDisposeCount);
+        Assert.Equal(1, connector.Managed.ProcessHandleReleaseCount);
         Assert.Equal(1, owned.KillCount);
         Assert.Equal(1, owned.WaitForExitCount);
         Assert.Equal(1, owned.DisposeCount);
@@ -109,10 +110,31 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         Assert.Equal(1, connector.Managed!.ExitCount);
         Assert.Equal(1, owned.KillCount);
         Assert.Equal(1, owned.WaitForExitCount);
-        Assert.Equal(1, connector.Managed.DisposeCount);
+        Assert.Equal(0, connector.Managed.WrapperDisposeCount);
+        Assert.Equal(1, connector.Managed.ProcessHandleReleaseCount);
         Assert.Equal(1, owned.DisposeCount);
         Assert.Empty(processes.TerminatedPids);
         Assert.DoesNotContain(99, processes.TerminatedPids);
+    }
+
+    [Fact]
+    public void PostLaunchAmbiguity_does_not_release_handle_when_exit_is_unconfirmed()
+    {
+        var owned = new FakeOwnedProcess(Identity(42), waitForExitResult: false);
+        var processes = new FakeProcesses(
+            [Observation(), Observation(owned.Identity, Identity(99))]);
+        var connector = new FakeConnector(succeedOnAttempt: 1);
+        var launcher = CreateLauncher(owned, processes, connector, new StringWriter());
+
+        var error = Assert.Throws<EtabsLaunchException>(() => launcher.Launch());
+
+        Assert.Equal(EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance, error.Code);
+        Assert.Equal(1, connector.Managed!.ExitCount);
+        Assert.Equal(1, owned.KillCount);
+        Assert.Equal(1, owned.WaitForExitCount);
+        Assert.Equal(0, connector.Managed.WrapperDisposeCount);
+        Assert.Equal(0, connector.Managed.ProcessHandleReleaseCount);
+        Assert.Equal(0, owned.DisposeCount);
     }
 
     [Fact]
@@ -128,11 +150,14 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
             new StringWriter(),
             clock);
 
-        using var result = launcher.Launch();
+        var result = launcher.Launch();
 
         Assert.Equal([42, 42, 42], connector.RequestedPids);
         Assert.Equal(2, clock.SleepCount);
         Assert.Equal(0, owned.KillCount);
+        Assert.Same(connector.Managed, result);
+        Assert.Equal(0, connector.Managed!.WrapperDisposeCount);
+        Assert.Equal(0, connector.Managed.ProcessHandleReleaseCount);
     }
 
     [Fact]
@@ -276,7 +301,9 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         public int StartCount { get; private set; }
     }
 
-    private sealed class FakeOwnedProcess(ManagedProcessIdentity identity) : IOwnedEtabsProcess
+    private sealed class FakeOwnedProcess(
+        ManagedProcessIdentity identity,
+        bool waitForExitResult = true) : IOwnedEtabsProcess
     {
         public ManagedProcessIdentity Identity { get; } = identity;
         public bool HasExited { get; set; }
@@ -287,13 +314,16 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         public void Kill()
         {
             KillCount++;
-            HasExited = true;
         }
 
         public bool WaitForExit(TimeSpan timeout)
         {
             WaitForExitCount++;
-            return true;
+            if (waitForExitResult)
+            {
+                HasExited = true;
+            }
+            return waitForExitResult;
         }
 
         public void Dispose() => DisposeCount++;
@@ -335,7 +365,8 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         public Guid ManagedLaunchRecordId { get; } = launchRecordId;
         public bool HasExited => process.HasExited;
         public int ExitCount { get; private set; }
-        public int DisposeCount { get; private set; }
+        public int WrapperDisposeCount { get; private set; }
+        public int ProcessHandleReleaseCount { get; private set; }
         public int InitializeNewModel() => 0;
         public int ExitWithoutSaving()
         {
@@ -350,7 +381,12 @@ public sealed class ManagedEtabsLauncherTests : IDisposable
         public void Kill() => process.Kill();
         public void Dispose()
         {
-            DisposeCount++;
+            WrapperDisposeCount++;
+            process.Dispose();
+        }
+        public void ReleaseOwnedProcessHandle()
+        {
+            ProcessHandleReleaseCount++;
             process.Dispose();
         }
     }

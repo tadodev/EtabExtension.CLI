@@ -425,7 +425,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                     catch
                     {
                         CleanUpManagedApplication(managed, transferredProcess);
-                        ownedProcess = null; // managed cleanup disposed the transferred handle
+                        ownedProcess = null; // managed cleanup retains or releases the transferred handle
                         throw;
                     }
                 }
@@ -538,49 +538,43 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 $"⚠ Could not exit managed ETABS PID {managed.Identity.Pid} after ownership failure: {ex.Message}");
         }
 
-        StopOwnedProcess(ownedProcess, "ownership failure");
-
-        try
+        if (StopOwnedProcess(ownedProcess, "ownership failure"))
         {
-            managed.Dispose();
-        }
-        catch (Exception ex)
-        {
-            _diagnostics.WriteLine(
-                $"⚠ Could not dispose managed ETABS PID {managed.Identity.Pid} after ownership failure: {ex.Message}");
+            managed.ReleaseOwnedProcessHandle();
         }
     }
 
     private void CleanUpOwnedProcess(IOwnedEtabsProcess ownedProcess)
     {
-        try
-        {
-            StopOwnedProcess(ownedProcess, "launch failure");
-        }
-        finally
+        if (StopOwnedProcess(ownedProcess, "launch failure"))
         {
             ownedProcess.Dispose();
         }
     }
 
-    private void StopOwnedProcess(IOwnedEtabsProcess ownedProcess, string context)
+    private bool StopOwnedProcess(IOwnedEtabsProcess ownedProcess, string context)
     {
         try
         {
-            if (!ownedProcess.HasExited)
+            if (ownedProcess.HasExited)
             {
-                ownedProcess.Kill();
-                if (!ownedProcess.WaitForExit(TimeSpan.FromSeconds(10)))
-                {
-                    _diagnostics.WriteLine(
-                        $"⚠ Timed out waiting for owned ETABS PID {ownedProcess.Identity.Pid} to exit after {context}.");
-                }
+                return true;
             }
+
+            ownedProcess.Kill();
+            var confirmed = ownedProcess.WaitForExit(TimeSpan.FromSeconds(10));
+            if (!confirmed)
+            {
+                _diagnostics.WriteLine(
+                    $"⚠ Timed out waiting for owned ETABS PID {ownedProcess.Identity.Pid} to exit after {context}.");
+            }
+            return confirmed;
         }
         catch (Exception ex)
         {
             _diagnostics.WriteLine(
                 $"⚠ Could not stop owned ETABS PID {ownedProcess.Identity.Pid} after {context}: {ex.Message}");
+            return false;
         }
     }
 }

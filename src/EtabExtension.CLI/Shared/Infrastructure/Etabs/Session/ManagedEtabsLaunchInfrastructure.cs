@@ -227,7 +227,7 @@ public interface IEtabsProcessStarter
     IOwnedEtabsProcess Start(string executablePath);
 }
 
-public interface IManagedEtabsApplication : IDisposable
+public interface IManagedEtabsApplication
 {
     ETABSApplication Application { get; }
     ManagedProcessIdentity Identity { get; }
@@ -237,6 +237,7 @@ public interface IManagedEtabsApplication : IDisposable
     bool HasExited { get; }
     bool WaitForExit(TimeSpan timeout);
     void Kill();
+    void ReleaseOwnedProcessHandle();
 }
 
 public sealed class ManagedEtabsApplication(
@@ -260,17 +261,7 @@ public sealed class ManagedEtabsApplication(
 
     public void Kill() => ownedProcess.Kill();
 
-    public void Dispose()
-    {
-        try
-        {
-            Application.Dispose();
-        }
-        finally
-        {
-            ownedProcess.Dispose();
-        }
-    }
+    public void ReleaseOwnedProcessHandle() => ownedProcess.Dispose();
 }
 
 public sealed class WindowsEtabsProcessStarter : IEtabsProcessStarter

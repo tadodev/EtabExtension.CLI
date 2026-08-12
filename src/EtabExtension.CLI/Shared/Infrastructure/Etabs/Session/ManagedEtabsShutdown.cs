@@ -57,124 +57,106 @@ public sealed class ManagedEtabsShutdownMachine(
     {
         ArgumentNullException.ThrowIfNull(owned);
 
-        ManagedEtabsShutdownResult result;
         var record = records.Read();
         var recordMatchesOwned = IdentityMatches(record, owned);
 
+        if (authority == ShutdownAuthority.RequireMatchingRecoveryRecord
+            && !recordMatchesOwned)
+        {
+            return Failed(
+                ManagedEtabsShutdownState.IdentityMismatch,
+                ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                "Managed ETABS recovery record does not match the authoritative owned process handle.",
+                owned.Identity.Pid,
+                processExitConfirmed: false,
+                forced: false,
+                recordRetained: record is not null,
+                applicationExitReturnCode: null);
+        }
+
+        if (owned.HasExited)
+        {
+            var recordRetained = ClearMatchingRecord(record, recordMatchesOwned);
+            owned.ReleaseOwnedProcessHandle();
+            return Succeeded(
+                owned.Identity.Pid,
+                forced: false,
+                applicationExitReturnCode: null,
+                recordRetained);
+        }
+
+        int? applicationExitReturnCode = null;
+        string? applicationExitError = null;
         try
         {
-            if (authority == ShutdownAuthority.RequireMatchingRecoveryRecord
-                && !recordMatchesOwned)
+            applicationExitReturnCode = owned.ExitWithoutSaving();
+            if (applicationExitReturnCode != 0)
             {
-                return Failed(
-                    ManagedEtabsShutdownState.IdentityMismatch,
-                    ManagedEtabsShutdownErrorCodes.IdentityMismatch,
-                    "Managed ETABS recovery record does not match the authoritative owned process handle.",
-                    owned.Identity.Pid,
-                    processExitConfirmed: false,
-                    forced: false,
-                    recordRetained: record is not null,
-                    applicationExitReturnCode: null);
+                applicationExitError = EtabsApiDiagnosticFormatter.ApiReturn(
+                    "cOAPI.ApplicationExit(false)",
+                    applicationExitReturnCode.Value);
             }
+        }
+        catch (Exception exception)
+        {
+            applicationExitError = EtabsApiDiagnosticFormatter.Exception(
+                "cOAPI.ApplicationExit(false)",
+                exception);
+        }
 
-            if (owned.HasExited)
-            {
-                var recordRetained = ClearMatchingRecord(record, recordMatchesOwned);
-                result = Succeeded(
-                    owned.Identity.Pid,
-                    forced: false,
-                    applicationExitReturnCode: null,
-                    recordRetained);
-                return result;
-            }
-
-            int? applicationExitReturnCode = null;
-            string? applicationExitError = null;
+        var processExitConfirmed = TryWait(owned, GracefulExitTimeout);
+        var forced = false;
+        string? cleanupError = null;
+        if (!processExitConfirmed)
+        {
+            forced = true;
             try
             {
-                applicationExitReturnCode = owned.ExitWithoutSaving();
-                if (applicationExitReturnCode != 0)
-                {
-                    applicationExitError = EtabsApiDiagnosticFormatter.ApiReturn(
-                        "cOAPI.ApplicationExit(false)",
-                        applicationExitReturnCode.Value);
-                }
+                owned.Kill();
             }
             catch (Exception exception)
             {
-                applicationExitError = EtabsApiDiagnosticFormatter.Exception(
-                    "cOAPI.ApplicationExit(false)",
+                cleanupError = EtabsApiDiagnosticFormatter.Exception(
+                    "Process.Kill(authoritative-owned-handle)",
                     exception);
             }
 
-            var processExitConfirmed = TryWait(owned, GracefulExitTimeout);
-            var forced = false;
-            string? cleanupError = null;
-            if (!processExitConfirmed)
-            {
-                forced = true;
-                try
-                {
-                    owned.Kill();
-                }
-                catch (Exception exception)
-                {
-                    cleanupError = EtabsApiDiagnosticFormatter.Exception(
-                        "Process.Kill(authoritative-owned-handle)",
-                        exception);
-                }
-
-                processExitConfirmed = TryWait(owned, ForcedExitTimeout);
-            }
-
-            if (!processExitConfirmed)
-            {
-                result = Failed(
-                    ManagedEtabsShutdownState.ProcessExitUnconfirmed,
-                    ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
-                    cleanupError ?? applicationExitError
-                        ?? "The exact owned ETABS process did not confirm exit after graceful and forced cleanup.",
-                    owned.Identity.Pid,
-                    processExitConfirmed: false,
-                    forced,
-                    recordRetained: record is not null,
-                    applicationExitReturnCode);
-                return result;
-            }
-
-            var confirmedRecordRetained = ClearMatchingRecord(record, recordMatchesOwned);
-            result = applicationExitError is null
-                ? Succeeded(
-                    owned.Identity.Pid,
-                    forced,
-                    applicationExitReturnCode,
-                    confirmedRecordRetained)
-                : Failed(
-                    ManagedEtabsShutdownState.ApplicationExitFailed,
-                    ManagedEtabsShutdownErrorCodes.ApplicationExitFailed,
-                    EtabsApiDiagnosticFormatter.AppendTerminalFacts(
-                        applicationExitError,
-                        $"forced={forced.ToString().ToLowerInvariant()}; processExitConfirmed=true"),
-                    owned.Identity.Pid,
-                    processExitConfirmed: true,
-                    forced,
-                    recordRetained: confirmedRecordRetained,
-                    applicationExitReturnCode);
-            return result;
+            processExitConfirmed = TryWait(owned, ForcedExitTimeout);
         }
-        finally
+
+        if (!processExitConfirmed)
         {
-            try
-            {
-                owned.Dispose();
-            }
-            catch (Exception exception)
-            {
-                Console.Error.WriteLine(EtabsApiDiagnosticFormatter.Exception(
-                    "ManagedEtabsApplication.Dispose",
-                    exception));
-            }
+            return Failed(
+                ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                cleanupError ?? applicationExitError
+                    ?? "The exact owned ETABS process did not confirm exit after graceful and forced cleanup.",
+                owned.Identity.Pid,
+                processExitConfirmed: false,
+                forced,
+                recordRetained: record is not null,
+                applicationExitReturnCode);
         }
+
+        var confirmedRecordRetained = ClearMatchingRecord(record, recordMatchesOwned);
+        owned.ReleaseOwnedProcessHandle();
+        return applicationExitError is null
+            ? Succeeded(
+                owned.Identity.Pid,
+                forced,
+                applicationExitReturnCode,
+                confirmedRecordRetained)
+            : Failed(
+                ManagedEtabsShutdownState.ApplicationExitFailed,
+                ManagedEtabsShutdownErrorCodes.ApplicationExitFailed,
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    applicationExitError,
+                    $"forced={forced.ToString().ToLowerInvariant()}; processExitConfirmed=true"),
+                owned.Identity.Pid,
+                processExitConfirmed: true,
+                forced,
+                recordRetained: confirmedRecordRetained,
+                applicationExitReturnCode);
     }
 
     private bool ClearMatchingRecord(
