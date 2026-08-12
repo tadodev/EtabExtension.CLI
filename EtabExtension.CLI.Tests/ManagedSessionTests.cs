@@ -152,6 +152,8 @@ public sealed class ManagedSessionTests
             store);
 
         var error = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+        session.Dispose();
+        var repeated = session.Shutdown();
 
         Assert.Equal("ETABS_MODEL_INITIALIZATION_FAILED", error.Code);
         Assert.Contains("operation=cSapModel.InitializeNewModel", error.Message, StringComparison.Ordinal);
@@ -166,6 +168,7 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, managed.WrapperDisposeCount);
         Assert.Equal(0, managed.ProcessHandleReleaseCount);
         Assert.Equal(Identity.Pid, session.ProcessId);
+        Assert.Equal(ManagedEtabsShutdownState.ProcessExitUnconfirmed, repeated.Data.State);
         Assert.NotNull(store.Record);
     }
 
