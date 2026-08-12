@@ -19,6 +19,7 @@ public static class ServeExtensions
         services.AddScoped<IOrphanSessionCleaner, OrphanSessionCleaner>();
         services.AddScoped<IEtabsSession, EtabsSession>();
         services.AddScoped<IStaExecutionWorker, StaExecutionWorker>();
+        services.AddScoped<IServeShutdownCoordinator, ServeShutdownCoordinator>();
         services.AddScoped<IOperationEventJournalFactory, OperationEventJournalFactory>();
         services.AddScoped<IOperationClock, SystemOperationClock>();
         services.AddScoped<ICachedSessionStatus, CachedSessionStatus>();
