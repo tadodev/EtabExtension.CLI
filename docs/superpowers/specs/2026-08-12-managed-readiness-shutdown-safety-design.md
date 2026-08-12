@@ -72,7 +72,9 @@ A nonzero return or exception from `InitializeNewModel` fails launch with the
 stable code `ETABS_MODEL_INITIALIZATION_FAILED`. The diagnostic includes the
 operation, return code or bounded exception evidence, and the owned PID.
 
-Failure cleanup uses only the authoritative owned process handle:
+Initialization-failure cleanup enters the same shutdown state machine used by
+normal shutdown; it is not a separate or weaker cleanup helper. That state
+machine uses only the authoritative owned process handle:
 
 1. Request `ApplicationExit(false)` when the COM object is usable.
 2. Wait a bounded grace period for the exact process to exit.
@@ -94,6 +96,25 @@ exception produces a stable `ETABS_COM_OPERATION_FAILED` diagnostic containing:
 - a control-character-normalized, length-bounded message;
 - at most one inner exception type, HRESULT, and bounded message.
 
+The formatter applies these numerically testable UTF-16 code-unit bounds:
+
+| Component | Maximum |
+| --- | ---: |
+| Operation/call site | 128 |
+| Outer exception type | 256 |
+| Outer message | 512 |
+| Inner exception type | 256 |
+| Inner message | 512 |
+| Complete formatted diagnostic | 2,048 |
+
+When present, each outer or inner HRESULT is rendered as exactly `0x` followed
+by eight uppercase hexadecimal digits. Before measuring or truncating, the
+formatter normalizes CR, LF, tab, and every other control character to spaces.
+It truncates each over-limit component with one final ellipsis (`…`) while
+keeping that component within its cap, then applies the same final-ellipsis
+rule to keep the complete formatted diagnostic within 2,048 UTF-16 code units.
+Only one inner exception level is inspected or rendered.
+
 Nonzero CSI return codes use `ETABS_API_CALL_FAILED` and include the operation
 and exact return code. Diagnostics never include stack traces, arbitrary object
 dumps, recursively nested exceptions, or unbounded messages.
@@ -113,6 +134,12 @@ With proven identity, shutdown executes:
 4. Wait up to 10 seconds for confirmed exit.
 5. Dispose COM/process resources and clear the recovery record only after exit
    is confirmed.
+
+The authoritative process handle remains alive through both waits and until the
+state machine has produced its terminal result. `Dispose` cannot discard that
+handle earlier. When `ApplicationExit(false)` returns zero but exact-handle
+force termination is required, the successful terminal result records
+`forced=true`; it does not describe the exit as graceful.
 
 The terminal result separates CSI truth from process safety:
 
@@ -145,20 +172,26 @@ preserves the record and emits a typed/bounded diagnostic for later recovery.
 
 ## Serve Protocol Ordering
 
-`ServeLoop` receives one idempotent asynchronous shutdown coordinator. On a
-`shutdown` request, it awaits the coordinator's complete terminal result and
-serializes that result afterward. It never writes an optimistic success response
-and then depends on scope disposal for cleanup.
+`ServeLoop` receives one idempotent asynchronous shutdown coordinator. Every
+serve termination path converges on that same coordinator: an explicit
+`shutdown` request, stdin EOF or client disconnect, cancellation, normal
+disposal, and fatal loop exit. No path may rely on a later `Dispose` call for
+process safety.
+
+For an explicit `shutdown` request, the loop awaits the STA-worker coordinator's
+complete terminal result, serializes that result only afterward, and then
+terminates the loop. It never writes an optimistic success response and then
+depends on scope disposal for cleanup.
 
 The coordinator submits the session shutdown state machine to the existing STA
 worker and awaits it. The worker's serial queue places shutdown after any ETABS
 work already accepted by that daemon and keeps COM cleanup on the same apartment
 that created and used the managed application. Only after the session reaches a
 terminal shutdown state does the coordinator dispose the worker. The
-command-level `finally` path invokes the same coordinator for stdin EOF,
-cancellation, or exceptions; idempotency avoids duplicate cleanup. A protocol
-failure can therefore state both the CSI outcome and whether the ETABS process
-is confirmed gone.
+command-level `finally` path invokes the same coordinator for stdin EOF/client
+disconnect, cancellation, normal disposal, or fatal loop exit; idempotency
+avoids duplicate cleanup. A protocol failure can therefore state both the CSI
+outcome and whether the ETABS process is confirmed gone.
 
 ## Regression Matrix
 
@@ -169,7 +202,8 @@ ETABS-free tests cover:
 2. Initialization return zero marks the session ready; reuse does not initialize
    again.
 3. Initialization nonzero and exception produce
-   `ETABS_MODEL_INITIALIZATION_FAILED` with bounded call evidence.
+   `ETABS_MODEL_INITIALIZATION_FAILED` with bounded call evidence, then enter
+   the same exact-handle shutdown state machine as normal cleanup.
 4. Initialization failure clears the record only after confirmed exact-process
    exit and retains it when exit is unconfirmed.
 5. `ApplicationExit(false)` return zero plus normal process exit succeeds and
@@ -177,20 +211,27 @@ ETABS-free tests cover:
 6. Nonzero/exceptional `ApplicationExit(false)` never reports success, even when
    exact-handle forced termination confirms zero process.
 7. Return zero with a still-live process force terminates only the exact owned
-   handle, confirms exit, and succeeds.
+   handle, confirms exit, succeeds, and records `forced=true`.
 8. Unconfirmed forced termination fails with
    `ETABS_PROCESS_EXIT_UNCONFIRMED` and retains recovery evidence.
 9. Identity mismatch never calls `ApplicationExit` or terminates a process and
    retains the record.
 10. The record is never cleared while the verified process remains alive.
-11. `shutdown` emits no response before coordinator completion and serializes
-    the coordinator's success or typed failure exactly once.
+11. `shutdown` emits no response before STA-worker coordinator completion,
+    serializes the coordinator's success or typed failure exactly once, and
+    terminates the loop only afterward.
 12. Repeated shutdown is deterministic/idempotent and never saves.
 13. Orphan recovery remains full-identity-only and retains the record on unsafe
     or unconfirmed cleanup.
 14. OpenModel exception and return-code diagnostics are bounded and preserve the
     operation, exception type, HRESULT, message, one inner level, and API return
     code where applicable.
+15. The formatter enforces every component cap and the 2,048 UTF-16-code-unit
+    total cap, uses fixed-width uppercase HRESULTs, normalizes controls, and
+    truncates with a final ellipsis without exceeding a cap.
+16. Explicit shutdown, stdin EOF/client disconnect, cancellation, normal
+    disposal, and fatal loop exit all converge on the same idempotent
+    coordinator; none depends on later disposal for process safety.
 
 ## Verification and Release Boundary
 
