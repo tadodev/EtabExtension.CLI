@@ -43,7 +43,16 @@ public sealed class EtabsSession : IEtabsSession
         _shutdownMachine = shutdownMachine;
     }
 
-    public bool IsStarted { get { lock (_gate) return _owned is not null && _ready; } }
+    public bool IsStarted
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _owned is not null && _ready;
+            }
+        }
+    }
     public int? ProcessId { get { lock (_gate) return _owned?.Identity.Pid; } }
 
     public ETABSApplication GetOrStart() => GetOrStartOwned().Application;
