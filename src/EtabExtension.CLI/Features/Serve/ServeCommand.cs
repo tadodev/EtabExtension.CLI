@@ -1,6 +1,6 @@
 using System.CommandLine;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
-using EtabExtension.CLI.Features.Serve.Operations;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EtabExtension.CLI.Features.Serve;
@@ -18,12 +18,11 @@ public static class ServeCommand
         {
             // One DI scope for the daemon's whole life so the shared session and the
             // (scoped) feature services live and die together.
-            using var scope = services.CreateScope();
+            await using var scope = services.CreateAsyncScope();
             var provider = scope.ServiceProvider;
-            var session = provider.GetRequiredService<IEtabsSession>();
             var dispatcher = provider.GetRequiredService<IServeDispatcher>();
-            var operations = provider.GetRequiredService<IOperationManager>();
             var orphanCleaner = provider.GetRequiredService<IOrphanSessionCleaner>();
+            var shutdown = provider.GetRequiredService<IServeShutdownCoordinator>();
 
             // Program.cs redirects Console.Out to stderr — write the protocol to the
             // REAL stdout. "\n" line endings keep framing clean for the Rust reader.
@@ -34,18 +33,65 @@ public static class ServeCommand
             };
             using var stdin = new StreamReader(Console.OpenStandardInput());
 
-            try
-            {
-                orphanCleaner.Clean();
-                await new ServeLoop(dispatcher).RunAsync(stdin, stdout);
-            }
-            finally
-            {
-                operations.Dispose();
-                session.Shutdown();
-            }
+            await RunLifecycleAsync(
+                orphanCleaner,
+                shutdown,
+                () => new ServeLoop(dispatcher, shutdown).RunAsync(stdin, stdout),
+                Console.Error);
         });
 
         return command;
+    }
+
+    internal static async Task RunLifecycleAsync(
+        IOrphanSessionCleaner orphanCleaner,
+        IServeShutdownCoordinator shutdown,
+        Func<Task> runLoop,
+        TextWriter diagnostics)
+    {
+        ArgumentNullException.ThrowIfNull(orphanCleaner);
+        ArgumentNullException.ThrowIfNull(shutdown);
+        ArgumentNullException.ThrowIfNull(runLoop);
+        ArgumentNullException.ThrowIfNull(diagnostics);
+
+        try
+        {
+            var recovery = orphanCleaner.Clean();
+            if (!recovery.Success)
+            {
+                throw new EtabsLaunchException(
+                    recovery.ErrorCode ?? ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                    recovery.Error ?? "Managed ETABS orphan recovery failed closed.");
+            }
+
+            await runLoop();
+        }
+        finally
+        {
+            try
+            {
+                var cleanup = await shutdown.ShutdownAsync();
+                if (!cleanup.Success)
+                {
+                    var diagnostic = cleanup.Error
+                        ?? "Serve cleanup failed without a diagnostic.";
+                    await diagnostics.WriteLineAsync(
+                        EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                            diagnostic,
+                            $"state={cleanup.Data?.State.ToString() ?? "unknown"}; " +
+                            $"processExitConfirmed={cleanup.Data?.ProcessExitConfirmed ?? false}; " +
+                            $"recordRetained={cleanup.Data?.RecordRetained ?? true}"));
+                }
+                await diagnostics.FlushAsync();
+            }
+            catch (Exception cleanupException)
+            {
+                await diagnostics.WriteLineAsync(
+                    EtabsApiDiagnosticFormatter.InfrastructureException(
+                        "IServeShutdownCoordinator.ShutdownAsync",
+                        cleanupException));
+                await diagnostics.FlushAsync();
+            }
+        }
     }
 }

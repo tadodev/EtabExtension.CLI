@@ -1,6 +1,8 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 namespace EtabExtension.CLI.Features.Serve;
 
@@ -20,17 +22,29 @@ public sealed class ServeLoop
     internal const string ShutdownCommand = "shutdown";
 
     private readonly IServeDispatcher _dispatcher;
+    private readonly IServeShutdownCoordinator _shutdown;
     private readonly ServeHandshake _handshake;
+    private readonly TextWriter _diagnostics;
 
-    public ServeLoop(IServeDispatcher dispatcher) : this(dispatcher, ServeHandshake.Current)
+    public ServeLoop(
+        IServeDispatcher dispatcher,
+        IServeShutdownCoordinator shutdown) : this(
+            dispatcher,
+            shutdown,
+            ServeHandshake.Current,
+            Console.Error)
     {
     }
 
     internal ServeLoop(
         IServeDispatcher dispatcher,
-        Func<IReadOnlyList<string>, ServeHandshake> handshakeFactory)
+        IServeShutdownCoordinator shutdown,
+        Func<IReadOnlyList<string>, ServeHandshake> handshakeFactory,
+        TextWriter diagnostics)
     {
         _dispatcher = dispatcher;
+        _shutdown = shutdown;
+        _diagnostics = diagnostics;
         var capabilities = dispatcher.Capabilities
             .Append(ShutdownCommand)
             .Order(StringComparer.Ordinal)
@@ -45,57 +59,107 @@ public sealed class ServeLoop
     /// </summary>
     public async Task RunAsync(TextReader input, TextWriter output, CancellationToken ct = default)
     {
-        await output.WriteLineAsync(JsonSerializer.Serialize(
-            _handshake, ServeJson.Options));
-        await output.FlushAsync(ct);
-        Console.Error.WriteLine("ℹ etab-cli serve: ready (line-delimited JSON on stdin/stdout)");
-
-        while (!ct.IsCancellationRequested)
+        var explicitShutdown = false;
+        try
         {
-            string? line = await input.ReadLineAsync(ct);
-            if (line is null)
-            {
-                break; // stdin closed
-            }
+            await output.WriteLineAsync(JsonSerializer.Serialize(
+                _handshake, ServeJson.Options));
+            await output.FlushAsync(ct);
+            Console.Error.WriteLine("ℹ etab-cli serve: ready (line-delimited JSON on stdin/stdout)");
 
-            if (string.IsNullOrWhiteSpace(line))
+            while (true)
             {
-                continue;
-            }
-
-            long id = 0;
-            try
-            {
-                var request = JsonSerializer.Deserialize<ServeRequest>(line, ServeJson.Options);
-                if (request is null || string.IsNullOrWhiteSpace(request.Command))
+                ct.ThrowIfCancellationRequested();
+                string? line = await input.ReadLineAsync(ct);
+                if (line is null)
                 {
-                    await WriteAsync(output, id, Result.Fail("Malformed request: missing command"));
+                    break;
+                }
+
+                if (string.IsNullOrWhiteSpace(line))
+                {
                     continue;
                 }
 
-                id = request.Id;
+                ServeRequest? request;
+                try
+                {
+                    request = JsonSerializer.Deserialize<ServeRequest>(line, ServeJson.Options);
+                }
+                catch (JsonException exception)
+                {
+                    await WriteAsync(
+                        output,
+                        id: 0,
+                        Result.Fail($"Invalid request JSON: {exception.Message}"));
+                    continue;
+                }
+
+                if (request is null || string.IsNullOrWhiteSpace(request.Command))
+                {
+                    await WriteAsync(
+                        output,
+                        request?.Id ?? 0,
+                        Result.Fail("Malformed request: missing command"));
+                    continue;
+                }
 
                 if (string.Equals(
                     request.Command,
                     ShutdownCommand,
                     StringComparison.OrdinalIgnoreCase))
                 {
-                    await WriteAsync(output, id, Result.Ok());
-                    return; // graceful shutdown — caller disposes the session
+                    explicitShutdown = true;
+                    var terminal = await _shutdown.ShutdownAsync();
+                    await WriteAsync(output, request.Id, terminal);
+                    return;
                 }
 
-                object result = await _dispatcher.DispatchAsync(request.Command, request.Request, ct);
-                await WriteAsync(output, id, result);
-            }
-            catch (JsonException ex)
-            {
-                await WriteAsync(output, id, Result.Fail($"Invalid request JSON: {ex.Message}"));
-            }
-            catch (Exception ex)
-            {
-                await WriteAsync(output, id, Result.Fail($"Sidecar error: {ex.Message}"));
+                var result = await _dispatcher.DispatchAsync(
+                    request.Command,
+                    request.Request,
+                    ct);
+                await WriteAsync(output, request.Id, result);
             }
         }
+        finally
+        {
+            try
+            {
+                var cleanup = await _shutdown.ShutdownAsync();
+                if (!cleanup.Success && !explicitShutdown)
+                {
+                    await WriteCleanupFailureAsync(cleanup);
+                }
+            }
+            catch (Exception cleanupException)
+            {
+                await WriteCleanupExceptionAsync(cleanupException);
+            }
+        }
+    }
+
+    private async Task WriteCleanupFailureAsync(
+        Result<ManagedEtabsShutdownData> cleanup)
+    {
+        var diagnostic = cleanup.Error
+            ?? "Serve cleanup failed without a diagnostic.";
+        var bounded = EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+            diagnostic,
+            $"state={cleanup.Data?.State.ToString() ?? "unknown"}; " +
+            $"processExitConfirmed={cleanup.Data?.ProcessExitConfirmed ?? false}; " +
+            $"recordRetained={cleanup.Data?.RecordRetained ?? true}");
+        await _diagnostics.WriteLineAsync(bounded);
+        await _diagnostics.FlushAsync();
+    }
+
+    private async Task WriteCleanupExceptionAsync(Exception exception)
+    {
+        var bounded = EtabsApiDiagnosticFormatter.InfrastructureException(
+            "IServeShutdownCoordinator.ShutdownAsync",
+            exception);
+        await _diagnostics.WriteLineAsync(bounded);
+        await _diagnostics.FlushAsync();
     }
 
     /// <summary>

@@ -1,6 +1,7 @@
 using System.Text.Json;
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using Xunit;
 
 namespace EtabExtension.CLI.Tests;
@@ -38,7 +39,11 @@ public class ServeLoopTests
     }
 
     private static ServeLoop CreateLoop(IServeDispatcher dispatcher) =>
-        new(dispatcher, TestHandshake);
+        new(
+            dispatcher,
+            ShutdownCoordinator.Completed(SuccessShutdown()),
+            TestHandshake,
+            TextWriter.Null);
 
     private static ServeHandshake TestHandshake(IReadOnlyList<string> capabilities) => new(
         "etab-cli-serve",
@@ -182,5 +187,335 @@ public class ServeLoopTests
         Assert.Equal(1, responses[0].GetProperty("id").GetInt64());
         Assert.True(responses[0].GetProperty("success").GetBoolean());
         Assert.Empty(dispatcher.Commands);
+    }
+
+    [Fact]
+    public async Task Shutdown_waits_for_cleanup_then_writes_one_success_with_terminal_data_and_stops_reading()
+    {
+        var dispatcher = new FakeDispatcher();
+        var coordinator = new ShutdownCoordinator();
+        using var reader = new CountingReader(
+            "{\"id\":41,\"command\":\"shutdown\"}",
+            "{\"id\":42,\"command\":\"get-status\"}");
+        await using var writer = new StringWriter();
+        var loop = new ServeLoop(dispatcher, coordinator, TestHandshake, TextWriter.Null);
+
+        var running = loop.RunAsync(reader, writer);
+        await coordinator.Called;
+
+        Assert.Empty(ResponseLines(writer));
+        Assert.False(running.IsCompleted);
+        Assert.Equal(1, reader.ReadCount);
+
+        coordinator.Complete(SuccessShutdown(forced: true));
+        await running;
+
+        var response = Assert.Single(ResponseLines(writer));
+        Assert.Equal(41, response.GetProperty("id").GetInt64());
+        Assert.True(response.GetProperty("success").GetBoolean());
+        var data = response.GetProperty("data");
+        Assert.True(data.GetProperty("processExitConfirmed").GetBoolean());
+        Assert.True(data.GetProperty("forced").GetBoolean());
+        Assert.Equal("succeeded", data.GetProperty("state").GetString());
+        Assert.Equal(2, coordinator.CallCount);
+        Assert.Equal(1, coordinator.UnderlyingStartCount);
+        Assert.Equal(1, reader.ReadCount);
+        Assert.Empty(dispatcher.Commands);
+    }
+
+    [Fact]
+    public async Task Shutdown_waits_for_cleanup_then_writes_typed_failure_with_populated_data()
+    {
+        var coordinator = new ShutdownCoordinator();
+        using var reader = new CountingReader(
+            "{\"id\":51,\"command\":\"shutdown\"}",
+            "{\"id\":52,\"command\":\"get-status\"}");
+        await using var writer = new StringWriter();
+        var loop = new ServeLoop(
+            new FakeDispatcher(),
+            coordinator,
+            TestHandshake,
+            TextWriter.Null);
+        var failure = ShutdownFailure();
+
+        var running = loop.RunAsync(reader, writer);
+        await coordinator.Called;
+        Assert.Empty(ResponseLines(writer));
+
+        coordinator.Complete(failure);
+        await running;
+
+        var response = Assert.Single(ResponseLines(writer));
+        Assert.Equal(51, response.GetProperty("id").GetInt64());
+        Assert.False(response.GetProperty("success").GetBoolean());
+        Assert.Contains(
+            ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+            response.GetProperty("error").GetString(),
+            StringComparison.Ordinal);
+        var data = response.GetProperty("data");
+        Assert.False(data.GetProperty("processExitConfirmed").GetBoolean());
+        Assert.True(data.GetProperty("recordRetained").GetBoolean());
+        Assert.Equal("processExitUnconfirmed", data.GetProperty("state").GetString());
+        Assert.Equal(1, reader.ReadCount);
+    }
+
+    [Fact]
+    public async Task Stdin_eof_converges_on_shutdown_coordinator()
+    {
+        var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
+        using var reader = new StringReader(string.Empty);
+        await using var writer = new StringWriter();
+
+        await new ServeLoop(
+            new FakeDispatcher(),
+            coordinator,
+            TestHandshake,
+            TextWriter.Null).RunAsync(reader, writer);
+
+        Assert.Equal(1, coordinator.CallCount);
+        Assert.Equal(1, coordinator.UnderlyingStartCount);
+    }
+
+    [Fact]
+    public async Task Cancellation_cleans_up_then_preserves_original_cancellation()
+    {
+        var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
+        using var reader = new BlockingReader();
+        await using var writer = new StringWriter();
+        using var cancellation = new CancellationTokenSource();
+        var running = new ServeLoop(
+            new FakeDispatcher(),
+            coordinator,
+            TestHandshake,
+            TextWriter.Null).RunAsync(reader, writer, cancellation.Token);
+        await reader.ReadStarted;
+
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => running);
+        Assert.Equal(1, coordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task Fatal_reader_error_is_preserved_after_cleanup_failure_is_bounded_and_logged()
+    {
+        var coordinator = ShutdownCoordinator.Completed(ShutdownFailure());
+        using var reader = new FatalReader(new IOException("reader failed"));
+        await using var writer = new StringWriter();
+        await using var diagnostics = new StringWriter();
+        var loop = new ServeLoop(
+            new FakeDispatcher(),
+            coordinator,
+            TestHandshake,
+            diagnostics);
+
+        var error = await Assert.ThrowsAsync<IOException>(() => loop.RunAsync(reader, writer));
+
+        Assert.Equal("reader failed", error.Message);
+        Assert.Contains(
+            ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+            diagnostics.ToString(),
+            StringComparison.Ordinal);
+        Assert.All(
+            diagnostics.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries),
+            line => Assert.True(line.Length <= 2048));
+        Assert.Equal(1, coordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task Fatal_reader_error_is_preserved_when_cleanup_itself_throws()
+    {
+        var coordinator = new ThrowingCoordinator(
+            new InvalidOperationException("cleanup exploded\r\n"));
+        using var reader = new FatalReader(new IOException("reader failed"));
+        await using var writer = new StringWriter();
+        await using var diagnostics = new StringWriter();
+        var loop = new ServeLoop(
+            new FakeDispatcher(),
+            coordinator,
+            TestHandshake,
+            diagnostics);
+
+        var error = await Assert.ThrowsAsync<IOException>(() => loop.RunAsync(reader, writer));
+
+        Assert.Equal("reader failed", error.Message);
+        Assert.Contains(
+            "operation=IServeShutdownCoordinator.ShutdownAsync",
+            diagnostics.ToString(),
+            StringComparison.Ordinal);
+        var diagnostic = diagnostics.ToString().TrimEnd('\r', '\n');
+        Assert.DoesNotContain(diagnostic, char.IsControl);
+        Assert.True(diagnostic.Length <= 2048);
+        Assert.Equal(1, coordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task Fatal_dispatch_error_is_preserved_after_cleanup()
+    {
+        var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
+        using var reader = new StringReader("{\"id\":61,\"command\":\"explode\"}\n");
+        await using var writer = new StringWriter();
+        var loop = new ServeLoop(
+            new FatalDispatcher(),
+            coordinator,
+            TestHandshake,
+            TextWriter.Null);
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => loop.RunAsync(reader, writer));
+
+        Assert.Equal("dispatch failed", error.Message);
+        Assert.Empty(ResponseLines(writer));
+        Assert.Equal(1, coordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task Fatal_handshake_writer_error_is_preserved_after_cleanup()
+    {
+        var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
+        using var reader = new StringReader(string.Empty);
+        await using var writer = new FatalWriter(new IOException("handshake failed"));
+        var loop = new ServeLoop(
+            new FakeDispatcher(),
+            coordinator,
+            TestHandshake,
+            TextWriter.Null);
+
+        var error = await Assert.ThrowsAsync<IOException>(
+            () => loop.RunAsync(reader, writer));
+
+        Assert.Equal("handshake failed", error.Message);
+        Assert.Equal(1, coordinator.CallCount);
+    }
+
+    private static IReadOnlyList<JsonElement> ResponseLines(StringWriter writer) =>
+        writer.ToString()
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(line => JsonSerializer.Deserialize<JsonElement>(line))
+            .Where(element => element.TryGetProperty("id", out _))
+            .ToList();
+
+    private static Result<ManagedEtabsShutdownData> SuccessShutdown(bool forced = false) =>
+        Result.Ok(new ManagedEtabsShutdownData(
+            ManagedEtabsShutdownState.Succeeded,
+            ProcessExitConfirmed: true,
+            Forced: forced,
+            RecordRetained: false,
+            ApplicationExitReturnCode: 0,
+            OwnedPid: 42));
+
+    private static Result<ManagedEtabsShutdownData> ShutdownFailure() => new(
+        false,
+        new ManagedEtabsShutdownData(
+            ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+            ProcessExitConfirmed: false,
+            Forced: true,
+            RecordRetained: true,
+            ApplicationExitReturnCode: 7,
+            OwnedPid: 42),
+        $"{ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed}: cleanup failed");
+
+    private sealed class ShutdownCoordinator : IServeShutdownCoordinator
+    {
+        private readonly object _gate = new();
+        private readonly TaskCompletionSource<Result<ManagedEtabsShutdownData>> _completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private Task<Result<ManagedEtabsShutdownData>>? _shutdown;
+        private readonly TaskCompletionSource _called =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int CallCount { get; private set; }
+        public int UnderlyingStartCount { get; private set; }
+        public Task Called => _called.Task;
+
+        public static ShutdownCoordinator Completed(Result<ManagedEtabsShutdownData> result)
+        {
+            var coordinator = new ShutdownCoordinator();
+            coordinator.Complete(result);
+            return coordinator;
+        }
+
+        public Task<Result<ManagedEtabsShutdownData>> ShutdownAsync()
+        {
+            lock (_gate)
+            {
+                CallCount++;
+                _called.TrySetResult();
+                if (_shutdown is null)
+                {
+                    UnderlyingStartCount++;
+                    _shutdown = _completion.Task;
+                }
+                return _shutdown;
+            }
+        }
+
+        public void Complete(Result<ManagedEtabsShutdownData> result) =>
+            _completion.TrySetResult(result);
+
+        public async ValueTask DisposeAsync() =>
+            _ = await ShutdownAsync();
+    }
+
+    private sealed class ThrowingCoordinator(Exception exception) : IServeShutdownCoordinator
+    {
+        public int CallCount { get; private set; }
+
+        public Task<Result<ManagedEtabsShutdownData>> ShutdownAsync()
+        {
+            CallCount++;
+            return Task.FromException<Result<ManagedEtabsShutdownData>>(exception);
+        }
+
+        public async ValueTask DisposeAsync() =>
+            _ = await ShutdownAsync();
+    }
+
+    private sealed class CountingReader(params string[] lines) : TextReader
+    {
+        private readonly Queue<string> _lines = new(lines);
+        public int ReadCount { get; private set; }
+
+        public override ValueTask<string?> ReadLineAsync(CancellationToken cancellationToken)
+        {
+            ReadCount++;
+            return ValueTask.FromResult<string?>(
+                _lines.Count == 0 ? null : _lines.Dequeue());
+        }
+    }
+
+    private sealed class BlockingReader : TextReader
+    {
+        private readonly TaskCompletionSource _started =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task ReadStarted => _started.Task;
+
+        public override async ValueTask<string?> ReadLineAsync(
+            CancellationToken cancellationToken)
+        {
+            _started.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return null;
+        }
+    }
+
+    private sealed class FatalReader(Exception exception) : TextReader
+    {
+        public override ValueTask<string?> ReadLineAsync(CancellationToken cancellationToken) =>
+            ValueTask.FromException<string?>(exception);
+    }
+
+    private sealed class FatalWriter(Exception exception) : StringWriter
+    {
+        public override Task WriteLineAsync(string? value) => Task.FromException(exception);
+    }
+
+    private sealed class FatalDispatcher : IServeDispatcher
+    {
+        public IReadOnlyCollection<string> Capabilities { get; } = ["explode"];
+        public Task<object> DispatchAsync(
+            string command,
+            JsonElement? request,
+            CancellationToken ct) => throw new InvalidOperationException("dispatch failed");
     }
 }
