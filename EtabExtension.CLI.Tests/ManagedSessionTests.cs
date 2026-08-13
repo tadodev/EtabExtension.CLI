@@ -1,4 +1,4 @@
-using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
+﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
 using Xunit;
 
@@ -76,7 +76,7 @@ public sealed class ManagedSessionTests
         Assert.True(session.IsStarted);
         Assert.NotNull(store.Record);
         Assert.Equal(
-            ["launch", "ownership-proven", "record-write", "initialize"],
+            ["launch", "ownership-proven", "record-write", "initialize", "wrap-existing"],
             events);
     }
 
@@ -125,7 +125,8 @@ public sealed class ManagedSessionTests
                 "application-exit",
                 "wait-10",
                 "record-clear",
-                "process-handle-release"
+                "process-handle-release",
+                "release-api-references"
             ],
             events);
     }
@@ -317,7 +318,7 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, fixture.Managed.KillCount);
         Assert.Equal([ManagedEtabsShutdownMachine.GracefulExitTimeout], fixture.Managed.WaitTimeouts);
         Assert.Null(fixture.Store.Record);
-        Assert.Equal(["application-exit", "wait-10", "record-clear", "process-handle-release"], fixture.Events);
+        Assert.Equal(["application-exit", "wait-10", "record-clear", "process-handle-release", "release-api-references"], fixture.Events);
     }
 
     [Fact]
@@ -762,6 +763,7 @@ public sealed class ManagedSessionTests
         public bool ExactHandleKillAttempted { get; set; }
         public EtabsProcessObservation ObserveEtabs() =>
             new(Live is null ? [] : [Live], 0);
+        public IOwnedEtabsProcess? OpenExact(ManagedProcessIdentity expected) => null;
         public ManagedProcessIdentity? Find(int pid) => Live?.Pid == pid ? Live : null;
         public ExactProcessTerminationResult TerminateExact(
             ManagedProcessIdentity expected,
@@ -831,6 +833,21 @@ public sealed class ManagedSessionTests
         public int ProcessHandleReleaseCount { get; private set; }
         public int InitializeCount { get; private set; }
         public List<TimeSpan> WaitTimeouts { get; } = [];
+
+        public int ReadinessCount { get; private set; }
+        public int ApiReferenceReleaseCount { get; private set; }
+
+        public void CompleteApiReadiness()
+        {
+            _events.Add("wrap-existing");
+            ReadinessCount++;
+        }
+
+        public void ReleaseApiReferences()
+        {
+            _events.Add("release-api-references");
+            ApiReferenceReleaseCount++;
+        }
 
         public int InitializeNewModel()
         {

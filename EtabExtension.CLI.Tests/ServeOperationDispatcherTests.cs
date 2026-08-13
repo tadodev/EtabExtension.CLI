@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.RunAnalysis;
@@ -407,6 +407,7 @@ public sealed class ServeOperationDispatcherTests : IDisposable
     private sealed class FakeProcesses(EtabsProcessObservation observation) : IProcessInspector
     {
         public EtabsProcessObservation ObserveEtabs() => observation;
+        public IOwnedEtabsProcess? OpenExact(ManagedProcessIdentity expected) => null;
         public ManagedProcessIdentity? Find(int pid) =>
             observation.Identified.FirstOrDefault(identity => identity.Pid == pid);
         public ExactProcessTerminationResult TerminateExact(

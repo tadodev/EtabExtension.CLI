@@ -140,6 +140,10 @@ public sealed class ManagedEtabsShutdownMachine(
 
         var confirmedRecordRetained = ClearMatchingRecord(record, recordMatchesOwned);
         owned.ReleaseOwnedProcessHandle();
+
+        // Passive COM-reference cleanup, never a substitute for the exit above: only after
+        // the authoritative ApplicationExit(false) and a confirmed process exit.
+        owned.ReleaseApiReferences();
         return applicationExitError is null
             ? Succeeded(
                 owned.Identity.Pid,

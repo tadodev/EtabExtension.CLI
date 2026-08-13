@@ -102,7 +102,8 @@ public sealed class EtabsSession : IEtabsSession
                     throw _launchFailure;
                 }
 
-                var initializationFailure = Initialize(launched);
+                var initializationFailure = Initialize(launched)
+                    ?? CompleteReadiness(launched);
                 if (initializationFailure is not null)
                 {
                     var cleanup = _shutdownMachine.Shutdown(launched);
@@ -145,6 +146,27 @@ public sealed class EtabsSession : IEtabsSession
                 _ready = false;
                 throw;
             }
+        }
+    }
+
+    /// <summary>
+    /// Wraps the same started object with EtabSharp, only after initialization returned
+    /// zero. A wrap failure is a launch failure: the session must not be exposed holding a
+    /// handle nothing can use.
+    /// </summary>
+    private static (string Diagnostic, Exception? Exception)? CompleteReadiness(
+        IManagedEtabsApplication owned)
+    {
+        try
+        {
+            owned.CompleteApiReadiness();
+            return null;
+        }
+        catch (Exception exception)
+        {
+            return (EtabsApiDiagnosticFormatter.InfrastructureException(
+                "ETABSWrapper.WrapExisting",
+                exception), exception);
         }
     }
 

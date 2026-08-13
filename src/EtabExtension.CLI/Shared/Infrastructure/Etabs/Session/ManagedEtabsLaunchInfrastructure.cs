@@ -12,9 +12,10 @@ public static class EtabsLaunchErrorCodes
 {
     public const string ExecutableNotFound = "ETABS_EXECUTABLE_NOT_FOUND";
     public const string ExecutableUnresolved = "ETABS_EXECUTABLE_UNRESOLVED";
-    public const string ProcessStartFailed = "ETABS_PROCESS_START_FAILED";
+    public const string ApiObjectCreationFailed = "ETABS_API_OBJECT_CREATION_FAILED";
+    public const string ApplicationStartFailed = "ETABS_APPLICATION_START_FAILED";
+    public const string ApiModelUnavailable = "ETABS_API_MODEL_UNAVAILABLE";
     public const string ProcessIdentityFailed = "ETABS_PROCESS_IDENTITY_FAILED";
-    public const string AttachTimeout = "ETABS_ATTACH_TIMEOUT";
     public const string ExternalOrAmbiguousInstance = "ETABS_EXTERNAL_OR_AMBIGUOUS_INSTANCE";
     public const string ModelInitializationFailed = "ETABS_MODEL_INITIALIZATION_FAILED";
     public const string RecoveryRecordWriteFailed = "ETABS_RECOVERY_RECORD_WRITE_FAILED";
@@ -222,9 +223,128 @@ public interface IOwnedEtabsProcess : IDisposable
     bool WaitForExit(TimeSpan timeout);
 }
 
-public interface IEtabsProcessStarter
+/// <summary>
+/// The raw <c>ETABSv1</c> boundary for one managed application, kept behind an
+/// interface so the whole lifecycle is exercisable without ETABS or COM.
+///
+/// <para>Per the Cardex ETABS 23.3 contract: <c>cHelper.CreateObject(path)</c>
+/// starts the program and returns nothing on failure, <c>cOAPI.ApplicationStart()</c>
+/// returns zero on success, <c>cSapModel.InitializeNewModel()</c> returns zero on
+/// success, and <c>cOAPI.ApplicationExit(false)</c> returns zero on success with the
+/// <c>cSapModel</c> reference dropped afterwards.</para>
+/// </summary>
+public interface IEtabsRawApi
 {
-    IOwnedEtabsProcess Start(string executablePath);
+    /// <summary>Raw <c>cOAPI.ApplicationStart()</c>. Zero means started.</summary>
+    int ApplicationStart();
+
+    /// <summary>Raw <c>cHelper.GetOAPIVersionNumber()</c>, used only as wrap metadata.</summary>
+    double GetOapiVersionNumber();
+
+    /// <summary>Whether <c>cOAPI.SapModel</c> is available on this started object.</summary>
+    bool HasSapModel { get; }
+
+    /// <summary>Raw <c>cSapModel.InitializeNewModel(kip_in_F)</c>. Zero means initialized.</summary>
+    int InitializeNewModel();
+
+    /// <summary>Raw <c>cOAPI.ApplicationExit(fileSave)</c>. Zero means exited.</summary>
+    int ApplicationExit(bool fileSave);
+
+    /// <summary>
+    /// Wraps this exact started object with EtabSharp — no create, start, attach or
+    /// ROT lookup. Called only after initialization returned zero.
+    /// </summary>
+    void CompleteApiReadiness(int majorVersion, double apiVersion, string fullVersion);
+
+    /// <summary>The wrapper from <see cref="CompleteApiReadiness"/>; throws before it.</summary>
+    ETABSApplication Application { get; }
+
+    /// <summary>
+    /// Passive COM-reference cleanup for the wrapper. Never an exit: only valid after
+    /// the authoritative <c>ApplicationExit(false)</c> and confirmed process exit.
+    /// </summary>
+    void ReleaseApiReferences();
+}
+
+public interface IEtabsRawApiFactory
+{
+    /// <summary>
+    /// Raw <c>cHelper.CreateObject(executablePath)</c>, which starts that program. A
+    /// null return is the documented failure mode and becomes a typed launch failure.
+    /// </summary>
+    IEtabsRawApi CreateFromExecutable(string executablePath);
+}
+
+/// <summary>Reads ETABS version metadata from the executable — no COM, no model.</summary>
+public interface IEtabsVersionProbe
+{
+    (int MajorVersion, string FullVersion) Read(string executablePath);
+}
+
+public sealed class FileEtabsVersionProbe : IEtabsVersionProbe
+{
+    public (int MajorVersion, string FullVersion) Read(string executablePath)
+    {
+        var info = FileVersionInfo.GetVersionInfo(executablePath);
+        return (
+            info.FileMajorPart,
+            $"{info.FileMajorPart}.{info.FileMinorPart}.{info.FileBuildPart}");
+    }
+}
+
+public sealed class EtabsRawApiFactory : IEtabsRawApiFactory
+{
+    public IEtabsRawApi CreateFromExecutable(string executablePath)
+    {
+        cOAPI api;
+        cHelper helper = new Helper();
+        try
+        {
+            api = helper.CreateObject(executablePath);
+        }
+        catch (Exception ex)
+        {
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ApiObjectCreationFailed,
+                EtabsApiDiagnosticFormatter.Exception("cHelper.CreateObject", ex),
+                ex);
+        }
+
+        // Documented failure mode: "An instance of cOAPI if successful, nothing otherwise."
+        return api is null
+            ? throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ApiObjectCreationFailed,
+                $"cHelper.CreateObject returned no API object for '{executablePath}'.")
+            : new EtabsRawApi(api, helper);
+    }
+}
+
+public sealed class EtabsRawApi(cOAPI api, cHelper helper) : IEtabsRawApi
+{
+    private ETABSApplication? _wrapper;
+
+    public int ApplicationStart() => api.ApplicationStart();
+
+    public double GetOapiVersionNumber() => helper.GetOAPIVersionNumber();
+
+    public bool HasSapModel => api.SapModel is not null;
+
+    public int InitializeNewModel() => api.SapModel.InitializeNewModel(eUnits.kip_in_F);
+
+    public int ApplicationExit(bool fileSave) => api.ApplicationExit(fileSave);
+
+    public void CompleteApiReadiness(int majorVersion, double apiVersion, string fullVersion) =>
+        _wrapper = ETABSWrapper.WrapExisting(api, majorVersion, apiVersion, fullVersion);
+
+    public ETABSApplication Application => _wrapper
+        ?? throw new InvalidOperationException(
+            "Managed ETABS API is not ready: the raw handle has not been wrapped yet.");
+
+    public void ReleaseApiReferences()
+    {
+        _wrapper?.Dispose();
+        _wrapper = null;
+    }
 }
 
 public interface IManagedEtabsApplication
@@ -234,202 +354,92 @@ public interface IManagedEtabsApplication
     Guid ManagedLaunchRecordId { get; }
     int InitializeNewModel();
     int ExitWithoutSaving();
+    void CompleteApiReadiness();
     bool HasExited { get; }
     bool WaitForExit(TimeSpan timeout);
     void Kill();
     void ReleaseOwnedProcessHandle();
+    void ReleaseApiReferences();
 }
 
+/// <summary>Version metadata captured at launch and used only to wrap the started object.</summary>
+public sealed record ManagedEtabsApiVersion(
+    int MajorVersion,
+    double ApiVersion,
+    string FullVersion);
+
 public sealed class ManagedEtabsApplication(
-    ETABSApplication application,
+    IEtabsRawApi rawApi,
     ManagedProcessIdentity identity,
     Guid launchRecordId,
-    IOwnedEtabsProcess ownedProcess) : IManagedEtabsApplication
+    IOwnedEtabsProcess ownedProcess,
+    ManagedEtabsApiVersion version) : IManagedEtabsApplication
 {
-    public ETABSApplication Application { get; } = application;
+    public ETABSApplication Application => rawApi.Application;
     public ManagedProcessIdentity Identity { get; } = identity;
     public Guid ManagedLaunchRecordId { get; } = launchRecordId;
     public bool HasExited => ownedProcess.HasExited;
 
-    public int InitializeNewModel() =>
-        Application.Model.ModelInfo.InitializeNewModel(eUnits.kip_in_F);
+    public int InitializeNewModel() => rawApi.InitializeNewModel();
 
-    public int ExitWithoutSaving() =>
-        Application.Application.ApplicationExit(false);
+    public int ExitWithoutSaving() => rawApi.ApplicationExit(false);
+
+    /// <summary>Wraps the same started object once initialization has returned zero.</summary>
+    public void CompleteApiReadiness() => rawApi.CompleteApiReadiness(
+        version.MajorVersion,
+        version.ApiVersion,
+        version.FullVersion);
 
     public bool WaitForExit(TimeSpan timeout) => ownedProcess.WaitForExit(timeout);
 
     public void Kill() => ownedProcess.Kill();
 
     public void ReleaseOwnedProcessHandle() => ownedProcess.Dispose();
+
+    public void ReleaseApiReferences() => rawApi.ReleaseApiReferences();
 }
 
-public sealed class WindowsEtabsProcessStarter : IEtabsProcessStarter
+/// <summary>
+/// An authoritative handle on a process this daemon proved it owns, opened by exact
+/// identity rather than by PID alone.
+/// </summary>
+public sealed class WindowsOwnedEtabsProcess : IOwnedEtabsProcess
 {
-    public IOwnedEtabsProcess Start(string executablePath)
-    {
-        Process process;
-        try
-        {
-            process = Process.Start(new ProcessStartInfo
-            {
-                FileName = executablePath,
-                WorkingDirectory = Path.GetDirectoryName(executablePath)!,
-                UseShellExecute = false
-            }) ?? throw new InvalidOperationException("Process.Start returned null.");
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
-        {
-            throw new EtabsLaunchException(
-                EtabsLaunchErrorCodes.ProcessStartFailed,
-                $"Could not start ETABS executable '{executablePath}': {ex.Message}",
-                ex);
-        }
+    private readonly Process _process;
 
-        try
+    internal WindowsOwnedEtabsProcess(Process process, ManagedProcessIdentity identity)
+    {
+        _process = process;
+        Identity = identity;
+    }
+
+    public ManagedProcessIdentity Identity { get; }
+
+    public bool HasExited
+    {
+        get
         {
-            return new WindowsOwnedEtabsProcess(process);
-        }
-        catch (Exception ex)
-        {
-            TryKillAndDispose(process);
-            throw new EtabsLaunchException(
-                EtabsLaunchErrorCodes.ProcessIdentityFailed,
-                $"Started ETABS but could not capture PID/start time/executable path from the owned process: {ex.Message}",
-                ex);
+            try
+            {
+                return _process.HasExited;
+            }
+            catch (InvalidOperationException)
+            {
+                return true;
+            }
         }
     }
 
-    private static void TryKillAndDispose(Process process)
+    public void Kill()
     {
-        try
+        if (!HasExited)
         {
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-                process.WaitForExit(10_000);
-            }
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
-        {
-            Console.Error.WriteLine($"⚠ Could not clean up ETABS after identity capture failure: {ex.Message}");
-        }
-        finally
-        {
-            process.Dispose();
+            _process.Kill(entireProcessTree: true);
         }
     }
 
-    private sealed class WindowsOwnedEtabsProcess : IOwnedEtabsProcess
-    {
-        private readonly Process _process;
+    public bool WaitForExit(TimeSpan timeout) =>
+        _process.WaitForExit(checked((int)timeout.TotalMilliseconds));
 
-        public WindowsOwnedEtabsProcess(Process process)
-        {
-            _process = process;
-            var executablePath = process.MainModule?.FileName;
-            if (string.IsNullOrWhiteSpace(executablePath))
-            {
-                throw new InvalidOperationException("Process.MainModule.FileName was unavailable.");
-            }
-
-            Identity = new(
-                process.Id,
-                process.StartTime.ToUniversalTime(),
-                Path.GetFullPath(executablePath));
-        }
-
-        public ManagedProcessIdentity Identity { get; }
-
-        public bool HasExited
-        {
-            get
-            {
-                try
-                {
-                    return _process.HasExited;
-                }
-                catch (InvalidOperationException)
-                {
-                    return true;
-                }
-            }
-        }
-
-        public void Kill()
-        {
-            if (!HasExited)
-            {
-                _process.Kill(entireProcessTree: true);
-            }
-        }
-
-        public bool WaitForExit(TimeSpan timeout) =>
-            _process.WaitForExit(checked((int)timeout.TotalMilliseconds));
-
-        public void Dispose() => _process.Dispose();
-    }
-}
-
-public interface IManagedEtabsConnector
-{
-    IManagedEtabsApplication? TryConnect(
-        IOwnedEtabsProcess process,
-        Guid launchRecordId,
-        out string? error);
-}
-
-public sealed class EtabSharpManagedEtabsConnector : IManagedEtabsConnector
-{
-    public IManagedEtabsApplication? TryConnect(
-        IOwnedEtabsProcess process,
-        Guid launchRecordId,
-        out string? error)
-    {
-        ETABSApplication? application = null;
-        try
-        {
-            application = ETABSWrapper.ConnectToProcess(process.Identity.Pid);
-            if (application is null)
-            {
-                error = "ETABSWrapper.ConnectToProcess returned null.";
-                return null;
-            }
-
-            if (application.Application.Visible())
-            {
-                application.Application.Hide();
-            }
-
-            error = null;
-            var managed = new ManagedEtabsApplication(
-                application,
-                process.Identity,
-                launchRecordId,
-                process);
-            application = null;
-            return managed;
-        }
-        catch (Exception ex)
-        {
-            error = ex.Message;
-            return null;
-        }
-        finally
-        {
-            application?.Dispose();
-        }
-    }
-}
-
-public interface IEtabsLaunchClock
-{
-    DateTimeOffset UtcNow { get; }
-    void Sleep(TimeSpan duration);
-}
-
-public sealed class SystemEtabsLaunchClock : IEtabsLaunchClock
-{
-    public DateTimeOffset UtcNow => DateTimeOffset.UtcNow;
-    public void Sleep(TimeSpan duration) => Thread.Sleep(duration);
+    public void Dispose() => _process.Dispose();
 }
