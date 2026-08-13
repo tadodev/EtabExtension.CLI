@@ -1,8 +1,8 @@
-using System.ComponentModel;
+﻿using System.ComponentModel;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using EtabSharp.Core;
+using EtabExtension.CLI.Features.GetStatus.Models;
 using Microsoft.Extensions.Configuration;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
@@ -11,6 +11,37 @@ public sealed record ManagedProcessIdentity(
     int Pid,
     DateTimeOffset ProcessStartTimeUtc,
     string ExecutablePath);
+
+public sealed record EtabsProcessObservation(
+    IReadOnlyList<ManagedProcessIdentity> Identified,
+    int UnidentifiedCount);
+
+public static class EtabsOwnershipResolver
+{
+    public static EtabsInstanceOwnership Resolve(
+        EtabsProcessObservation observation,
+        int? managedPid)
+    {
+        if (observation.UnidentifiedCount > 0 || observation.Identified.Count > 1)
+        {
+            return EtabsInstanceOwnership.Ambiguous;
+        }
+
+        if (observation.Identified.Count == 0)
+        {
+            return EtabsInstanceOwnership.None;
+        }
+
+        if (!managedPid.HasValue)
+        {
+            return EtabsInstanceOwnership.External;
+        }
+
+        return observation.Identified[0].Pid == managedPid.Value
+            ? EtabsInstanceOwnership.Managed
+            : EtabsInstanceOwnership.Ambiguous;
+    }
+}
 
 public sealed record ManagedEtabsSessionRecord(
     int SchemaVersion,
@@ -22,6 +53,12 @@ public sealed record ManagedEtabsSessionRecord(
 
 public interface ISessionRecordStore
 {
+    /// <summary>
+    /// Where the recovery record lives. Reported in the startup refusal frame so a
+    /// consumer can name the retained evidence instead of guessing at it.
+    /// </summary>
+    string FilePath { get; }
+
     ManagedEtabsSessionRecord? Read();
     void Write(ManagedEtabsSessionRecord record);
     void Clear();
@@ -91,94 +128,256 @@ public sealed class JsonSessionRecordStore : ISessionRecordStore
 
 public interface IProcessInspector
 {
-    IReadOnlyList<ManagedProcessIdentity> SnapshotEtabs();
+    EtabsProcessObservation ObserveEtabs();
     ManagedProcessIdentity? Find(int pid);
-    void Terminate(int pid);
-    bool WaitForExit(int pid, TimeSpan timeout);
+
+    /// <summary>
+    /// Opens an authoritative handle on the process matching <paramref name="expected"/>
+    /// exactly — pid, start time and executable path. Returns null when the live process
+    /// does not match, so ownership is never assumed from a pid alone.
+    /// </summary>
+    IOwnedEtabsProcess? OpenExact(ManagedProcessIdentity expected);
+
+    ExactProcessTerminationResult TerminateExact(
+        ManagedProcessIdentity expected,
+        TimeSpan timeout);
 }
+
+public enum ExactProcessTerminationState
+{
+    NotFound,
+    ConfirmedGone,
+    IdentityMismatchOrUnidentified,
+    ExitUnconfirmed
+}
+
+public sealed record ExactProcessTerminationResult(
+    ExactProcessTerminationState State,
+    ManagedProcessIdentity? ObservedIdentity);
 
 public sealed class WindowsProcessInspector : IProcessInspector
 {
-    public IReadOnlyList<ManagedProcessIdentity> SnapshotEtabs() =>
-        Process.GetProcessesByName("ETABS")
-            .Select(TryRead)
-            .Where(identity => identity is not null)
-            .Cast<ManagedProcessIdentity>()
-            .ToList();
+    public EtabsProcessObservation ObserveEtabs()
+    {
+        var identified = new List<ManagedProcessIdentity>();
+        var unidentifiedCount = 0;
+        foreach (var process in Process.GetProcessesByName("ETABS"))
+        {
+            using (process)
+            {
+                var identity = TryRead(process);
+                if (identity is null)
+                {
+                    unidentifiedCount++;
+                }
+                else
+                {
+                    identified.Add(identity);
+                }
+            }
+        }
+
+        return new(identified, unidentifiedCount);
+    }
 
     public ManagedProcessIdentity? Find(int pid)
     {
-        try { return TryRead(Process.GetProcessById(pid)); }
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return TryRead(process);
+        }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception)
         { return null; }
     }
 
-    public void Terminate(int pid)
+    public IOwnedEtabsProcess? OpenExact(ManagedProcessIdentity expected)
     {
-        // The target may exit between identity verification and this call;
-        // an already-gone process is a successful termination, not a crash.
-        try { Process.GetProcessById(pid).Kill(entireProcessTree: true); }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception) { }
+        ArgumentNullException.ThrowIfNull(expected);
+
+        Process process;
+        try
+        {
+            process = Process.GetProcessById(expected.Pid);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or Win32Exception)
+        { return null; }
+
+        var observed = TryRead(process);
+        if (observed is null || !IdentityMatches(expected, observed))
+        {
+            process.Dispose();
+            return null;
+        }
+
+        return new WindowsOwnedEtabsProcess(process, observed);
     }
 
-    public bool WaitForExit(int pid, TimeSpan timeout)
+    public ExactProcessTerminationResult TerminateExact(
+        ManagedProcessIdentity expected,
+        TimeSpan timeout)
     {
-        try { return Process.GetProcessById(pid).WaitForExit((int)timeout.TotalMilliseconds); }
-        catch (ArgumentException) { return true; }
+        ArgumentNullException.ThrowIfNull(expected);
+
+        Process process;
+        try
+        {
+            process = Process.GetProcessById(expected.Pid);
+        }
+        catch (ArgumentException)
+        {
+            return new(ExactProcessTerminationState.NotFound, ObservedIdentity: null);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+        {
+            return new(
+                ExactProcessTerminationState.IdentityMismatchOrUnidentified,
+                ObservedIdentity: null);
+        }
+
+        using (process)
+        {
+            var observed = TryRead(process);
+            if (observed is null || !IdentityMatches(expected, observed))
+            {
+                return new(
+                    ExactProcessTerminationState.IdentityMismatchOrUnidentified,
+                    observed);
+            }
+
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill();
+                }
+
+                return process.HasExited
+                    || process.WaitForExit(checked((int)timeout.TotalMilliseconds))
+                    ? new(ExactProcessTerminationState.ConfirmedGone, observed)
+                    : new(ExactProcessTerminationState.ExitUnconfirmed, observed);
+            }
+            catch (Exception ex) when (
+                ex is InvalidOperationException or Win32Exception or NotSupportedException)
+            {
+                return HasExited(process)
+                    ? new(ExactProcessTerminationState.ConfirmedGone, observed)
+                    : new(ExactProcessTerminationState.ExitUnconfirmed, observed);
+            }
+        }
     }
 
     private static ManagedProcessIdentity? TryRead(Process process)
     {
-        using (process)
+        try
         {
-            try
-            {
-                var path = process.MainModule?.FileName;
-                return string.IsNullOrWhiteSpace(path)
-                    ? null
-                    : new(process.Id, process.StartTime.ToUniversalTime(), Path.GetFullPath(path));
-            }
-            catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
-            { return null; }
+            var path = process.MainModule?.FileName;
+            return string.IsNullOrWhiteSpace(path)
+                ? null
+                : new(process.Id, process.StartTime.ToUniversalTime(), Path.GetFullPath(path));
         }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
+        { return null; }
+    }
+
+    private static bool IdentityMatches(
+        ManagedProcessIdentity expected,
+        ManagedProcessIdentity observed) =>
+        expected.Pid == observed.Pid
+        && expected.ProcessStartTimeUtc.ToUniversalTime()
+            == observed.ProcessStartTimeUtc.ToUniversalTime()
+        && string.Equals(
+            Path.GetFullPath(expected.ExecutablePath),
+            Path.GetFullPath(observed.ExecutablePath),
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasExited(Process process)
+    {
+        try { return process.HasExited; }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+        { return false; }
     }
 }
 
 public interface IOrphanSessionCleaner
 {
-    void Clean();
+    ManagedEtabsShutdownResult Clean();
 }
 
 public sealed class OrphanSessionCleaner(
     ISessionRecordStore records,
     IProcessInspector processes) : IOrphanSessionCleaner
 {
-    public void Clean()
+    public ManagedEtabsShutdownResult Clean()
     {
         var record = records.Read();
         if (record is null)
         {
             records.Clear();
-            return;
+            return Succeeded(ownedPid: null, forced: false);
         }
 
-        var live = processes.Find(record.Pid);
-        if (live is not null && IdentityMatches(record, live))
+        var expected = new ManagedProcessIdentity(
+            record.Pid,
+            record.ProcessStartTimeUtc,
+            record.ExecutablePath);
+        var termination = processes.TerminateExact(expected, TimeSpan.FromSeconds(10));
+        switch (termination.State)
         {
-            Console.Error.WriteLine(
-                $"⚠ Managed ETABS orphan detected (PID {record.Pid}, launch {record.ManagedLaunchRecordId}). " +
-                "Unsaved state is untrusted; terminating it. A clean reopen is required.");
-            processes.Terminate(record.Pid);
-            if (!processes.WaitForExit(record.Pid, TimeSpan.FromSeconds(10)))
-                Console.Error.WriteLine($"⚠ Timed out waiting for managed ETABS orphan PID {record.Pid} to exit.");
+            case ExactProcessTerminationState.NotFound:
+                records.Clear();
+                return Succeeded(record.Pid, forced: false);
+            case ExactProcessTerminationState.ConfirmedGone:
+                records.Clear();
+                return Succeeded(record.Pid, forced: true);
+            case ExactProcessTerminationState.IdentityMismatchOrUnidentified:
+                return Failed(
+                    ManagedEtabsShutdownState.IdentityMismatch,
+                    ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                    "Managed ETABS orphan identity was mismatched or unreadable; process was not targeted.",
+                    record.Pid,
+                    forced: false);
+            case ExactProcessTerminationState.ExitUnconfirmed:
+                return Failed(
+                    ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                    ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                    "Exact-handle orphan termination did not confirm process exit.",
+                    record.Pid,
+                    forced: true);
+            default:
+                throw new InvalidOperationException(
+                    $"Unknown exact process termination state: {termination.State}.");
         }
-        else if (live is not null)
-        {
-            Console.Error.WriteLine($"⚠ Stale ETABS session record for PID {record.Pid}; identity tuple did not match. Process was not targeted.");
-        }
-
-        records.Clear();
     }
+
+    private static ManagedEtabsShutdownResult Succeeded(int? ownedPid, bool forced) => new(
+        true,
+        null,
+        null,
+        new(
+            ManagedEtabsShutdownState.Succeeded,
+            ProcessExitConfirmed: true,
+            Forced: forced,
+            RecordRetained: false,
+            ApplicationExitReturnCode: null,
+            OwnedPid: ownedPid));
+
+    private static ManagedEtabsShutdownResult Failed(
+        ManagedEtabsShutdownState state,
+        string errorCode,
+        string error,
+        int ownedPid,
+        bool forced) => new(
+        false,
+        errorCode,
+        error,
+        new(
+            state,
+            ProcessExitConfirmed: false,
+            Forced: forced,
+            RecordRetained: true,
+            ApplicationExitReturnCode: null,
+            OwnedPid: ownedPid));
 
     internal static bool IdentityMatches(ManagedEtabsSessionRecord record, ManagedProcessIdentity live) =>
         record.Pid == live.Pid
@@ -186,52 +385,34 @@ public sealed class OrphanSessionCleaner(
         && string.Equals(Path.GetFullPath(record.ExecutablePath), Path.GetFullPath(live.ExecutablePath), StringComparison.OrdinalIgnoreCase);
 }
 
-public interface IManagedEtabsApplication : IDisposable
-{
-    ETABSApplication Application { get; }
-    ManagedProcessIdentity Identity { get; }
-    Guid ManagedLaunchRecordId { get; }
-    void ExitWithoutSaving();
-}
-
-public sealed class ManagedEtabsApplication(
-    ETABSApplication application,
-    ManagedProcessIdentity identity,
-    Guid launchRecordId,
-    IOwnedEtabsProcess ownedProcess) : IManagedEtabsApplication
-{
-    public ETABSApplication Application { get; } = application;
-    public ManagedProcessIdentity Identity { get; } = identity;
-    public Guid ManagedLaunchRecordId { get; } = launchRecordId;
-    public void ExitWithoutSaving() => Application.Application.ApplicationExit(false);
-    public void Dispose()
-    {
-        try
-        {
-            Application.Dispose();
-        }
-        finally
-        {
-            ownedProcess.Dispose();
-        }
-    }
-}
-
 public interface IManagedEtabsLauncher
 {
     IManagedEtabsApplication Launch();
 }
-
+/// <summary>
+/// Starts and takes exclusive ownership of one managed ETABS instance through the raw
+/// CSI lifecycle documented for ETABS 23.3.
+///
+/// <para>Sequence: preflight census (no external or ambiguous instance) →
+/// <c>cHelper.CreateObject(exact ETABS.exe)</c>, which starts the program →
+/// <c>cOAPI.ApplicationStart()</c> exactly once, requiring zero → <c>cOAPI.SapModel</c>
+/// present → an exact OS census proving exactly one ETABS process, captured as pid +
+/// start time UTC + executable path with an authoritative handle.</para>
+///
+/// <para>The returned application is owned but <b>not yet API-ready</b>: the caller writes
+/// the recovery record and calls <c>InitializeNewModel</c> before exposing it. Nothing here
+/// starts a process out of band, attaches by pid, falls back to the ROT, hides a window, or
+/// sleeps waiting for readiness — the previous path did all four and still could not prove
+/// that the object it attached to was usable.</para>
+/// </summary>
 public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 {
-    public static readonly TimeSpan AttachTimeout = TimeSpan.FromSeconds(60);
-    public static readonly TimeSpan AttachRetryInterval = TimeSpan.FromMilliseconds(100);
+    public static readonly TimeSpan ForcedExitTimeout = TimeSpan.FromSeconds(10);
 
     private readonly IProcessInspector _processes;
     private readonly IEtabsExecutableResolver _executableResolver;
-    private readonly IEtabsProcessStarter _processStarter;
-    private readonly IManagedEtabsConnector _connector;
-    private readonly IEtabsLaunchClock _clock;
+    private readonly IEtabsRawApiFactory _apiFactory;
+    private readonly IEtabsVersionProbe _versionProbe;
     private readonly TextWriter _diagnostics;
 
     public ManagedEtabsLauncher(
@@ -239,9 +420,8 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         IConfiguration configuration) : this(
             processes,
             new EtabsExecutableResolver(configuration, new WindowsEtabsInstallDiscovery()),
-            new WindowsEtabsProcessStarter(),
-            new EtabSharpManagedEtabsConnector(),
-            new SystemEtabsLaunchClock(),
+            new EtabsRawApiFactory(),
+            new FileEtabsVersionProbe(),
             Console.Error)
     {
     }
@@ -249,133 +429,432 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     public ManagedEtabsLauncher(
         IProcessInspector processes,
         IEtabsExecutableResolver executableResolver,
-        IEtabsProcessStarter processStarter,
-        IManagedEtabsConnector connector,
-        IEtabsLaunchClock clock,
+        IEtabsRawApiFactory apiFactory,
+        IEtabsVersionProbe versionProbe,
         TextWriter diagnostics)
     {
         _processes = processes;
         _executableResolver = executableResolver;
-        _processStarter = processStarter;
-        _connector = connector;
-        _clock = clock;
+        _apiFactory = apiFactory;
+        _versionProbe = versionProbe;
         _diagnostics = diagnostics;
     }
 
     public IManagedEtabsApplication Launch()
     {
-        var before = CaptureCrossCheckBaseline();
+        CaptureCrossCheckBaseline();
         var executablePath = _executableResolver.Resolve();
+
+        // CreateObject itself starts the program, so it lives inside the cleanup envelope:
+        // even a null return or a throw can leave a partially started process behind, and
+        // every exit path from here must resolve it.
+        IEtabsRawApi? rawApi = null;
         IOwnedEtabsProcess? ownedProcess = null;
         try
         {
-            ownedProcess = _processStarter.Start(executablePath);
-            var launchRecordId = Guid.NewGuid();
-            var deadline = _clock.UtcNow + AttachTimeout;
-            string? lastError = null;
+            rawApi = _apiFactory.CreateFromExecutable(executablePath);
+            StartApplication(rawApi);
+            RequireSapModel(rawApi);
 
-            // TODO(issue #238 live certification): Verify that a plainly started ETABS.exe
-            // accepts ConnectToProcess before any model is open and measure readiness latency.
-            while (_clock.UtcNow < deadline)
-            {
-                var managed = _connector.TryConnect(ownedProcess, launchRecordId, out lastError);
-                if (managed is not null)
-                {
-                    LogCrossCheckDisagreement(before, ownedProcess.Identity.Pid);
-                    ownedProcess = null; // ownership transferred to the managed application
-                    return managed;
-                }
+            var identity = CensusExactlyOneOwnedProcess();
+            ownedProcess = _processes.OpenExact(identity)
+                ?? throw new EtabsLaunchException(
+                    EtabsLaunchErrorCodes.ProcessIdentityFailed,
+                    "Could not open an authoritative handle on the started ETABS process " +
+                    $"pid={identity.Pid}; its live identity no longer matches the census.");
 
-                if (ownedProcess.HasExited)
-                {
-                    lastError = "The owned ETABS process exited before COM attach succeeded.";
-                    break;
-                }
-
-                _clock.Sleep(AttachRetryInterval);
-            }
+            var version = ReadVersion(identity.ExecutablePath);
+            var managed = new ManagedEtabsApplication(
+                rawApi,
+                identity,
+                Guid.NewGuid(),
+                ownedProcess,
+                new ManagedEtabsApiVersion(
+                    version.MajorVersion,
+                    ReadApiVersion(rawApi),
+                    version.FullVersion));
+            ownedProcess = null; // ownership transferred to the managed application
+            return managed;
+        }
+        catch (Exception failure)
+        {
+            // The cleanup outcome always travels with the failure. When it is unresolved a
+            // process this attempt started may still be alive with no recovery record to
+            // describe it, and the session uses that to refuse both a relaunch and a clean
+            // shutdown answer later.
+            var cleanup = CleanUpFailedStart(rawApi, ownedProcess);
+            var code = failure is EtabsLaunchException typed
+                ? typed.Code
+                : EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance;
+            var message = failure is EtabsLaunchException original
+                ? StripCode(original)
+                : failure.Message;
 
             throw new EtabsLaunchException(
-                EtabsLaunchErrorCodes.AttachTimeout,
-                $"ETABS process PID {ownedProcess.Identity.Pid} did not accept ConnectToProcess within {AttachTimeout.TotalSeconds:0} seconds. Last error: {lastError ?? "none"}");
-        }
-        catch
-        {
-            if (ownedProcess is not null)
+                code,
+                cleanup.Success
+                    ? message
+                    : EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        message,
+                        $"cleanup={cleanup.Data.State}; " +
+                        $"processExitConfirmed={cleanup.Data.ProcessExitConfirmed}; " +
+                        $"forced={cleanup.Data.Forced}; " +
+                        $"ownedPid={cleanup.Data.OwnedPid?.ToString() ?? "unknown"}"),
+                failure.InnerException ?? failure)
             {
-                CleanUpOwnedProcess(ownedProcess);
-            }
-
-            throw;
+                Cleanup = cleanup
+            };
         }
     }
 
-    private HashSet<int>? CaptureCrossCheckBaseline()
+    private static void StartApplication(IEtabsRawApi rawApi)
     {
+        int returnCode;
         try
         {
-            return _processes.SnapshotEtabs().Select(identity => identity.Pid).ToHashSet();
+            returnCode = rawApi.ApplicationStart();
         }
         catch (Exception ex)
         {
-            _diagnostics.WriteLine($"⚠ Managed ETABS launch cross-check baseline unavailable: {ex.Message}");
-            return null;
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ApplicationStartFailed,
+                EtabsApiDiagnosticFormatter.Exception("cOAPI.ApplicationStart", ex),
+                ex);
+        }
+
+        if (returnCode != 0)
+        {
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ApplicationStartFailed,
+                EtabsApiDiagnosticFormatter.ApiReturn("cOAPI.ApplicationStart", returnCode));
         }
     }
 
-    private void LogCrossCheckDisagreement(HashSet<int>? before, int ownedPid)
+    private static void RequireSapModel(IEtabsRawApi rawApi)
     {
-        if (before is null)
-        {
-            return;
-        }
-
+        bool available;
         try
         {
-            var candidates = _processes.SnapshotEtabs()
-                .Where(identity => !before.Contains(identity.Pid))
+            available = rawApi.HasSapModel;
+        }
+        catch (Exception ex)
+        {
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ApiModelUnavailable,
+                EtabsApiDiagnosticFormatter.Exception("cOAPI.SapModel", ex),
+                ex);
+        }
+
+        if (!available)
+        {
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ApiModelUnavailable,
+                "cOAPI.SapModel was unavailable on the started application object.");
+        }
+    }
+
+    private (int MajorVersion, string FullVersion) ReadVersion(string executablePath)
+    {
+        try
+        {
+            return _versionProbe.Read(executablePath);
+        }
+        catch (Exception ex)
+        {
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ProcessIdentityFailed,
+                EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "FileVersionInfo.GetVersionInfo(ETABS.exe)",
+                    ex),
+                ex);
+        }
+    }
+
+    private double ReadApiVersion(IEtabsRawApi rawApi)
+    {
+        // Wrap metadata only. A version that cannot be read is reported as 0 rather than
+        // failing a session whose lifecycle is otherwise proven.
+        try
+        {
+            return rawApi.GetOapiVersionNumber();
+        }
+        catch (Exception ex)
+        {
+            _diagnostics.WriteLine(
+                EtabsApiDiagnosticFormatter.Exception("cHelper.GetOAPIVersionNumber", ex));
+            return 0;
+        }
+    }
+
+    private void CaptureCrossCheckBaseline()
+    {
+        EtabsProcessObservation observation;
+        try
+        {
+            observation = _processes.ObserveEtabs();
+        }
+        catch (Exception ex)
+        {
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+                $"Could not verify that ETABS is absent before launch: {ex.Message}",
+                ex);
+        }
+
+        if (observation.Identified.Count > 0 || observation.UnidentifiedCount > 0)
+        {
+            var pids = observation.Identified
                 .Select(identity => identity.Pid)
                 .Distinct()
                 .Order()
                 .ToList();
-            if (candidates.Count == 1 && candidates[0] == ownedPid)
-            {
-                return;
-            }
-
-            _diagnostics.WriteLine(
-                $"⚠ Managed ETABS launch cross-check disagreed with authoritative owned PID {ownedPid}: " +
-                $"snapshot candidates=[{string.Join(", ", candidates)}]. Authoritative owned-process identity retained.");
-        }
-        catch (Exception ex)
-        {
-            _diagnostics.WriteLine(
-                $"⚠ Managed ETABS launch cross-check unavailable for authoritative owned PID {ownedPid}: {ex.Message}");
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+                "Refusing to start managed ETABS because an external or ambiguous " +
+                $"instance already exists: observedPids=[{string.Join(", ", pids)}], " +
+                $"unidentifiedCount={observation.UnidentifiedCount}.");
         }
     }
 
-    private void CleanUpOwnedProcess(IOwnedEtabsProcess ownedProcess)
+    /// <summary>
+    /// Preflight proved zero ETABS processes, so exactly one identified process after
+    /// CreateObject is ours by construction. Anything else — none, several, or one that
+    /// could not be identified — fails closed.
+    /// </summary>
+    private ManagedProcessIdentity CensusExactlyOneOwnedProcess()
     {
+        EtabsProcessObservation observation;
         try
         {
-            if (!ownedProcess.HasExited)
+            observation = _processes.ObserveEtabs();
+        }
+        catch (Exception ex)
+        {
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+                $"Could not verify exclusive ownership after starting managed ETABS: {ex.Message}",
+                ex);
+        }
+
+        if (observation.UnidentifiedCount == 0 && observation.Identified.Count == 1)
+        {
+            return observation.Identified[0];
+        }
+
+        var pids = observation.Identified
+            .Select(identity => identity.Pid)
+            .Distinct()
+            .Order()
+            .ToList();
+        throw new EtabsLaunchException(
+            EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+            "Managed ETABS did not resolve to exactly one owned process: " +
+            $"observedPids=[{string.Join(", ", pids)}], " +
+            $"unidentifiedCount={observation.UnidentifiedCount}.");
+    }
+
+    /// <summary>
+    /// Resolves a process that CreateObject may have started. The raw exit is requested
+    /// first; termination happens only against an identity this launcher proved, never
+    /// against an ambiguous or unreadable one.
+    /// </summary>
+    /// <summary>
+    /// Removes the <c>[CODE] </c> prefix so re-throwing with the same code does not stack
+    /// two of them onto one message.
+    /// </summary>
+    private static string StripCode(EtabsLaunchException failure)
+    {
+        var prefix = $"[{failure.Code}] ";
+        return failure.Message.StartsWith(prefix, StringComparison.Ordinal)
+            ? failure.Message[prefix.Length..]
+            : failure.Message;
+    }
+
+    private ManagedEtabsShutdownResult CleanUpFailedStart(
+        IEtabsRawApi? rawApi,
+        IOwnedEtabsProcess? ownedProcess)
+    {
+        var applicationExitReturnCode = RequestRawExit(rawApi);
+
+        return ownedProcess is not null
+            ? StopOwnedProcess(ownedProcess, applicationExitReturnCode)
+            : ResolveSurvivorWithoutHandle(applicationExitReturnCode);
+    }
+
+    /// <summary>Requests the raw exit when an object exists; a missing object is not an error.</summary>
+    private int? RequestRawExit(IEtabsRawApi? rawApi)
+    {
+        if (rawApi is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            var returnCode = rawApi.ApplicationExit(false);
+            if (returnCode != 0)
             {
-                ownedProcess.Kill();
-                if (!ownedProcess.WaitForExit(TimeSpan.FromSeconds(10)))
-                {
-                    _diagnostics.WriteLine(
-                        $"⚠ Timed out waiting for owned ETABS PID {ownedProcess.Identity.Pid} to exit after launch failure.");
-                }
+                _diagnostics.WriteLine(
+                    EtabsApiDiagnosticFormatter.ApiReturn("cOAPI.ApplicationExit(false)", returnCode));
             }
+
+            return returnCode;
         }
         catch (Exception ex)
         {
             _diagnostics.WriteLine(
-                $"⚠ Could not clean up owned ETABS PID {ownedProcess.Identity.Pid} after launch failure: {ex.Message}");
+                EtabsApiDiagnosticFormatter.Exception("cOAPI.ApplicationExit(false)", ex));
+            return null;
         }
-        finally
+    }
+
+    private ManagedEtabsShutdownResult StopOwnedProcess(
+        IOwnedEtabsProcess ownedProcess,
+        int? applicationExitReturnCode)
+    {
+        var pid = ownedProcess.Identity.Pid;
+        try
         {
+            var forced = false;
+            if (!ownedProcess.HasExited)
+            {
+                forced = true;
+                ownedProcess.Kill();
+                if (!ownedProcess.WaitForExit(ForcedExitTimeout))
+                {
+                    return Unresolved(
+                        ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                        ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                        $"The ETABS process started by this attempt (pid={pid}) did not confirm exit after forced termination.",
+                        pid,
+                        forced: true,
+                        applicationExitReturnCode);
+                }
+            }
+
             ownedProcess.Dispose();
+            return Resolved(pid, forced, applicationExitReturnCode);
         }
+        catch (Exception ex)
+        {
+            return Unresolved(
+                ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "IOwnedEtabsProcess.Kill/WaitForExit",
+                    ex),
+                pid,
+                forced: true,
+                applicationExitReturnCode);
+        }
+    }
+
+    /// <summary>
+    /// No authoritative handle was taken, so ownership is re-derived from the census:
+    /// nothing left is clean, exactly one identified process is ours by construction and
+    /// may be terminated by exact identity, and anything ambiguous is left untouched and
+    /// reported as unresolved.
+    /// </summary>
+    private ManagedEtabsShutdownResult ResolveSurvivorWithoutHandle(int? applicationExitReturnCode)
+    {
+        EtabsProcessObservation observation;
+        try
+        {
+            observation = _processes.ObserveEtabs();
+        }
+        catch (Exception ex)
+        {
+            return Unresolved(
+                ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "IProcessInspector.ObserveEtabs",
+                    ex),
+                ownedPid: null,
+                forced: false,
+                applicationExitReturnCode);
+        }
+
+        if (observation.Identified.Count == 0 && observation.UnidentifiedCount == 0)
+        {
+            return Resolved(ownedPid: null, forced: false, applicationExitReturnCode);
+        }
+
+        if (observation.UnidentifiedCount > 0 || observation.Identified.Count != 1)
+        {
+            return Unresolved(
+                ManagedEtabsShutdownState.IdentityMismatch,
+                ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                "Managed ETABS start failed and ownership of the surviving ETABS process could not be proven; " +
+                $"nothing was terminated. identifiedCount={observation.Identified.Count}; " +
+                $"unidentifiedCount={observation.UnidentifiedCount}",
+                ownedPid: null,
+                forced: false,
+                applicationExitReturnCode);
+        }
+
+        var survivor = observation.Identified[0];
+        var termination = _processes.TerminateExact(survivor, ForcedExitTimeout);
+        return termination.State switch
+        {
+            ExactProcessTerminationState.NotFound =>
+                Resolved(survivor.Pid, forced: false, applicationExitReturnCode),
+            ExactProcessTerminationState.ConfirmedGone =>
+                Resolved(survivor.Pid, forced: true, applicationExitReturnCode),
+            ExactProcessTerminationState.IdentityMismatchOrUnidentified => Unresolved(
+                ManagedEtabsShutdownState.IdentityMismatch,
+                ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                $"The surviving ETABS process (pid={survivor.Pid}) no longer matched the census identity; it was not terminated.",
+                survivor.Pid,
+                forced: false,
+                applicationExitReturnCode),
+            _ => Unresolved(
+                ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                $"The ETABS process started by this attempt (pid={survivor.Pid}) could not be confirmed gone.",
+                survivor.Pid,
+                forced: true,
+                applicationExitReturnCode)
+        };
+    }
+
+    private static ManagedEtabsShutdownResult Resolved(
+        int? ownedPid,
+        bool forced,
+        int? applicationExitReturnCode) => new(
+        true,
+        null,
+        null,
+        new(
+            ManagedEtabsShutdownState.Succeeded,
+            ProcessExitConfirmed: true,
+            Forced: forced,
+            RecordRetained: false,
+            ApplicationExitReturnCode: applicationExitReturnCode,
+            OwnedPid: ownedPid));
+
+    private ManagedEtabsShutdownResult Unresolved(
+        ManagedEtabsShutdownState state,
+        string errorCode,
+        string diagnostic,
+        int? ownedPid,
+        bool forced,
+        int? applicationExitReturnCode)
+    {
+        var bounded = EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+            diagnostic,
+            $"code={errorCode}; state={state}; forced={forced}");
+        _diagnostics.WriteLine(bounded);
+        return new(
+            false,
+            errorCode,
+            bounded,
+            new(
+                state,
+                ProcessExitConfirmed: false,
+                Forced: forced,
+                RecordRetained: false,
+                ApplicationExitReturnCode: applicationExitReturnCode,
+                OwnedPid: ownedPid));
     }
 }

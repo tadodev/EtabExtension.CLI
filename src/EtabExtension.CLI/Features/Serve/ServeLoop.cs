@@ -1,6 +1,8 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 namespace EtabExtension.CLI.Features.Serve;
 
@@ -17,65 +19,192 @@ namespace EtabExtension.CLI.Features.Serve;
 /// </summary>
 public sealed class ServeLoop
 {
-    private readonly IServeDispatcher _dispatcher;
+    internal const string ShutdownCommand = "shutdown";
 
-    public ServeLoop(IServeDispatcher dispatcher) => _dispatcher = dispatcher;
+    private readonly IServeDispatcher _dispatcher;
+    private readonly IServeShutdownCoordinator _shutdown;
+    private readonly ServeHandshake _handshake;
+    private readonly TextWriter _diagnostics;
+
+    public ServeLoop(
+        IServeDispatcher dispatcher,
+        IServeShutdownCoordinator shutdown) : this(
+            dispatcher,
+            shutdown,
+            ServeHandshake.Current,
+            Console.Error)
+    {
+    }
+
+    internal ServeLoop(
+        IServeDispatcher dispatcher,
+        IServeShutdownCoordinator shutdown,
+        Func<IReadOnlyList<string>, ServeHandshake> handshakeFactory,
+        TextWriter diagnostics)
+    {
+        _dispatcher = dispatcher;
+        _shutdown = shutdown;
+        _diagnostics = diagnostics;
+        var capabilities = dispatcher.Capabilities
+            .Append(ShutdownCommand)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        _handshake = handshakeFactory(capabilities);
+    }
 
     /// <summary>
     /// Runs until stdin EOF, a <c>shutdown</c> command, or cancellation. Never
-    /// throws for a bad request — malformed lines get an error response and the
-    /// loop keeps serving.
+    /// throws for a bad request — malformed lines and failing handlers both get a
+    /// correlated error response and the loop keeps serving. Only transport and
+    /// cancellation failures end the run.
     /// </summary>
     public async Task RunAsync(TextReader input, TextWriter output, CancellationToken ct = default)
     {
-        await output.WriteLineAsync(JsonSerializer.Serialize(
-            new ServeHandshake("etab-cli-serve", 1), ServeJson.Options));
-        await output.FlushAsync(ct);
-        Console.Error.WriteLine("ℹ etab-cli serve: ready (line-delimited JSON on stdin/stdout)");
-
-        while (!ct.IsCancellationRequested)
+        var explicitShutdown = false;
+        try
         {
-            string? line = await input.ReadLineAsync(ct);
-            if (line is null)
-            {
-                break; // stdin closed
-            }
+            await output.WriteLineAsync(JsonSerializer.Serialize(
+                _handshake, ServeJson.Options));
+            await output.FlushAsync(ct);
+            Console.Error.WriteLine("ℹ etab-cli serve: ready (line-delimited JSON on stdin/stdout)");
 
-            if (string.IsNullOrWhiteSpace(line))
+            while (true)
             {
-                continue;
-            }
-
-            long id = 0;
-            try
-            {
-                var request = JsonSerializer.Deserialize<ServeRequest>(line, ServeJson.Options);
-                if (request is null || string.IsNullOrWhiteSpace(request.Command))
+                ct.ThrowIfCancellationRequested();
+                string? line = await input.ReadLineAsync(ct);
+                if (line is null)
                 {
-                    await WriteAsync(output, id, Result.Fail("Malformed request: missing command"));
+                    break;
+                }
+
+                if (string.IsNullOrWhiteSpace(line))
+                {
                     continue;
                 }
 
-                id = request.Id;
-
-                if (string.Equals(request.Command, "shutdown", StringComparison.OrdinalIgnoreCase))
+                ServeRequest? request;
+                try
                 {
-                    await WriteAsync(output, id, Result.Ok());
-                    return; // graceful shutdown — caller disposes the session
+                    request = JsonSerializer.Deserialize<ServeRequest>(line, ServeJson.Options);
+                }
+                catch (JsonException exception)
+                {
+                    await WriteAsync(
+                        output,
+                        id: 0,
+                        Result.Fail($"Invalid request JSON: {exception.Message}"));
+                    continue;
                 }
 
-                object result = await _dispatcher.DispatchAsync(request.Command, request.Request, ct);
-                await WriteAsync(output, id, result);
-            }
-            catch (JsonException ex)
-            {
-                await WriteAsync(output, id, Result.Fail($"Invalid request JSON: {ex.Message}"));
-            }
-            catch (Exception ex)
-            {
-                await WriteAsync(output, id, Result.Fail($"Sidecar error: {ex.Message}"));
+                if (request is null || string.IsNullOrWhiteSpace(request.Command))
+                {
+                    await WriteAsync(
+                        output,
+                        request?.Id ?? 0,
+                        Result.Fail("Malformed request: missing command"));
+                    continue;
+                }
+
+                if (string.Equals(
+                    request.Command,
+                    ShutdownCommand,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    explicitShutdown = true;
+                    var terminal = await _shutdown.ShutdownAsync();
+                    await WriteAsync(output, request.Id, terminal);
+                    return;
+                }
+
+                await WriteAsync(
+                    output,
+                    request.Id,
+                    await DispatchIsolatedAsync(request, ct));
             }
         }
+        finally
+        {
+            try
+            {
+                var cleanup = await _shutdown.ShutdownAsync();
+                if (!cleanup.Success && !explicitShutdown)
+                {
+                    await WriteCleanupFailureAsync(cleanup);
+                }
+            }
+            catch (Exception cleanupException)
+            {
+                await WriteCleanupExceptionAsync(cleanupException);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Runs one request against the dispatcher with its failures contained to that
+    /// request. A bad payload — a missing <c>request</c> object, a wrong field type,
+    /// an unexpected handler or COM escape — becomes one bounded correlated failure
+    /// response, and the daemon keeps serving. Without this the offending request
+    /// would get no response at all and would take the managed ETABS session down
+    /// with the loop.
+    ///
+    /// <para>Cancellation is deliberately not contained: when the serve token is
+    /// cancelled the daemon really is stopping, so it propagates and terminates
+    /// through the same shutdown coordinator as every other exit path.</para>
+    ///
+    /// <para>A typed managed-session failure keeps its own code. Wrapping an
+    /// <see cref="EtabsLaunchException"/> in the generic infrastructure envelope
+    /// would bury the one token a consumer branches on — the live proof surfaced
+    /// <c>ETABS_MODEL_INITIALIZATION_FAILED</c> only inside a generic message.</para>
+    /// </summary>
+    private async Task<object> DispatchIsolatedAsync(ServeRequest request, CancellationToken ct)
+    {
+        try
+        {
+            return await _dispatcher.DispatchAsync(request.Command, request.Request, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (EtabsLaunchException launch)
+        {
+            return Result.Fail(
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    EtabsApiDiagnosticFormatter.Bounded(launch.Message),
+                    $"command={request.Command}"));
+        }
+        catch (Exception exception)
+        {
+            return Result.Fail(
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    EtabsApiDiagnosticFormatter.InfrastructureException(
+                        "IServeDispatcher.DispatchAsync",
+                        exception),
+                    $"command={request.Command}"));
+        }
+    }
+
+    private async Task WriteCleanupFailureAsync(
+        Result<ManagedEtabsShutdownData> cleanup)
+    {
+        var diagnostic = cleanup.Error
+            ?? "Serve cleanup failed without a diagnostic.";
+        var bounded = EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+            diagnostic,
+            $"state={cleanup.Data?.State.ToString() ?? "unknown"}; " +
+            $"processExitConfirmed={cleanup.Data?.ProcessExitConfirmed ?? false}; " +
+            $"recordRetained={cleanup.Data?.RecordRetained ?? true}");
+        await _diagnostics.WriteLineAsync(bounded);
+        await _diagnostics.FlushAsync();
+    }
+
+    private async Task WriteCleanupExceptionAsync(Exception exception)
+    {
+        var bounded = EtabsApiDiagnosticFormatter.InfrastructureException(
+            "IServeShutdownCoordinator.ShutdownAsync",
+            exception);
+        await _diagnostics.WriteLineAsync(bounded);
+        await _diagnostics.FlushAsync();
     }
 
     /// <summary>

@@ -1,6 +1,8 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 using EtabExtension.CLI.Features.GetStatus.Models;
+using EtabExtension.CLI.Features.RunAnalysis;
+using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Features.Serve.Operations;
 using EtabExtension.CLI.Shared.Common;
@@ -12,6 +14,29 @@ namespace EtabExtension.CLI.Tests;
 
 public sealed class ServeOperationDispatcherTests : IDisposable
 {
+    private static readonly string[] ExpectedCapabilities =
+    [
+        "analyze-and-extract",
+        "cancel-operation",
+        "close-model",
+        "extract-materials",
+        "extract-results",
+        "generate-e2k",
+        "get-model-state",
+        "get-operation-events",
+        "get-operation-status",
+        "get-status",
+        "inspect-wall-property",
+        "list-wall-properties",
+        "open-model",
+        "read-model-metadata",
+        "resolve-area-targets",
+        "run-analysis",
+        "snapshot-export",
+        "start-operation",
+        "unlock-model"
+    ];
+
     private readonly string _directory = Path.Combine(
         Path.GetTempPath(), "etab-cli-serve-operation-tests", Guid.NewGuid().ToString("N"));
     private OperationManager? _manager;
@@ -80,7 +105,10 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             return Result.Ok();
         }));
         var session = new FakeSession();
-        var dispatcher = CreateDispatcher(_manager, session);
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            new FakeProcesses(new EtabsProcessObservation([Identity(42)], 0)));
         var started = _manager.Start("analyze-and-extract", Json("{}"));
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
@@ -89,9 +117,123 @@ public sealed class ServeOperationDispatcherTests : IDisposable
 
         Assert.True(response.Data!.IsRunning);
         Assert.Equal(42, response.Data.Pid);
+        Assert.Equal(EtabsInstanceOwnership.Managed, response.Data.Ownership);
+        Assert.Equal([42], response.Data.ObservedPids);
         Assert.Equal(0, session.GetOrStartCalls);
         release.SetResult();
         await _manager.WaitAsync(started.Data!.OperationId, TestContext.Current.CancellationToken);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Active_status_reports_process_ambiguity_without_com(bool unidentified)
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager = CreateManager(new DelegateOperation(async (_, context) =>
+        {
+            await context.RunStepAsync(1, 1, "Fake.CsiCall", async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return true;
+            });
+            return Result.Ok();
+        }));
+        var session = new FakeSession();
+        var observation = unidentified
+            ? new EtabsProcessObservation([Identity(42)], 1)
+            : new EtabsProcessObservation([Identity(42), Identity(99)], 0);
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            new FakeProcesses(observation));
+        var started = _manager.Start("analyze-and-extract", Json("{}"));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        try
+        {
+            var response = Assert.IsType<Result<GetStatusData>>(await dispatcher.DispatchAsync(
+                "get-status", null, TestContext.Current.CancellationToken));
+
+            Assert.True(response.Success);
+            Assert.Equal(EtabsInstanceOwnership.Ambiguous, response.Data!.Ownership);
+            Assert.Equal(
+                unidentified ? [42] : [42, 99],
+                response.Data.ObservedPids);
+            Assert.Equal(0, session.GetOrStartCalls);
+        }
+        finally
+        {
+            release.SetResult();
+            await _manager.WaitAsync(
+                started.Data!.OperationId,
+                TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task Active_status_preserves_cached_failure()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager = CreateManager(new DelegateOperation(async (_, context) =>
+        {
+            await context.RunStepAsync(1, 1, "Fake.CsiCall", async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return true;
+            });
+            return Result.Ok();
+        }));
+        var session = new FakeSession();
+        var cachedStatus = new CachedSessionStatus();
+        cachedStatus.Update(Result.Fail<GetStatusData>("cached status failed"));
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            new FakeProcesses(new EtabsProcessObservation([Identity(42)], 0)),
+            cachedStatus: cachedStatus);
+        var started = _manager.Start("analyze-and-extract", Json("{}"));
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        try
+        {
+            var response = Assert.IsType<Result<GetStatusData>>(await dispatcher.DispatchAsync(
+                "get-status", null, TestContext.Current.CancellationToken));
+
+            Assert.False(response.Success);
+            Assert.Equal("cached status failed", response.Error);
+            Assert.Equal(0, session.GetOrStartCalls);
+        }
+        finally
+        {
+            release.SetResult();
+            await _manager.WaitAsync(
+                started.Data!.OperationId,
+                TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task Get_status_reports_external_process_without_touching_com()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession(isStarted: false, processId: null);
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            new FakeProcesses(new EtabsProcessObservation([Identity(99)], 0)));
+
+        var response = Assert.IsType<Result<GetStatusData>>(await dispatcher.DispatchAsync(
+            "get-status", null, TestContext.Current.CancellationToken));
+
+        Assert.True(response.Data!.IsRunning);
+        Assert.Equal(EtabsInstanceOwnership.External, response.Data.Ownership);
+        Assert.Equal([99], response.Data.ObservedPids);
+        Assert.Equal(0, session.GetOrStartCalls);
     }
 
     [Fact]
@@ -117,6 +259,28 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.True(response.Success);
         Assert.Equal(@"C:\model.edb", response.Data!.FilePath);
         Assert.Equal(@"C:\results", response.Data.OutputDir);
+    }
+
+    [Fact]
+    public async Task Run_analysis_uses_the_shared_serve_session()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var runAnalysis = new FakeRunAnalysisService();
+        var dispatcher = CreateDispatcher(_manager, session, runAnalysis: runAnalysis);
+
+        var response = Assert.IsType<Result<RunAnalysisData>>(await dispatcher.DispatchAsync(
+            "run-analysis",
+            Json("""{"filePath":"C:\\model.edb","cases":["DEAD"],"units":"SI_kN_m_C"}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.True(response.Success);
+        Assert.Equal(1, runAnalysis.SharedCalls);
+        Assert.Equal(0, runAnalysis.OneShotCalls);
+        Assert.Equal(1, session.GetOrStartCalls);
+        Assert.Equal(@"C:\model.edb", runAnalysis.FilePath);
+        Assert.Equal(["DEAD"], runAnalysis.Cases);
+        Assert.Equal("SI_kN_m_C", runAnalysis.Units);
     }
 
     [Theory]
@@ -161,9 +325,29 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         new SystemOperationClock(),
         [definition]);
 
+    [Fact]
+    public async Task Capabilities_are_the_registered_dispatch_handlers()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) =>
+            Task.FromResult<object>(Result.Ok())));
+        var dispatcher = CreateDispatcher(_manager);
+
+        Assert.Equal(ExpectedCapabilities, dispatcher.Capabilities);
+
+        var unsupported = Assert.IsType<Result>(await dispatcher.DispatchAsync(
+            "not-a-command",
+            null,
+            TestContext.Current.CancellationToken));
+        Assert.False(unsupported.Success);
+        Assert.Contains("not supported", unsupported.Error, StringComparison.Ordinal);
+    }
+
     private static ServeDispatcher CreateDispatcher(
         IOperationManager operations,
-        IEtabsSession? session = null) => new(
+        IEtabsSession? session = null,
+        IProcessInspector? processes = null,
+        IRunAnalysisService? runAnalysis = null,
+        ICachedSessionStatus? cachedStatus = null) => new(
             session ?? null!,
             null!,
             null!,
@@ -178,7 +362,9 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             null!,
             null!,
             operations,
-            new CachedSessionStatus());
+            cachedStatus ?? new CachedSessionStatus(),
+            processes ?? new FakeProcesses(new EtabsProcessObservation([], 0)),
+            runAnalysis ?? null!);
 
     private static JsonElement Json(string value) => JsonSerializer.Deserialize<JsonElement>(value);
 
@@ -198,18 +384,65 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             execute(payload, context);
     }
 
-    private sealed class FakeSession : IEtabsSession
+    private static ManagedProcessIdentity Identity(int pid) => new(
+        pid,
+        new DateTimeOffset(2026, 8, 9, 1, 2, pid % 60, TimeSpan.Zero),
+        $@"C:\ETABS-{pid}\ETABS.exe");
+
+    private sealed class FakeSession(bool isStarted = true, int? processId = 42) : IEtabsSession
     {
         public int GetOrStartCalls { get; private set; }
-        public bool IsStarted => true;
-        public int? ProcessId => 42;
+        public bool IsStarted => isStarted;
+        public int? ProcessId => processId;
         public ETABSApplication GetOrStart()
         {
             GetOrStartCalls++;
-            throw new InvalidOperationException("COM must not be touched for cached status");
+            return null!;
         }
         public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
-        public void Shutdown() { }
+        public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
         public void Dispose() { }
+    }
+
+    private sealed class FakeProcesses(EtabsProcessObservation observation) : IProcessInspector
+    {
+        public EtabsProcessObservation ObserveEtabs() => observation;
+        public IOwnedEtabsProcess? OpenExact(ManagedProcessIdentity expected) => null;
+        public ManagedProcessIdentity? Find(int pid) =>
+            observation.Identified.FirstOrDefault(identity => identity.Pid == pid);
+        public ExactProcessTerminationResult TerminateExact(
+            ManagedProcessIdentity expected,
+            TimeSpan timeout) => throw new NotSupportedException();
+    }
+
+    private sealed class FakeRunAnalysisService : IRunAnalysisService
+    {
+        public int OneShotCalls { get; private set; }
+        public int SharedCalls { get; private set; }
+        public string? FilePath { get; private set; }
+        public List<string>? Cases { get; private set; }
+        public string? Units { get; private set; }
+
+        public Task<Result<RunAnalysisData>> RunAnalysisAsync(
+            string filePath,
+            List<string>? cases,
+            string? units = null)
+        {
+            OneShotCalls++;
+            return Task.FromResult(Result.Ok(new RunAnalysisData { FilePath = filePath }));
+        }
+
+        public Task<Result<RunAnalysisData>> RunAnalysisOnAppAsync(
+            ETABSApplication app,
+            string filePath,
+            List<string>? cases,
+            string? units = null)
+        {
+            SharedCalls++;
+            FilePath = filePath;
+            Cases = cases;
+            Units = units;
+            return Task.FromResult(Result.Ok(new RunAnalysisData { FilePath = filePath }));
+        }
     }
 }

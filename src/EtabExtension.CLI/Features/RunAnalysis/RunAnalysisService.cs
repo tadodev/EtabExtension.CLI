@@ -17,20 +17,14 @@ public class RunAnalysisService : IRunAnalysisService
         List<string>? cases,
         string? units = null)
     {
-        await Task.CompletedTask;
-
         if (!File.Exists(filePath))
             return Result.Fail<RunAnalysisData>($"File not found: {filePath}");
 
-        // Resolve units before starting ETABS — fail fast with a clear message
-        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(units);
+        var (_, unitsError) = EtabsUnitPreset.Resolve(units);
         if (unitsError is not null)
             return Result.Fail<RunAnalysisData>(unitsError);
 
-        var hasSpecificCases = cases is { Count: > 0 };
-
         ETABSApplication? app = null;
-        var stopwatch = Stopwatch.StartNew();
         try
         {
             Console.Error.WriteLine("ℹ Starting ETABS (hidden)...");
@@ -40,6 +34,40 @@ public class RunAnalysisService : IRunAnalysisService
 
             EtabsSessionHelpers.HideIfVisible(app);
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
+
+            return await RunAnalysisOnAppAsync(app, filePath, cases, units);
+        }
+        catch (Exception ex)
+        {
+            return Result.Fail<RunAnalysisData>($"ETABS COM error: {ex.Message}");
+        }
+        finally
+        {
+            app?.Application.ApplicationExit(false);
+            app?.Dispose();
+        }
+    }
+
+    public async Task<Result<RunAnalysisData>> RunAnalysisOnAppAsync(
+        ETABSApplication app,
+        string filePath,
+        List<string>? cases,
+        string? units = null)
+    {
+        await Task.CompletedTask;
+
+        if (!File.Exists(filePath))
+            return Result.Fail<RunAnalysisData>($"File not found: {filePath}");
+
+        // Resolve units before touching the shared model — fail fast with a clear message.
+        var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(units);
+        if (unitsError is not null)
+            return Result.Fail<RunAnalysisData>(unitsError);
+
+        var hasSpecificCases = cases is { Count: > 0 };
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
 
             Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
             int openRet = app.Model.Files.OpenFile(filePath);
@@ -149,11 +177,6 @@ public class RunAnalysisService : IRunAnalysisService
         catch (Exception ex)
         {
             return Result.Fail<RunAnalysisData>($"ETABS COM error: {ex.Message}");
-        }
-        finally
-        {
-            app?.Application.ApplicationExit(false);
-            app?.Dispose();
         }
     }
 

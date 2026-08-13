@@ -13,7 +13,11 @@ public class GetStatusService : IGetStatusService
         await Task.CompletedTask;
 
         if (!ETABSWrapper.IsRunning())
-            return Result.Ok(new GetStatusData { IsRunning = false });
+            return Result.Ok(new GetStatusData
+            {
+                IsRunning = false,
+                Ownership = EtabsInstanceOwnership.None
+            });
 
         var instances = ETABSWrapper.GetAllRunningInstances();
         if (instances.Count != 1)
@@ -30,7 +34,11 @@ public class GetStatusService : IGetStatusService
                     "ETABS is running but COM attach failed. Try restarting ETABS.");
 
             Console.Error.WriteLine($"✓ Connected to ETABS v{app.FullVersion} (PID {pid})");
-            return Result.Ok(BuildStatusData(app, pid));
+            return Result.Ok(BuildStatusData(
+                app,
+                pid,
+                EtabsInstanceOwnership.External,
+                [pid]));
         }
         catch (Exception ex)
         {
@@ -47,7 +55,11 @@ public class GetStatusService : IGetStatusService
     {
         try
         {
-            return Result.Ok(BuildStatusData(app, pid));
+            return Result.Ok(BuildStatusData(
+                app,
+                pid,
+                pid.HasValue ? EtabsInstanceOwnership.Managed : EtabsInstanceOwnership.External,
+                pid.HasValue ? [pid.Value] : []));
         }
         catch (Exception ex)
         {
@@ -55,7 +67,11 @@ public class GetStatusService : IGetStatusService
         }
     }
 
-    private static GetStatusData BuildStatusData(ETABSApplication app, int? pid)
+    private static GetStatusData BuildStatusData(
+        ETABSApplication app,
+        int? pid,
+        EtabsInstanceOwnership ownership,
+        IReadOnlyList<int> observedPids)
     {
         var openFilePath = app.Model.ModelInfo.GetModelFilepath();
         var isModelOpen = !string.IsNullOrEmpty(openFilePath);
@@ -87,6 +103,8 @@ public class GetStatusService : IGetStatusService
         {
             IsRunning = true,
             Pid = pid,
+            Ownership = ownership,
+            ObservedPids = observedPids,
             EtabsVersion = app.FullVersion,
             OpenFilePath = isModelOpen ? openFilePath : null,
             IsModelOpen = isModelOpen,

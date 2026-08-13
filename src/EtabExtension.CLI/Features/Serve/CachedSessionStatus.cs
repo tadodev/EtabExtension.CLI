@@ -7,7 +7,9 @@ namespace EtabExtension.CLI.Features.Serve;
 public interface ICachedSessionStatus
 {
     void Update(Result<GetStatusData> status);
-    Result<GetStatusData> Read(IEtabsSession session);
+    Result<GetStatusData> Read(
+        IEtabsSession session,
+        EtabsProcessObservation observation);
 }
 
 public sealed class CachedSessionStatus : ICachedSessionStatus
@@ -23,24 +25,69 @@ public sealed class CachedSessionStatus : ICachedSessionStatus
         }
     }
 
-    public Result<GetStatusData> Read(IEtabsSession session)
+    public Result<GetStatusData> Read(
+        IEtabsSession session,
+        EtabsProcessObservation observation)
     {
         lock (_gate)
         {
-            if (_status is { Success: true, Data: not null })
+            if (_status is { Success: false })
             {
-                return Result.Ok(_status.Data with
-                {
-                    IsRunning = session.IsStarted,
-                    Pid = session.ProcessId
-                });
+                return _status;
             }
 
-            return Result.Ok(new GetStatusData
-            {
-                IsRunning = session.IsStarted,
-                Pid = session.ProcessId
-            });
+            var baseline = _status ?? Result.Ok(new GetStatusData());
+            return EtabsStatusOwnership.Decorate(
+                baseline,
+                observation,
+                session.ProcessId);
         }
+    }
+}
+
+internal static class EtabsStatusOwnership
+{
+    public static Result<GetStatusData> Decorate(
+        Result<GetStatusData> status,
+        EtabsProcessObservation observation,
+        int? managedPid)
+    {
+        if (!status.Success)
+        {
+            return status;
+        }
+
+        if (status.Data is null)
+        {
+            return Result.Fail<GetStatusData>(
+                "ETABS status reported success without data");
+        }
+
+        var ownership = EtabsOwnershipResolver.Resolve(observation, managedPid);
+        if (managedPid.HasValue && ownership == EtabsInstanceOwnership.None)
+        {
+            ownership = EtabsInstanceOwnership.Ambiguous;
+        }
+
+        var observedPids = observation.Identified
+            .Select(identity => identity.Pid)
+            .Distinct()
+            .Order()
+            .ToList();
+        var pid = ownership switch
+        {
+            EtabsInstanceOwnership.Managed => managedPid,
+            EtabsInstanceOwnership.External => observedPids.SingleOrDefault(),
+            EtabsInstanceOwnership.Ambiguous => managedPid,
+            _ => null
+        };
+
+        return Result.Ok(status.Data with
+        {
+            IsRunning = ownership != EtabsInstanceOwnership.None,
+            Pid = pid,
+            Ownership = ownership,
+            ObservedPids = observedPids
+        });
     }
 }

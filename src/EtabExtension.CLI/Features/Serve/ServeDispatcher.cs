@@ -11,21 +11,21 @@ using EtabExtension.CLI.Features.GetStatus;
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.OpenModel;
 using EtabExtension.CLI.Features.ReadModelMetadata;
+using EtabExtension.CLI.Features.RunAnalysis;
+using EtabExtension.CLI.Features.Serve.Inspection;
+using EtabExtension.CLI.Features.Serve.Operations;
 using EtabExtension.CLI.Features.SnapshotExport;
 using EtabExtension.CLI.Features.SnapshotExport.Models;
 using EtabExtension.CLI.Features.UnlockModel;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
-using EtabExtension.CLI.Features.Serve.Operations;
-using EtabExtension.CLI.Features.Serve.Inspection;
 
 namespace EtabExtension.CLI.Features.Serve;
 
 /// <summary>
 /// Routes one serve request to the matching feature, executed against the single
-/// shared ETABS session. All commands here operate on the SAME instance
-/// (<see cref="IEtabsSession.GetOrStart"/>) — that is the fix for the
-/// multi-instance golden-path bug.
+/// shared ETABS session. The handler registry is also the authoritative source
+/// for the capabilities advertised by the persistent protocol.
 /// </summary>
 public sealed class ServeDispatcher : IServeDispatcher
 {
@@ -44,6 +44,13 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly ISessionRecordStore _sessionRecords;
     private readonly IOperationManager _operations;
     private readonly ICachedSessionStatus _cachedStatus;
+    private readonly IProcessInspector _processes;
+    private readonly IRunAnalysisService _runAnalysis;
+    private readonly Dictionary<
+        string,
+        Func<JsonElement?, CancellationToken, Task<object>>> _handlers;
+
+    public IReadOnlyCollection<string> Capabilities { get; }
 
     public ServeDispatcher(
         IEtabsSession session,
@@ -60,7 +67,9 @@ public sealed class ServeDispatcher : IServeDispatcher
         IEtabsInspectionApiFactory inspectionApiFactory,
         ISessionRecordStore sessionRecords,
         IOperationManager operations,
-        ICachedSessionStatus cachedStatus)
+        ICachedSessionStatus cachedStatus,
+        IProcessInspector processes,
+        IRunAnalysisService runAnalysis)
     {
         _session = session;
         _status = status;
@@ -77,156 +86,278 @@ public sealed class ServeDispatcher : IServeDispatcher
         _sessionRecords = sessionRecords;
         _operations = operations;
         _cachedStatus = cachedStatus;
+        _processes = processes;
+        _runAnalysis = runAnalysis;
+
+        var handlers = new Dictionary<
+            string,
+            Func<JsonElement?, CancellationToken, Task<object>>>(StringComparer.Ordinal)
+        {
+            ["analyze-and-extract"] = DispatchAnalyzeAndExtractAsync,
+            ["cancel-operation"] = DispatchCancelOperationAsync,
+            ["close-model"] = DispatchCloseModelAsync,
+            ["extract-materials"] = DispatchExtractMaterialsAsync,
+            ["extract-results"] = DispatchExtractResultsAsync,
+            ["generate-e2k"] = DispatchGenerateE2KAsync,
+            ["get-model-state"] = DispatchGetModelStateAsync,
+            ["get-operation-events"] = DispatchGetOperationEventsAsync,
+            ["get-operation-status"] = DispatchGetOperationStatusAsync,
+            ["get-status"] = DispatchGetStatusAsync,
+            ["inspect-wall-property"] = DispatchInspectWallPropertyAsync,
+            ["list-wall-properties"] = DispatchListWallPropertiesAsync,
+            ["open-model"] = DispatchOpenModelAsync,
+            ["read-model-metadata"] = DispatchReadModelMetadataAsync,
+            ["resolve-area-targets"] = DispatchResolveAreaTargetsAsync,
+            ["run-analysis"] = DispatchRunAnalysisAsync,
+            ["snapshot-export"] = DispatchSnapshotExportAsync,
+            ["start-operation"] = DispatchStartOperationAsync,
+            ["unlock-model"] = DispatchUnlockModelAsync
+        };
+        _handlers = handlers;
+        Capabilities = handlers.Keys.Order(StringComparer.Ordinal).ToArray();
     }
 
-    public async Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
+    public Task<object> DispatchAsync(
+        string command,
+        JsonElement? request,
+        CancellationToken ct)
     {
-        switch (command)
+        return _handlers.TryGetValue(command, out var handler)
+            ? handler(request, ct)
+            : Task.FromResult<object>(Result.Fail(
+                $"Command not supported in serve mode yet: '{command}'"));
+    }
+
+    private async Task<object> DispatchGetStatusAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = request;
+        _ = ct;
+        // During an async operation the protocol thread must never issue COM
+        // calls. Report the most recent worker-owned snapshot instead.
+        if (_operations.HasActiveOperation)
         {
-            case "get-status":
-                // During an async operation the protocol thread must never issue COM
-                // calls. Report the most recent worker-owned snapshot instead.
-                if (_operations.HasActiveOperation)
-                {
-                    return _cachedStatus.Read(_session);
-                }
-                return await _operations.ExecuteSynchronousAsync(() =>
-                {
-                    var current = _session.IsStarted
-                        ? _status.GetStatusOnApp(_session.GetOrStart(), _session.ProcessId)
-                        : Result.Ok(new GetStatusData { IsRunning = false });
-                    _cachedStatus.Update(current);
-                    return Task.FromResult<object>(current);
-                });
-
-            case "start-operation":
-            {
-                var req = Deserialize<StartOperationRequest>(request);
-                return _operations.Start(req.Kind, req.Payload);
-            }
-
-            case "get-operation-status":
-            {
-                var req = Deserialize<OperationIdRequest>(request);
-                return _operations.GetStatus(req.OperationId);
-            }
-
-            case "get-operation-events":
-            {
-                var req = Deserialize<GetOperationEventsRequest>(request);
-                return _operations.GetEvents(req.OperationId, req.SinceSeq);
-            }
-
-            case "cancel-operation":
-            {
-                var req = Deserialize<OperationIdRequest>(request);
-                return _operations.Cancel(req.OperationId);
-            }
-
-            case "open-model":
-            {
-                var req = Deserialize<ServeOpenModelRequest>(request);
-                return await ExecuteComAsync(async () => await _open.OpenModelOnAppAsync(
-                    _session.GetOrStart(), req.FilePath, req.SaveOnClose));
-            }
-
-            case "analyze-and-extract":
-            {
-                // Frozen Rust compatibility: start through the generic envelope,
-                // then internally wait and return the original Result<T> unchanged.
-                var payload = RequirePayload(request);
-                var started = _operations.Start("analyze-and-extract", payload);
-                if (!started.Success || started.Data is null)
-                {
-                    return Result.Fail<AnalyzeAndExtractData>(
-                        started.Error ?? "Could not start analyze-and-extract operation");
-                }
-                return await _operations.WaitAsync(started.Data.OperationId, ct);
-            }
-
-            case "snapshot-export":
-            {
-                var loc = Deserialize<ServeFileLocator>(request);
-                var snapReq = Deserialize<SnapshotExportRequest>(request);
-                return await ExecuteComAsync(async () => await _snapshot.SnapshotExportOnAppAsync(
-                    _session.GetOrStart(), loc.FilePath, loc.OutputDir, snapReq));
-            }
-
-            case "close-model":
-            {
-                var req = Deserialize<ServeCloseModelRequest>(request);
-                return await ExecuteComAsync(async () => await _close.CloseModelOnAppAsync(
-                    _session.GetOrStart(), req.Save));
-            }
-
-            case "unlock-model":
-            {
-                var req = Deserialize<ServeFileRequest>(request);
-                return await ExecuteComAsync(async () => await _unlock.UnlockModelOnAppAsync(
-                    _session.GetOrStart(), req.FilePath));
-            }
-
-            case "extract-results":
-                return await ExecuteComAsync(async () => await _extractResults.ExtractOnAppAsync(
-                    _session.GetOrStart(), Deserialize<ExtractResultsRequest>(request)));
-
-            case "extract-materials":
-                return await ExecuteComAsync(async () => await _extractMaterials.ExtractMaterialsOnAppAsync(
-                    _session.GetOrStart(), Deserialize<ExtractMaterialsRequest>(request)));
-
-            case "generate-e2k":
-            {
-                var req = Deserialize<ServeGenerateE2KRequest>(request);
-                return await ExecuteComAsync(async () => await _generateE2K.GenerateE2KOnAppAsync(
-                    _session.GetOrStart(), req.FilePath, req.OutputFile, req.Overwrite));
-            }
-
-            case "read-model-metadata":
-            {
-                var req = Deserialize<ServeFileRequest>(request);
-                return await ExecuteComAsync(async () => await _metadata.ReadOnAppAsync(
-                    _session.GetOrStart(), req.FilePath));
-            }
-
-            case "get-model-state":
-                return await ExecuteComAsync(() =>
-                {
-                    var api = _inspectionApiFactory.Create(_session.GetOrStart());
-                    return Task.FromResult<object>(
-                        _inspection.GetModelState(api, _sessionRecords.Read()));
-                });
-
-            case "list-wall-properties":
-                return await ExecuteComAsync(() =>
-                {
-                    var api = _inspectionApiFactory.Create(_session.GetOrStart());
-                    return Task.FromResult<object>(_inspection.ListWallProperties(api));
-                });
-
-            case "inspect-wall-property":
-            {
-                var req = Deserialize<InspectWallPropertyRequest>(request);
-                return await ExecuteComAsync(() =>
-                {
-                    var api = _inspectionApiFactory.Create(_session.GetOrStart());
-                    return Task.FromResult<object>(_inspection.InspectWallProperty(api, req.Name));
-                });
-            }
-
-            case "resolve-area-targets":
-            {
-                var req = Deserialize<ResolveAreaTargetsRequest>(request);
-                return await ExecuteComAsync(() =>
-                {
-                    var api = _inspectionApiFactory.Create(_session.GetOrStart());
-                    return Task.FromResult<object>(
-                        _inspection.ResolveAreaTargets(api, req.SourceProperty));
-                });
-            }
-
-            default:
-                return Result.Fail($"Command not supported in serve mode yet: '{command}'");
+            return ReadActiveStatus();
         }
+
+        return await _operations.ExecuteSynchronousAsync(() =>
+        {
+            try
+            {
+                var observation = _processes.ObserveEtabs();
+                var current = _session.IsStarted
+                    ? _status.GetStatusOnApp(_session.GetOrStart(), _session.ProcessId)
+                    : Result.Ok(new GetStatusData());
+                current = EtabsStatusOwnership.Decorate(
+                    current,
+                    observation,
+                    _session.ProcessId);
+                _cachedStatus.Update(current);
+                return Task.FromResult<object>(current);
+            }
+            catch (Exception ex)
+            {
+                return Task.FromResult<object>(Result.Fail<GetStatusData>(
+                    $"ETABS process observation failed: {ex.Message}"));
+            }
+        });
+    }
+
+    private Task<object> DispatchStartOperationAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<StartOperationRequest>(request);
+        return Task.FromResult<object>(_operations.Start(req.Kind, req.Payload));
+    }
+
+    private Task<object> DispatchGetOperationStatusAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<OperationIdRequest>(request);
+        return Task.FromResult<object>(_operations.GetStatus(req.OperationId));
+    }
+
+    private Task<object> DispatchGetOperationEventsAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<GetOperationEventsRequest>(request);
+        return Task.FromResult<object>(_operations.GetEvents(req.OperationId, req.SinceSeq));
+    }
+
+    private Task<object> DispatchCancelOperationAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<OperationIdRequest>(request);
+        return Task.FromResult<object>(_operations.Cancel(req.OperationId));
+    }
+
+    private async Task<object> DispatchOpenModelAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<ServeOpenModelRequest>(request);
+        return await ExecuteComAsync(async () => await _open.OpenModelOnAppAsync(
+            _session.GetOrStart(), req.FilePath, req.SaveOnClose));
+    }
+
+    private async Task<object> DispatchAnalyzeAndExtractAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        // Frozen Rust compatibility: start through the generic envelope,
+        // then internally wait and return the original Result<T> unchanged.
+        var payload = RequirePayload(request);
+        var started = _operations.Start("analyze-and-extract", payload);
+        if (!started.Success || started.Data is null)
+        {
+            return Result.Fail<AnalyzeAndExtractData>(
+                started.Error ?? "Could not start analyze-and-extract operation");
+        }
+
+        return await _operations.WaitAsync(started.Data.OperationId, ct);
+    }
+
+    private async Task<object> DispatchSnapshotExportAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var loc = Deserialize<ServeFileLocator>(request);
+        var snapReq = Deserialize<SnapshotExportRequest>(request);
+        return await ExecuteComAsync(async () => await _snapshot.SnapshotExportOnAppAsync(
+            _session.GetOrStart(), loc.FilePath, loc.OutputDir, snapReq));
+    }
+
+    private async Task<object> DispatchCloseModelAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<ServeCloseModelRequest>(request);
+        return await ExecuteComAsync(async () => await _close.CloseModelOnAppAsync(
+            _session.GetOrStart(), req.Save));
+    }
+
+    private async Task<object> DispatchUnlockModelAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<ServeFileRequest>(request);
+        return await ExecuteComAsync(async () => await _unlock.UnlockModelOnAppAsync(
+            _session.GetOrStart(), req.FilePath));
+    }
+
+    private async Task<object> DispatchExtractResultsAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        return await ExecuteComAsync(async () => await _extractResults.ExtractOnAppAsync(
+            _session.GetOrStart(), Deserialize<ExtractResultsRequest>(request)));
+    }
+
+    private async Task<object> DispatchExtractMaterialsAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        return await ExecuteComAsync(async () => await _extractMaterials.ExtractMaterialsOnAppAsync(
+            _session.GetOrStart(), Deserialize<ExtractMaterialsRequest>(request)));
+    }
+
+    private async Task<object> DispatchGenerateE2KAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<ServeGenerateE2KRequest>(request);
+        return await ExecuteComAsync(async () => await _generateE2K.GenerateE2KOnAppAsync(
+            _session.GetOrStart(), req.FilePath, req.OutputFile, req.Overwrite));
+    }
+
+    private async Task<object> DispatchReadModelMetadataAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<ServeFileRequest>(request);
+        return await ExecuteComAsync(async () => await _metadata.ReadOnAppAsync(
+            _session.GetOrStart(), req.FilePath));
+    }
+
+    private async Task<object> DispatchRunAnalysisAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<ServeRunAnalysisRequest>(request);
+        return await ExecuteComAsync(async () => await _runAnalysis.RunAnalysisOnAppAsync(
+            _session.GetOrStart(), req.FilePath, req.Cases, req.Units));
+    }
+
+    private Task<object> DispatchGetModelStateAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = request;
+        _ = ct;
+        return ExecuteComAsync(() =>
+        {
+            var api = _inspectionApiFactory.Create(_session.GetOrStart());
+            return Task.FromResult<object>(
+                _inspection.GetModelState(api, _sessionRecords.Read()));
+        });
+    }
+
+    private Task<object> DispatchListWallPropertiesAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = request;
+        _ = ct;
+        return ExecuteComAsync(() =>
+        {
+            var api = _inspectionApiFactory.Create(_session.GetOrStart());
+            return Task.FromResult<object>(_inspection.ListWallProperties(api));
+        });
+    }
+
+    private Task<object> DispatchInspectWallPropertyAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<InspectWallPropertyRequest>(request);
+        return ExecuteComAsync(() =>
+        {
+            var api = _inspectionApiFactory.Create(_session.GetOrStart());
+            return Task.FromResult<object>(_inspection.InspectWallProperty(api, req.Name));
+        });
+    }
+
+    private Task<object> DispatchResolveAreaTargetsAsync(
+        JsonElement? request,
+        CancellationToken ct)
+    {
+        _ = ct;
+        var req = Deserialize<ResolveAreaTargetsRequest>(request);
+        return ExecuteComAsync(() =>
+        {
+            var api = _inspectionApiFactory.Create(_session.GetOrStart());
+            return Task.FromResult<object>(
+                _inspection.ResolveAreaTargets(api, req.SourceProperty));
+        });
     }
 
     private static T Deserialize<T>(JsonElement? request)
@@ -248,4 +379,17 @@ public sealed class ServeDispatcher : IServeDispatcher
             ? Task.FromResult<object>(Result.Fail(
                 "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"))
             : _operations.ExecuteSynchronousAsync(action);
+
+    private Result<GetStatusData> ReadActiveStatus()
+    {
+        try
+        {
+            return _cachedStatus.Read(_session, _processes.ObserveEtabs());
+        }
+        catch (Exception ex)
+        {
+            return Result.Fail<GetStatusData>(
+                $"ETABS process observation failed: {ex.Message}");
+        }
+    }
 }

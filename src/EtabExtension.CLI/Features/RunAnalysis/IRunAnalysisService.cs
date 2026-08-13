@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.RunAnalysis;
 
@@ -23,6 +24,16 @@ public interface IRunAnalysisService
     /// See <see cref="EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit.EtabsUnitPreset"/> for valid values.
     /// </param>
     Task<Result<RunAnalysisData>> RunAnalysisAsync(
+        string filePath,
+        List<string>? cases,
+        string? units = null);
+
+    /// <summary>
+    /// Runs analysis on the ETABS instance owned by the persistent serve session.
+    /// The caller retains ownership of the application lifecycle.
+    /// </summary>
+    Task<Result<RunAnalysisData>> RunAnalysisOnAppAsync(
+        ETABSApplication app,
         string filePath,
         List<string>? cases,
         string? units = null);
