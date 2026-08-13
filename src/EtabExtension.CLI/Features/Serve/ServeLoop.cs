@@ -150,6 +150,11 @@ public sealed class ServeLoop
     /// <para>Cancellation is deliberately not contained: when the serve token is
     /// cancelled the daemon really is stopping, so it propagates and terminates
     /// through the same shutdown coordinator as every other exit path.</para>
+    ///
+    /// <para>A typed managed-session failure keeps its own code. Wrapping an
+    /// <see cref="EtabsLaunchException"/> in the generic infrastructure envelope
+    /// would bury the one token a consumer branches on — the live proof surfaced
+    /// <c>ETABS_MODEL_INITIALIZATION_FAILED</c> only inside a generic message.</para>
     /// </summary>
     private async Task<object> DispatchIsolatedAsync(ServeRequest request, CancellationToken ct)
     {
@@ -160,6 +165,13 @@ public sealed class ServeLoop
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             throw;
+        }
+        catch (EtabsLaunchException launch)
+        {
+            return Result.Fail(
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    EtabsApiDiagnosticFormatter.Bounded(launch.Message),
+                    $"command={request.Command}"));
         }
         catch (Exception exception)
         {

@@ -390,6 +390,43 @@ public class ServeLoopTests
         Assert.Equal(1, coordinator.CallCount);
     }
 
+    // The live proof surfaced ETABS_MODEL_INITIALIZATION_FAILED only inside a generic
+    // infrastructure envelope. A typed managed-session failure must keep its own code
+    // as the leading token so a consumer can branch on it.
+    [Fact]
+    public async Task TypedLaunchFailureKeepsItsCodeInsteadOfTheGenericEnvelope()
+    {
+        var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
+        using var reader = new StringReader(
+            "{\"id\":66,\"command\":\"launch-failure\",\"request\":{}}\n{\"id\":67,\"command\":\"get-status\"}\n");
+        await using var writer = new StringWriter();
+        var loop = new ServeLoop(
+            new IsolationDispatcher(),
+            coordinator,
+            TestHandshake,
+            TextWriter.Null);
+
+        await loop.RunAsync(reader, writer, TestContext.Current.CancellationToken);
+
+        var responses = ResponseLines(writer);
+        Assert.Equal(2, responses.Count);
+        var error = responses[0].GetProperty("error").GetString()!;
+        Assert.StartsWith(
+            $"[{EtabsLaunchErrorCodes.ModelInitializationFailed}]",
+            error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            EtabsApiErrorCodes.InfrastructureOperationFailed,
+            error,
+            StringComparison.Ordinal);
+        Assert.Contains("cSapModel.InitializeNewModel", error, StringComparison.Ordinal);
+        Assert.EndsWith("command=launch-failure", error, StringComparison.Ordinal);
+        Assert.True(error.Length <= 2048);
+
+        // Typed or not, the failure is still contained to its own request.
+        Assert.True(responses[1].GetProperty("success").GetBoolean());
+    }
+
     [Fact]
     public async Task UnboundedHandlerFailureTextIsCappedInTheCorrelatedResponse()
     {
@@ -583,7 +620,7 @@ public class ServeLoopTests
         : IServeDispatcher
     {
         public IReadOnlyCollection<string> Capabilities { get; } =
-            ["cancel", "explode", "flood", "get-status", "needs-payload", "typed"];
+            ["cancel", "explode", "flood", "get-status", "launch-failure", "needs-payload", "typed"];
         public List<string> Commands { get; } = [];
 
         public Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
@@ -600,6 +637,10 @@ public class ServeLoopTests
                     break;
                 case "explode":
                     throw new InvalidOperationException("dispatch failed");
+                case "launch-failure":
+                    throw new EtabsLaunchException(
+                        EtabsLaunchErrorCodes.ModelInitializationFailed,
+                        EtabsApiDiagnosticFormatter.ApiReturn("cSapModel.InitializeNewModel", 7));
                 case "flood":
                     throw new InvalidOperationException(new string('x', 5_000));
                 case "cancel":
