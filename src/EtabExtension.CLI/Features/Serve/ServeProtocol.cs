@@ -1,8 +1,22 @@
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 namespace EtabExtension.CLI.Features.Serve;
+
+/// <summary>
+/// The two terminal outcomes of serve startup. Exactly one startup frame is
+/// written to stdout before anything else: <c>ready</c> (the identity/capability
+/// handshake) or <c>refused</c> (a typed recovery refusal). A consumer never has
+/// to infer startup state from process exit alone.
+/// </summary>
+public static class ServeStartupOutcomes
+{
+    public const string Ready = "ready";
+    public const string Refused = "refused";
+}
 
 /// <summary>
 /// A single request line on the serve daemon's stdin:
@@ -25,6 +39,14 @@ public sealed record ServeHandshake(
     [property: JsonPropertyName("exePath")] string ExePath,
     [property: JsonPropertyName("capabilities")] IReadOnlyList<string> Capabilities)
 {
+    /// <summary>
+    /// Always <c>ready</c> — a handshake is only written once recovery succeeded.
+    /// The refusal frame carries <c>refused</c>, so one field discriminates the
+    /// startup outcome without inspecting the other members.
+    /// </summary>
+    [JsonPropertyName("startup")]
+    public string Startup { get; init; } = ServeStartupOutcomes.Ready;
+
     internal static Assembly MetadataAssembly => typeof(ServeHandshake).Assembly;
 
     public static ServeHandshake Current(IReadOnlyList<string> capabilities)
@@ -46,16 +68,27 @@ public sealed record ServeHandshake(
         IReadOnlyList<string> capabilities)
     {
         return new(
-            "etab-cli-serve",
-            1,
-            RequiredMetadata(assembly, "SidecarVersion"),
-            RequiredMetadata(assembly, "SidecarBuildId"),
+            ServeProtocolIdentity.Name,
+            ServeProtocolIdentity.Version,
+            ServeProtocolIdentity.RequiredMetadata(assembly, "SidecarVersion"),
+            ServeProtocolIdentity.RequiredMetadata(assembly, "SidecarBuildId"),
             pid,
             Path.GetFullPath(exePath),
             capabilities);
     }
+}
 
-    private static string RequiredMetadata(Assembly assembly, string key)
+/// <summary>
+/// Protocol name/version and the build identity read from assembly metadata.
+/// Shared by the <c>ready</c> handshake and the <c>refused</c> startup frame so
+/// both describe the same sidecar artifact.
+/// </summary>
+internal static class ServeProtocolIdentity
+{
+    public const string Name = "etab-cli-serve";
+    public const int Version = 1;
+
+    public static string RequiredMetadata(Assembly assembly, string key)
     {
         var value = assembly.GetCustomAttributes<AssemblyMetadataAttribute>()
             .SingleOrDefault(attribute => attribute.Key == key)?.Value;
@@ -66,6 +99,84 @@ public sealed record ServeHandshake(
         }
 
         return value;
+    }
+
+    public static string ProcessExePath() => Path.GetFullPath(
+        Environment.ProcessPath
+        ?? throw new InvalidOperationException("Process executable path is unavailable"));
+}
+
+/// <summary>
+/// The terminal startup frame written when managed-ETABS orphan recovery refuses
+/// to start the daemon. It carries the same build identity as the handshake, the
+/// stable recovery error code, bounded terminal facts, and the location of the
+/// retained recovery record.
+///
+/// <para>The record is retained deliberately — it is the only proof of which
+/// ETABS process a previous daemon owned. Deleting it to make startup succeed
+/// destroys that evidence, so the remediation says so explicitly.</para>
+///
+/// <para>No <c>capabilities</c> are advertised: nothing is served after a
+/// refusal, and a capability list would read as a ready daemon.</para>
+/// </summary>
+public sealed record ServeStartupRefusal(
+    [property: JsonPropertyName("protocol")] string Protocol,
+    [property: JsonPropertyName("protocolVersion")] int ProtocolVersion,
+    [property: JsonPropertyName("startup")] string Startup,
+    [property: JsonPropertyName("version")] string Version,
+    [property: JsonPropertyName("buildId")] string BuildId,
+    [property: JsonPropertyName("pid")] int Pid,
+    [property: JsonPropertyName("exePath")] string ExePath,
+    [property: JsonPropertyName("errorCode")] string ErrorCode,
+    [property: JsonPropertyName("error")] string Error,
+    [property: JsonPropertyName("state")] ManagedEtabsShutdownState State,
+    [property: JsonPropertyName("processExitConfirmed")] bool ProcessExitConfirmed,
+    [property: JsonPropertyName("recordRetained")] bool RecordRetained,
+    [property: JsonPropertyName("ownedPid")] int? OwnedPid,
+    [property: JsonPropertyName("recordPath")] string RecordPath,
+    [property: JsonPropertyName("remediation")] string Remediation)
+{
+    internal const string RemediationText =
+        "A previous managed ETABS session could not be proven cleaned up. Close the ETABS " +
+        "process named by ownedPid (verify it is the recorded executable first), then start " +
+        "etab-cli serve again. The managed-session record at recordPath is retained on purpose " +
+        "as recovery evidence; do not delete it to bypass this refusal.";
+
+    public static ServeStartupRefusal Current(
+        ManagedEtabsShutdownResult recovery,
+        string recordPath) => FromAssembly(
+            ServeHandshake.MetadataAssembly,
+            Environment.ProcessId,
+            ServeProtocolIdentity.ProcessExePath(),
+            recovery,
+            recordPath);
+
+    internal static ServeStartupRefusal FromAssembly(
+        Assembly assembly,
+        int pid,
+        string exePath,
+        ManagedEtabsShutdownResult recovery,
+        string recordPath)
+    {
+        ArgumentNullException.ThrowIfNull(recovery);
+
+        return new(
+            ServeProtocolIdentity.Name,
+            ServeProtocolIdentity.Version,
+            ServeStartupOutcomes.Refused,
+            ServeProtocolIdentity.RequiredMetadata(assembly, "SidecarVersion"),
+            ServeProtocolIdentity.RequiredMetadata(assembly, "SidecarBuildId"),
+            pid,
+            Path.GetFullPath(exePath),
+            recovery.ErrorCode ?? ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+            EtabsApiDiagnosticFormatter.Bounded(
+                recovery.Error ?? "Managed ETABS orphan recovery failed closed."),
+            recovery.Data.State,
+            recovery.Data.ProcessExitConfirmed,
+            recovery.Data.RecordRetained,
+            recovery.Data.OwnedPid,
+            EtabsApiDiagnosticFormatter.Bounded(recordPath),
+            RemediationText);
     }
 }
 

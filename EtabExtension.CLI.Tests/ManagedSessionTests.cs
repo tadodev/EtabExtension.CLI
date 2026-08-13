@@ -725,6 +725,7 @@ public sealed class ManagedSessionTests
 
     private sealed class MemoryStore(List<string>? events = null) : ISessionRecordStore
     {
+        public string FilePath => @"C:\memory\managed-etabs-session.json";
         public ManagedEtabsSessionRecord? Record { get; set; }
         public Exception? WriteException { get; set; }
         public bool PersistAttemptedRecordBeforeThrow { get; set; }

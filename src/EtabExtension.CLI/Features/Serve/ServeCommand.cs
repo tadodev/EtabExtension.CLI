@@ -1,12 +1,27 @@
 using System.CommandLine;
+using System.Text.Json;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EtabExtension.CLI.Features.Serve;
 
+/// <summary>
+/// How serve startup ended. <see cref="StartupRefused"/> means orphan recovery
+/// fail-closed: the refusal frame was written, the request loop never ran, and
+/// the retained recovery record is untouched.
+/// </summary>
+public enum ServeLifecycleOutcome
+{
+    Served,
+    StartupRefused
+}
+
 public static class ServeCommand
 {
+    /// <summary>Nonzero exit for a refused startup — same 0/1 convention as the one-shot commands.</summary>
+    internal const int StartupRefusedExitCode = 1;
+
     public static Command Create(IServiceProvider services)
     {
         var command = new Command(
@@ -23,6 +38,7 @@ public static class ServeCommand
             var dispatcher = provider.GetRequiredService<IServeDispatcher>();
             var orphanCleaner = provider.GetRequiredService<IOrphanSessionCleaner>();
             var shutdown = provider.GetRequiredService<IServeShutdownCoordinator>();
+            var records = provider.GetRequiredService<ISessionRecordStore>();
 
             // Program.cs redirects Console.Out to stderr — write the protocol to the
             // REAL stdout. "\n" line endings keep framing clean for the Rust reader.
@@ -33,38 +49,72 @@ public static class ServeCommand
             };
             using var stdin = new StreamReader(Console.OpenStandardInput());
 
-            await RunLifecycleAsync(
+            var outcome = await RunLifecycleAsync(
                 orphanCleaner,
                 shutdown,
                 () => new ServeLoop(dispatcher, shutdown).RunAsync(stdin, stdout),
-                Console.Error);
+                stdout,
+                Console.Error,
+                recovery => ServeStartupRefusal.Current(recovery, records.FilePath));
+
+            if (outcome == ServeLifecycleOutcome.StartupRefused)
+            {
+                await stdout.FlushAsync();
+                Environment.Exit(StartupRefusedExitCode);
+            }
         });
 
         return command;
     }
 
-    internal static async Task RunLifecycleAsync(
+    /// <summary>
+    /// Runs orphan recovery, then the request loop, then converges on the one
+    /// idempotent shutdown coordinator.
+    ///
+    /// <para>Recovery runs before the loop on purpose — a daemon must not serve
+    /// requests while a previous managed ETABS process may still be alive. When it
+    /// fails closed, startup is still <b>protocol-visible</b>: exactly one
+    /// <c>refused</c> frame is written to <paramref name="output"/>, no <c>ready</c>
+    /// handshake is emitted, no request is read, and the retained recovery record is
+    /// left alone. A consumer therefore sees a typed refusal instead of an opaque
+    /// process exit, and can stop respawning into the same refusal.</para>
+    /// </summary>
+    internal static async Task<ServeLifecycleOutcome> RunLifecycleAsync(
         IOrphanSessionCleaner orphanCleaner,
         IServeShutdownCoordinator shutdown,
         Func<Task> runLoop,
-        TextWriter diagnostics)
+        TextWriter output,
+        TextWriter diagnostics,
+        Func<ManagedEtabsShutdownResult, ServeStartupRefusal> refusalFactory)
     {
         ArgumentNullException.ThrowIfNull(orphanCleaner);
         ArgumentNullException.ThrowIfNull(shutdown);
         ArgumentNullException.ThrowIfNull(runLoop);
+        ArgumentNullException.ThrowIfNull(output);
         ArgumentNullException.ThrowIfNull(diagnostics);
+        ArgumentNullException.ThrowIfNull(refusalFactory);
 
         try
         {
             var recovery = orphanCleaner.Clean();
             if (!recovery.Success)
             {
-                throw new EtabsLaunchException(
-                    recovery.ErrorCode ?? ManagedEtabsShutdownErrorCodes.IdentityMismatch,
-                    recovery.Error ?? "Managed ETABS orphan recovery failed closed.");
+                var refusal = refusalFactory(recovery);
+                await output.WriteLineAsync(
+                    JsonSerializer.Serialize(refusal, ServeJson.Options));
+                await output.FlushAsync();
+                await diagnostics.WriteLineAsync(
+                    EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        refusal.Error,
+                        $"startup=refused; code={refusal.ErrorCode}; " +
+                        $"state={refusal.State}; recordRetained={refusal.RecordRetained}; " +
+                        $"ownedPid={refusal.OwnedPid?.ToString() ?? "unknown"}"));
+                await diagnostics.FlushAsync();
+                return ServeLifecycleOutcome.StartupRefused;
             }
 
             await runLoop();
+            return ServeLifecycleOutcome.Served;
         }
         finally
         {

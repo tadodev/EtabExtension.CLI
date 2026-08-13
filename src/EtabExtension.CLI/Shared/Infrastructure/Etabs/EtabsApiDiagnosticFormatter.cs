@@ -30,6 +30,12 @@ public static class EtabsApiDiagnosticFormatter
     public static string InfrastructureException(string operation, Exception exception)
         => ExceptionCore(EtabsApiErrorCodes.InfrastructureOperationFailed, operation, exception);
 
+    /// <summary>
+    /// Normalizes control characters and caps a diagnostic at <see cref="TotalLimit"/>
+    /// so protocol fields never carry raw unbounded text.
+    /// </summary>
+    public static string Bounded(string? diagnostic) => Component(diagnostic, TotalLimit);
+
     public static string AppendTerminalFacts(string diagnostic, string terminalFacts)
     {
         var suffix = Component(terminalFacts, TotalLimit);

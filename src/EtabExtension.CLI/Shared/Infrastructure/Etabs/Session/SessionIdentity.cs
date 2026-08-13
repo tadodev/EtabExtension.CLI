@@ -53,6 +53,12 @@ public sealed record ManagedEtabsSessionRecord(
 
 public interface ISessionRecordStore
 {
+    /// <summary>
+    /// Where the recovery record lives. Reported in the startup refusal frame so a
+    /// consumer can name the retained evidence instead of guessing at it.
+    /// </summary>
+    string FilePath { get; }
+
     ManagedEtabsSessionRecord? Read();
     void Write(ManagedEtabsSessionRecord record);
     void Clear();
