@@ -1,6 +1,7 @@
 using System.Text.Json;
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using Xunit;
 
@@ -81,6 +82,7 @@ public class ServeLoopTests
 
         Assert.Equal("etab-cli-serve", first.GetProperty("protocol").GetString());
         Assert.Equal(1, first.GetProperty("protocolVersion").GetInt32());
+        Assert.Equal("ready", first.GetProperty("startup").GetString());
         Assert.Equal("0.1.0", first.GetProperty("version").GetString());
         Assert.Equal("0.1.0+gtest", first.GetProperty("buildId").GetString());
         Assert.True(first.GetProperty("pid").GetInt32() > 0);
@@ -351,24 +353,81 @@ public class ServeLoopTests
         Assert.Equal(1, coordinator.CallCount);
     }
 
-    [Fact]
-    public async Task FatalDispatchErrorIsPreservedAfterCleanup()
+    // A failing handler must cost the caller one request, not the whole managed
+    // ETABS session: the offending id gets a bounded failure and the loop serves on.
+    [Theory]
+    [InlineData("{\"id\":61,\"command\":\"needs-payload\"}", "Missing 'request' payload")]
+    [InlineData("{\"id\":61,\"command\":\"typed\",\"request\":{\"count\":\"twelve\"}}", "JsonException")]
+    [InlineData("{\"id\":61,\"command\":\"explode\",\"request\":{}}", "dispatch failed")]
+    public async Task HandlerFailureIsIsolatedToOneCorrelatedResponseAndTheLoopKeepsServing(
+        string badRequest,
+        string expectedFragment)
     {
         var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
-        using var reader = new StringReader("{\"id\":61,\"command\":\"explode\"}\n");
+        var dispatcher = new IsolationDispatcher();
+        using var reader = new StringReader(
+            $"{badRequest}\n{{\"id\":62,\"command\":\"get-status\"}}\n");
+        await using var writer = new StringWriter();
+        var loop = new ServeLoop(dispatcher, coordinator, TestHandshake, TextWriter.Null);
+
+        await loop.RunAsync(reader, writer, TestContext.Current.CancellationToken);
+
+        var responses = ResponseLines(writer);
+        Assert.Equal(2, responses.Count);
+
+        var failure = responses[0];
+        Assert.Equal(61, failure.GetProperty("id").GetInt64());
+        Assert.False(failure.GetProperty("success").GetBoolean());
+        var error = failure.GetProperty("error").GetString()!;
+        Assert.Contains(EtabsApiErrorCodes.InfrastructureOperationFailed, error, StringComparison.Ordinal);
+        Assert.Contains("operation=IServeDispatcher.DispatchAsync", error, StringComparison.Ordinal);
+        Assert.Contains(expectedFragment, error, StringComparison.Ordinal);
+        Assert.True(error.Length <= 2048);
+        Assert.DoesNotContain(error, char.IsControl);
+
+        Assert.Equal(62, responses[1].GetProperty("id").GetInt64());
+        Assert.True(responses[1].GetProperty("success").GetBoolean());
+        Assert.Equal(1, coordinator.CallCount);
+    }
+
+    [Fact]
+    public async Task UnboundedHandlerFailureTextIsCappedInTheCorrelatedResponse()
+    {
+        var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
+        using var reader = new StringReader("{\"id\":63,\"command\":\"flood\",\"request\":{}}\n");
         await using var writer = new StringWriter();
         var loop = new ServeLoop(
-            new FatalDispatcher(),
+            new IsolationDispatcher(),
             coordinator,
             TestHandshake,
             TextWriter.Null);
 
-        var error = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => loop.RunAsync(reader, writer, TestContext.Current.CancellationToken));
+        await loop.RunAsync(reader, writer, TestContext.Current.CancellationToken);
 
-        Assert.Equal("dispatch failed", error.Message);
+        var error = Assert.Single(ResponseLines(writer)).GetProperty("error").GetString()!;
+        Assert.True(error.Length <= 2048);
+        Assert.Contains("…", error, StringComparison.Ordinal);
+        Assert.EndsWith("command=flood", error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CancellationDuringDispatchTerminatesThroughTheShutdownCoordinatorOnce()
+    {
+        var coordinator = ShutdownCoordinator.Completed(SuccessShutdown());
+        using var cancellation = new CancellationTokenSource();
+        var dispatcher = new IsolationDispatcher(cancellation);
+        using var reader = new StringReader(
+            "{\"id\":64,\"command\":\"cancel\",\"request\":{}}\n{\"id\":65,\"command\":\"get-status\"}\n");
+        await using var writer = new StringWriter();
+        var loop = new ServeLoop(dispatcher, coordinator, TestHandshake, TextWriter.Null);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => loop.RunAsync(reader, writer, cancellation.Token));
+
         Assert.Empty(ResponseLines(writer));
+        Assert.Equal(["cancel"], dispatcher.Commands);
         Assert.Equal(1, coordinator.CallCount);
+        Assert.Equal(1, coordinator.UnderlyingStartCount);
     }
 
     [Fact]
@@ -512,12 +571,46 @@ public class ServeLoopTests
         public override Task WriteLineAsync(string? value) => Task.FromException(exception);
     }
 
-    private sealed class FatalDispatcher : IServeDispatcher
+    private sealed record TypedPayload(int Count);
+
+    /// <summary>
+    /// Reproduces the ways <see cref="ServeDispatcher"/> can throw out of a handler:
+    /// a missing payload (<c>RequirePayload</c>), a payload whose field types do not
+    /// match (<c>Deserialize&lt;T&gt;</c>), an unexpected handler escape, and a
+    /// cancellation raised by the serve token.
+    /// </summary>
+    private sealed class IsolationDispatcher(CancellationTokenSource? cancellation = null)
+        : IServeDispatcher
     {
-        public IReadOnlyCollection<string> Capabilities { get; } = ["explode"];
-        public Task<object> DispatchAsync(
-            string command,
-            JsonElement? request,
-            CancellationToken ct) => throw new InvalidOperationException("dispatch failed");
+        public IReadOnlyCollection<string> Capabilities { get; } =
+            ["cancel", "explode", "flood", "get-status", "needs-payload", "typed"];
+        public List<string> Commands { get; } = [];
+
+        public Task<object> DispatchAsync(string command, JsonElement? request, CancellationToken ct)
+        {
+            Commands.Add(command);
+            switch (command)
+            {
+                case "needs-payload":
+                    _ = request ?? throw new InvalidOperationException(
+                        "Missing 'request' payload for this command");
+                    break;
+                case "typed":
+                    _ = request!.Value.Deserialize<TypedPayload>(ServeJson.Options);
+                    break;
+                case "explode":
+                    throw new InvalidOperationException("dispatch failed");
+                case "flood":
+                    throw new InvalidOperationException(new string('x', 5_000));
+                case "cancel":
+                    cancellation!.Cancel();
+                    ct.ThrowIfCancellationRequested();
+                    break;
+                default:
+                    break;
+            }
+
+            return Task.FromResult<object>(Result.Ok(new Echo(command)));
+        }
     }
 }

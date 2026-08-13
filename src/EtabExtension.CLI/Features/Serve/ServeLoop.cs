@@ -54,8 +54,9 @@ public sealed class ServeLoop
 
     /// <summary>
     /// Runs until stdin EOF, a <c>shutdown</c> command, or cancellation. Never
-    /// throws for a bad request — malformed lines get an error response and the
-    /// loop keeps serving.
+    /// throws for a bad request — malformed lines and failing handlers both get a
+    /// correlated error response and the loop keeps serving. Only transport and
+    /// cancellation failures end the run.
     /// </summary>
     public async Task RunAsync(TextReader input, TextWriter output, CancellationToken ct = default)
     {
@@ -115,11 +116,10 @@ public sealed class ServeLoop
                     return;
                 }
 
-                var result = await _dispatcher.DispatchAsync(
-                    request.Command,
-                    request.Request,
-                    ct);
-                await WriteAsync(output, request.Id, result);
+                await WriteAsync(
+                    output,
+                    request.Id,
+                    await DispatchIsolatedAsync(request, ct));
             }
         }
         finally
@@ -136,6 +136,39 @@ public sealed class ServeLoop
             {
                 await WriteCleanupExceptionAsync(cleanupException);
             }
+        }
+    }
+
+    /// <summary>
+    /// Runs one request against the dispatcher with its failures contained to that
+    /// request. A bad payload — a missing <c>request</c> object, a wrong field type,
+    /// an unexpected handler or COM escape — becomes one bounded correlated failure
+    /// response, and the daemon keeps serving. Without this the offending request
+    /// would get no response at all and would take the managed ETABS session down
+    /// with the loop.
+    ///
+    /// <para>Cancellation is deliberately not contained: when the serve token is
+    /// cancelled the daemon really is stopping, so it propagates and terminates
+    /// through the same shutdown coordinator as every other exit path.</para>
+    /// </summary>
+    private async Task<object> DispatchIsolatedAsync(ServeRequest request, CancellationToken ct)
+    {
+        try
+        {
+            return await _dispatcher.DispatchAsync(request.Command, request.Request, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            return Result.Fail(
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    EtabsApiDiagnosticFormatter.InfrastructureException(
+                        "IServeDispatcher.DispatchAsync",
+                        exception),
+                    $"command={request.Command}"));
         }
     }
 
