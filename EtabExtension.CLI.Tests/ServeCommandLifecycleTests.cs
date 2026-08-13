@@ -1,6 +1,7 @@
 using System.Text.Json;
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using Xunit;
 
@@ -86,6 +87,57 @@ public sealed class ServeCommandLifecycleTests
         {
             Assert.Equal(ownedPid, frame.GetProperty("ownedPid").GetInt32());
         }
+    }
+
+    // The remediation is a human instruction standing next to a refusal the code made
+    // on exact identity. It must not be weaker than that: PID reuse can produce a
+    // foreign ETABS with the recorded pid AND the recorded executable path but a
+    // different start time — the precise state the sidecar refused to terminate.
+    [Fact]
+    public void RemediationRequiresAllThreeIdentityFieldsAndForbidsTerminationOnMismatch()
+    {
+        var remediation = ServeStartupRefusal.RemediationText;
+
+        // All three identity components, never a pid-only instruction.
+        Assert.Contains("pid + process start time (UTC) + executable path", remediation, StringComparison.Ordinal);
+        Assert.Contains("Do not terminate anything by pid alone", remediation, StringComparison.Ordinal);
+        Assert.Contains("only if all three match that record exactly", remediation, StringComparison.Ordinal);
+        Assert.Contains("PIDs are reused", remediation, StringComparison.Ordinal);
+
+        // Mismatched or unreadable identity: leave the process alone, keep the evidence.
+        Assert.Contains(
+            "If any of the three differs, or cannot be read, do not terminate the process",
+            remediation,
+            StringComparison.Ordinal);
+        Assert.Contains("keep the record", remediation, StringComparison.Ordinal);
+        Assert.Contains("do not delete it to bypass this refusal", remediation, StringComparison.Ordinal);
+
+        Assert.True(remediation.Length <= EtabsApiDiagnosticFormatter.TotalLimit);
+        Assert.DoesNotContain(remediation, char.IsControl);
+    }
+
+    [Fact]
+    public async Task RefusedStartupCarriesTheExactIdentityRemediationVerbatim()
+    {
+        var recovery = Recovery(
+            ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+            ManagedEtabsShutdownState.IdentityMismatch,
+            42);
+        await using var output = new StringWriter();
+        await using var diagnostics = new StringWriter();
+
+        await ServeCommand.RunLifecycleAsync(
+            new FakeOrphanCleaner(recovery),
+            new FakeCoordinator(Result.Ok(recovery.Data)),
+            () => Task.CompletedTask,
+            output,
+            diagnostics,
+            failure => Refusal(failure));
+
+        var frame = Assert.Single(Frames(output));
+        Assert.Equal(
+            ServeStartupRefusal.RemediationText,
+            frame.GetProperty("remediation").GetString());
     }
 
     [Fact]

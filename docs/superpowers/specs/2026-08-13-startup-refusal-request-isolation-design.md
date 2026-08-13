@@ -56,7 +56,17 @@ The `refused` frame carries the same build identity as the handshake plus:
 | `error` | bounded recovery diagnostic (2,048 UTF-16 code units, control characters normalized) |
 | `state`, `processExitConfirmed`, `recordRetained`, `ownedPid` | terminal facts from the recovery result |
 | `recordPath` | where the retained recovery record lives |
-| `remediation` | fixed actionable text, including that the record must not be deleted to bypass the refusal |
+| `remediation` | fixed actionable text (see below) |
+
+The remediation text is held to the same standard as the code that refused. Managed
+authority is pid **+ process start time + executable path**; PIDs are reused, so a
+live process can carry the recorded pid and the recorded executable path and still
+be a different, foreign ETABS — precisely the state exact-identity recovery declines
+to touch. The text therefore never instructs a pid-only kill: it names all three
+fields, permits termination only when all three match the record exactly, and when
+any of them differs or cannot be read it instructs the reader to leave the process
+running, keep the record, and escalate. The record must never be deleted to bypass
+the refusal. A regression test locks these semantics.
 
 Invariants:
 

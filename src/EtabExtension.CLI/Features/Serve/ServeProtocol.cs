@@ -136,11 +136,22 @@ public sealed record ServeStartupRefusal(
     [property: JsonPropertyName("recordPath")] string RecordPath,
     [property: JsonPropertyName("remediation")] string Remediation)
 {
+    /// <summary>
+    /// Deliberately never instructs a PID-only kill. Managed authority is pid +
+    /// process start time + executable path together; PIDs are reused, so a live
+    /// process can match the recorded pid and executable path and still be a
+    /// different, foreign ETABS. That is exactly the state the sidecar refused to
+    /// touch, so the human instruction must not be weaker than the code.
+    /// </summary>
     internal const string RemediationText =
-        "A previous managed ETABS session could not be proven cleaned up. Close the ETABS " +
-        "process named by ownedPid (verify it is the recorded executable first), then start " +
-        "etab-cli serve again. The managed-session record at recordPath is retained on purpose " +
-        "as recovery evidence; do not delete it to bypass this refusal.";
+        "A previous managed ETABS session could not be proven cleaned up. Do not terminate " +
+        "anything by pid alone. Managed identity is pid + process start time (UTC) + executable " +
+        "path, and all three are recorded in the managed-session record at recordPath. Terminate " +
+        "the live process named by ownedPid only if all three match that record exactly. PIDs are " +
+        "reused: a different start time or executable path means this is a foreign process that " +
+        "the sidecar refused to touch on purpose. If any of the three differs, or cannot be read, " +
+        "do not terminate the process — leave it running, keep the record, and escalate. The " +
+        "record is retained as recovery evidence; do not delete it to bypass this refusal.";
 
     public static ServeStartupRefusal Current(
         ManagedEtabsShutdownResult recovery,
