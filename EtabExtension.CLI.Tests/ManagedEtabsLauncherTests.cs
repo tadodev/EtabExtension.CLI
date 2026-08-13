@@ -84,6 +84,116 @@ public sealed class ManagedEtabsLauncherTests
         Assert.Equal(0, processes.TerminateExactCalls);
     }
 
+    // CreateObject starts the program, so a failure at that call can leave a survivor. The
+    // creation call must sit inside the cleanup envelope, not before it.
+    [Fact]
+    public void CreateObjectReturningNothingStillResolvesAProcessItStarted()
+    {
+        var processes = new FakeProcesses
+        {
+            AfterStart = [Identity],
+            ExactTerminationResult = new(ExactProcessTerminationState.ConfirmedGone, Identity)
+        };
+        var launcher = new ManagedEtabsLauncher(
+            processes,
+            new FakeResolver(Identity.ExecutablePath),
+            new NullReturningApiFactory(),
+            new FakeVersionProbe(),
+            TextWriter.Null);
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        Assert.Equal(EtabsLaunchErrorCodes.ApiObjectCreationFailed, error.Code);
+        Assert.Equal(1, processes.TerminateExactCalls);
+        Assert.Equal(Identity, processes.TerminateExactExpected);
+        Assert.NotNull(error.Cleanup);
+        Assert.True(error.Cleanup!.Success);
+        Assert.True(error.Cleanup.Data.ProcessExitConfirmed);
+    }
+
+    [Fact]
+    public void CreateObjectThrowingWithAnAmbiguousSurvivorReportsUnresolvedCleanup()
+    {
+        var processes = new FakeProcesses
+        {
+            AfterStart = [Identity],
+            AfterStartUnidentified = 1
+        };
+        var launcher = new ManagedEtabsLauncher(
+            processes,
+            new FakeResolver(Identity.ExecutablePath),
+            new ThrowingApiFactory(new TestException("create threw", 0)),
+            new FakeVersionProbe(),
+            TextWriter.Null);
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        // Nothing is terminated, and the failure carries machine-visible terminal facts.
+        Assert.Equal(0, processes.TerminateExactCalls);
+        Assert.NotNull(error.Cleanup);
+        Assert.False(error.Cleanup!.Success);
+        Assert.False(error.Cleanup.Data.ProcessExitConfirmed);
+        Assert.Equal(ManagedEtabsShutdownState.IdentityMismatch, error.Cleanup.Data.State);
+        Assert.Contains("processExitConfirmed=False", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CreateObjectFailureWithNoSurvivorIsResolvedClean()
+    {
+        var processes = new FakeProcesses { AfterStart = [] };
+        var launcher = new ManagedEtabsLauncher(
+            processes,
+            new FakeResolver(Identity.ExecutablePath),
+            new NullReturningApiFactory(),
+            new FakeVersionProbe(),
+            TextWriter.Null);
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        Assert.Equal(0, processes.TerminateExactCalls);
+        Assert.True(error.Cleanup!.Success);
+        Assert.True(error.Cleanup.Data.ProcessExitConfirmed);
+    }
+
+    [Fact]
+    public void UnconfirmedTerminationOfTheStartedProcessIsReportedUnresolved()
+    {
+        var api = new FakeRawApi { StartReturnCode = 3 };
+        var processes = new FakeProcesses
+        {
+            AfterStart = [Identity],
+            ExactTerminationResult = new(ExactProcessTerminationState.ExitUnconfirmed, Identity)
+        };
+        var launcher = Build(api, processes, out _);
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        Assert.Equal(EtabsLaunchErrorCodes.ApplicationStartFailed, error.Code);
+        Assert.False(error.Cleanup!.Success);
+        Assert.Equal(
+            ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+            error.Cleanup.Data.State);
+        Assert.Equal(Identity.Pid, error.Cleanup.Data.OwnedPid);
+    }
+
+    [Fact]
+    public void ResolvedCleanupCarriesNoTerminalFailureToTheSession()
+    {
+        var api = new FakeRawApi { StartReturnCode = 3 };
+        var processes = new FakeProcesses
+        {
+            AfterStart = [Identity],
+            ExactTerminationResult = new(ExactProcessTerminationState.ConfirmedGone, Identity)
+        };
+        var launcher = Build(api, processes, out _);
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        Assert.True(error.Cleanup!.Success);
+        Assert.True(error.Cleanup.Data.ProcessExitConfirmed);
+        Assert.True(error.Cleanup.Data.Forced);
+    }
+
     [Fact]
     public void CreateObjectThrowingFailsTypedWithBoundedDiagnostics()
     {

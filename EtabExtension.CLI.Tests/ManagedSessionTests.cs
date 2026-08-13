@@ -173,6 +173,103 @@ public sealed class ManagedSessionTests
         Assert.NotNull(store.Record);
     }
 
+    // A launch that could not prove the process it started is gone leaves no owned handle
+    // and no recovery record. Without caching that terminal state the next request would
+    // relaunch on top of it, and shutdown would answer "confirmed" about a process nobody
+    // resolved.
+    [Fact]
+    public void UnresolvedLaunchCleanupBlocksRelaunchAndKeepsShutdownTruthful()
+    {
+        var events = new List<string>();
+        var managed = new FakeManaged(
+            Identity,
+            Guid.NewGuid(),
+            events,
+            exitReturnCode: 0,
+            exitException: null,
+            waitResults: [],
+            hasExited: false);
+        var launcher = new FakeLauncher(managed, events)
+        {
+            Failure = new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ApplicationStartFailed,
+                "start failed")
+            {
+                Cleanup = new ManagedEtabsShutdownResult(
+                    false,
+                    ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                    "ownership of the surviving ETABS process could not be proven",
+                    new ManagedEtabsShutdownData(
+                        ManagedEtabsShutdownState.IdentityMismatch,
+                        ProcessExitConfirmed: false,
+                        Forced: false,
+                        RecordRetained: false,
+                        ApplicationExitReturnCode: null,
+                        OwnedPid: null))
+            }
+        };
+        var store = new MemoryStore(events);
+        var session = new EtabsSession(launcher, new FakeProcesses(), store);
+
+        var first = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+        var second = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+        var terminal = session.Shutdown();
+
+        Assert.Same(first, second);
+        Assert.Equal(1, launcher.LaunchCount);
+        Assert.False(session.IsStarted);
+
+        Assert.False(terminal.Success);
+        Assert.False(terminal.Data.ProcessExitConfirmed);
+        Assert.Equal(ManagedEtabsShutdownState.IdentityMismatch, terminal.Data.State);
+        Assert.Equal(["launch"], events);
+    }
+
+    [Fact]
+    public void ResolvedLaunchCleanupLeavesTheSessionFreeToTryAgain()
+    {
+        var events = new List<string>();
+        var managed = new FakeManaged(
+            Identity,
+            Guid.NewGuid(),
+            events,
+            exitReturnCode: 0,
+            exitException: null,
+            waitResults: [],
+            hasExited: false);
+        var launcher = new FakeLauncher(managed, events)
+        {
+            Failure = new EtabsLaunchException(
+                EtabsLaunchErrorCodes.ApplicationStartFailed,
+                "start failed")
+            {
+                Cleanup = new ManagedEtabsShutdownResult(
+                    true,
+                    null,
+                    null,
+                    new ManagedEtabsShutdownData(
+                        ManagedEtabsShutdownState.Succeeded,
+                        ProcessExitConfirmed: true,
+                        Forced: true,
+                        RecordRetained: false,
+                        ApplicationExitReturnCode: null,
+                        OwnedPid: Identity.Pid))
+            }
+        };
+        var session = new EtabsSession(
+            launcher,
+            new FakeProcesses { Live = Identity },
+            new MemoryStore(events));
+
+        Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
+        launcher.Failure = null;
+        var recovered = session.GetOrStartOwned();
+
+        Assert.Same(managed, recovered);
+        Assert.Equal(2, launcher.LaunchCount);
+        Assert.True(session.IsStarted);
+    }
+
     [Fact]
     public void SessionDisposeConvergesThroughShutdownOnceAndIsIdempotent()
     {
@@ -488,7 +585,13 @@ public sealed class ManagedSessionTests
         Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Empty(fixture.Managed.WaitTimeouts);
         Assert.Null(fixture.Store.Record);
-        Assert.Equal(["record-clear", "process-handle-release"], fixture.Events);
+
+        // Exit was already confirmed, so passive COM cleanup still runs — an early exit is
+        // not a reason to keep holding references.
+        Assert.Equal(1, fixture.Managed.ApiReferenceReleaseCount);
+        Assert.Equal(
+            ["record-clear", "process-handle-release", "release-api-references"],
+            fixture.Events);
     }
 
     [Fact]
@@ -781,11 +884,17 @@ public sealed class ManagedSessionTests
         List<string> events) : IManagedEtabsLauncher
     {
         public int LaunchCount { get; private set; }
+        public EtabsLaunchException? Failure { get; set; }
 
         public IManagedEtabsApplication Launch()
         {
             LaunchCount++;
             events.Add("launch");
+            if (Failure is not null)
+            {
+                throw Failure;
+            }
+
             events.Add("ownership-proven");
             return managed;
         }

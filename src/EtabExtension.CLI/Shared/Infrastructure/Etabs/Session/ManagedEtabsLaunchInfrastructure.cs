@@ -27,6 +27,14 @@ public sealed class EtabsLaunchException : InvalidOperationException
         : base($"[{code}] {message}", innerException) => Code = code;
 
     public string Code { get; }
+
+    /// <summary>
+    /// The structured outcome of resolving a process the failed launch may have started.
+    /// Present once creation has been attempted. When it reports failure the session must
+    /// treat the state as terminal: a process may still be alive, no recovery record was
+    /// written to describe it, and a later shutdown must not claim success.
+    /// </summary>
+    public ManagedEtabsShutdownResult? Cleanup { get; init; }
 }
 
 public interface IEtabsExecutableResolver

@@ -445,12 +445,14 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         CaptureCrossCheckBaseline();
         var executablePath = _executableResolver.Resolve();
 
-        // CreateObject starts the program, so from here a failure may have left a process
-        // behind and every exit path must resolve it.
-        var rawApi = _apiFactory.CreateFromExecutable(executablePath);
+        // CreateObject itself starts the program, so it lives inside the cleanup envelope:
+        // even a null return or a throw can leave a partially started process behind, and
+        // every exit path from here must resolve it.
+        IEtabsRawApi? rawApi = null;
         IOwnedEtabsProcess? ownedProcess = null;
         try
         {
+            rawApi = _apiFactory.CreateFromExecutable(executablePath);
             StartApplication(rawApi);
             RequireSapModel(rawApi);
 
@@ -474,10 +476,34 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             ownedProcess = null; // ownership transferred to the managed application
             return managed;
         }
-        catch
+        catch (Exception failure)
         {
-            CleanUpFailedStart(rawApi, ownedProcess);
-            throw;
+            // The cleanup outcome always travels with the failure. When it is unresolved a
+            // process this attempt started may still be alive with no recovery record to
+            // describe it, and the session uses that to refuse both a relaunch and a clean
+            // shutdown answer later.
+            var cleanup = CleanUpFailedStart(rawApi, ownedProcess);
+            var code = failure is EtabsLaunchException typed
+                ? typed.Code
+                : EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance;
+            var message = failure is EtabsLaunchException original
+                ? StripCode(original)
+                : failure.Message;
+
+            throw new EtabsLaunchException(
+                code,
+                cleanup.Success
+                    ? message
+                    : EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        message,
+                        $"cleanup={cleanup.Data.State}; " +
+                        $"processExitConfirmed={cleanup.Data.ProcessExitConfirmed}; " +
+                        $"forced={cleanup.Data.Forced}; " +
+                        $"ownedPid={cleanup.Data.OwnedPid?.ToString() ?? "unknown"}"),
+                failure.InnerException ?? failure)
+            {
+                Cleanup = cleanup
+            };
         }
     }
 
@@ -632,8 +658,37 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     /// first; termination happens only against an identity this launcher proved, never
     /// against an ambiguous or unreadable one.
     /// </summary>
-    private void CleanUpFailedStart(IEtabsRawApi rawApi, IOwnedEtabsProcess? ownedProcess)
+    /// <summary>
+    /// Removes the <c>[CODE] </c> prefix so re-throwing with the same code does not stack
+    /// two of them onto one message.
+    /// </summary>
+    private static string StripCode(EtabsLaunchException failure)
     {
+        var prefix = $"[{failure.Code}] ";
+        return failure.Message.StartsWith(prefix, StringComparison.Ordinal)
+            ? failure.Message[prefix.Length..]
+            : failure.Message;
+    }
+
+    private ManagedEtabsShutdownResult CleanUpFailedStart(
+        IEtabsRawApi? rawApi,
+        IOwnedEtabsProcess? ownedProcess)
+    {
+        var applicationExitReturnCode = RequestRawExit(rawApi);
+
+        return ownedProcess is not null
+            ? StopOwnedProcess(ownedProcess, applicationExitReturnCode)
+            : ResolveSurvivorWithoutHandle(applicationExitReturnCode);
+    }
+
+    /// <summary>Requests the raw exit when an object exists; a missing object is not an error.</summary>
+    private int? RequestRawExit(IEtabsRawApi? rawApi)
+    {
+        if (rawApi is null)
+        {
+            return null;
+        }
+
         try
         {
             var returnCode = rawApi.ApplicationExit(false);
@@ -642,24 +697,65 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 _diagnostics.WriteLine(
                     EtabsApiDiagnosticFormatter.ApiReturn("cOAPI.ApplicationExit(false)", returnCode));
             }
+
+            return returnCode;
         }
         catch (Exception ex)
         {
             _diagnostics.WriteLine(
                 EtabsApiDiagnosticFormatter.Exception("cOAPI.ApplicationExit(false)", ex));
+            return null;
         }
-
-        if (ownedProcess is not null)
-        {
-            StopOwnedProcess(ownedProcess);
-            ownedProcess.Dispose();
-            return;
-        }
-
-        TerminateProvenSurvivor();
     }
 
-    private void TerminateProvenSurvivor()
+    private ManagedEtabsShutdownResult StopOwnedProcess(
+        IOwnedEtabsProcess ownedProcess,
+        int? applicationExitReturnCode)
+    {
+        var pid = ownedProcess.Identity.Pid;
+        try
+        {
+            var forced = false;
+            if (!ownedProcess.HasExited)
+            {
+                forced = true;
+                ownedProcess.Kill();
+                if (!ownedProcess.WaitForExit(ForcedExitTimeout))
+                {
+                    return Unresolved(
+                        ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                        ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                        $"The ETABS process started by this attempt (pid={pid}) did not confirm exit after forced termination.",
+                        pid,
+                        forced: true,
+                        applicationExitReturnCode);
+                }
+            }
+
+            ownedProcess.Dispose();
+            return Resolved(pid, forced, applicationExitReturnCode);
+        }
+        catch (Exception ex)
+        {
+            return Unresolved(
+                ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "IOwnedEtabsProcess.Kill/WaitForExit",
+                    ex),
+                pid,
+                forced: true,
+                applicationExitReturnCode);
+        }
+    }
+
+    /// <summary>
+    /// No authoritative handle was taken, so ownership is re-derived from the census:
+    /// nothing left is clean, exactly one identified process is ours by construction and
+    /// may be terminated by exact identity, and anything ambiguous is left untouched and
+    /// reported as unresolved.
+    /// </summary>
+    private ManagedEtabsShutdownResult ResolveSurvivorWithoutHandle(int? applicationExitReturnCode)
     {
         EtabsProcessObservation observation;
         try
@@ -668,57 +764,97 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         }
         catch (Exception ex)
         {
-            _diagnostics.WriteLine(
+            return Unresolved(
+                ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
                 EtabsApiDiagnosticFormatter.InfrastructureException(
                     "IProcessInspector.ObserveEtabs",
-                    ex));
-            return;
+                    ex),
+                ownedPid: null,
+                forced: false,
+                applicationExitReturnCode);
         }
 
         if (observation.Identified.Count == 0 && observation.UnidentifiedCount == 0)
         {
-            return;
+            return Resolved(ownedPid: null, forced: false, applicationExitReturnCode);
         }
 
         if (observation.UnidentifiedCount > 0 || observation.Identified.Count != 1)
         {
-            // Ownership cannot be proven, so nothing is terminated.
-            _diagnostics.WriteLine(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
-                "Managed ETABS start failed and ownership of the surviving ETABS process could not be proven; nothing was terminated.",
-                $"identifiedCount={observation.Identified.Count}; unidentifiedCount={observation.UnidentifiedCount}"));
-            return;
+            return Unresolved(
+                ManagedEtabsShutdownState.IdentityMismatch,
+                ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                "Managed ETABS start failed and ownership of the surviving ETABS process could not be proven; " +
+                $"nothing was terminated. identifiedCount={observation.Identified.Count}; " +
+                $"unidentifiedCount={observation.UnidentifiedCount}",
+                ownedPid: null,
+                forced: false,
+                applicationExitReturnCode);
         }
 
-        var termination = _processes.TerminateExact(observation.Identified[0], ForcedExitTimeout);
-        if (termination.State is not (ExactProcessTerminationState.ConfirmedGone
-            or ExactProcessTerminationState.NotFound))
+        var survivor = observation.Identified[0];
+        var termination = _processes.TerminateExact(survivor, ForcedExitTimeout);
+        return termination.State switch
         {
-            _diagnostics.WriteLine(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
-                "Managed ETABS start failed and the started process could not be confirmed gone.",
-                $"state={termination.State}; pid={observation.Identified[0].Pid}"));
-        }
+            ExactProcessTerminationState.NotFound =>
+                Resolved(survivor.Pid, forced: false, applicationExitReturnCode),
+            ExactProcessTerminationState.ConfirmedGone =>
+                Resolved(survivor.Pid, forced: true, applicationExitReturnCode),
+            ExactProcessTerminationState.IdentityMismatchOrUnidentified => Unresolved(
+                ManagedEtabsShutdownState.IdentityMismatch,
+                ManagedEtabsShutdownErrorCodes.IdentityMismatch,
+                $"The surviving ETABS process (pid={survivor.Pid}) no longer matched the census identity; it was not terminated.",
+                survivor.Pid,
+                forced: false,
+                applicationExitReturnCode),
+            _ => Unresolved(
+                ManagedEtabsShutdownState.ProcessExitUnconfirmed,
+                ManagedEtabsShutdownErrorCodes.ProcessExitUnconfirmed,
+                $"The ETABS process started by this attempt (pid={survivor.Pid}) could not be confirmed gone.",
+                survivor.Pid,
+                forced: true,
+                applicationExitReturnCode)
+        };
     }
 
-    private void StopOwnedProcess(IOwnedEtabsProcess ownedProcess)
-    {
-        try
-        {
-            if (ownedProcess.HasExited)
-            {
-                return;
-            }
+    private static ManagedEtabsShutdownResult Resolved(
+        int? ownedPid,
+        bool forced,
+        int? applicationExitReturnCode) => new(
+        true,
+        null,
+        null,
+        new(
+            ManagedEtabsShutdownState.Succeeded,
+            ProcessExitConfirmed: true,
+            Forced: forced,
+            RecordRetained: false,
+            ApplicationExitReturnCode: applicationExitReturnCode,
+            OwnedPid: ownedPid));
 
-            ownedProcess.Kill();
-            if (!ownedProcess.WaitForExit(ForcedExitTimeout))
-            {
-                _diagnostics.WriteLine(
-                    $"⚠ Timed out waiting for owned ETABS PID {ownedProcess.Identity.Pid} to exit after launch failure.");
-            }
-        }
-        catch (Exception ex)
-        {
-            _diagnostics.WriteLine(
-                $"⚠ Could not stop owned ETABS PID {ownedProcess.Identity.Pid} after launch failure: {ex.Message}");
-        }
+    private ManagedEtabsShutdownResult Unresolved(
+        ManagedEtabsShutdownState state,
+        string errorCode,
+        string diagnostic,
+        int? ownedPid,
+        bool forced,
+        int? applicationExitReturnCode)
+    {
+        var bounded = EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+            diagnostic,
+            $"code={errorCode}; state={state}; forced={forced}");
+        _diagnostics.WriteLine(bounded);
+        return new(
+            false,
+            errorCode,
+            bounded,
+            new(
+                state,
+                ProcessExitConfirmed: false,
+                Forced: forced,
+                RecordRetained: false,
+                ApplicationExitReturnCode: applicationExitReturnCode,
+                OwnedPid: ownedPid));
     }
 }

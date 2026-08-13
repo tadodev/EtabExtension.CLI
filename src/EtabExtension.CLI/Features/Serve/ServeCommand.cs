@@ -26,7 +26,7 @@ public static class ServeCommand
     {
         var command = new Command(
             "serve",
-            "Long-lived daemon: one hidden ETABS instance shared across all requests. " +
+            "Long-lived daemon: one owned ETABS instance shared across all requests. " +
             "Reads line-delimited JSON requests on stdin, writes one JSON response per line on stdout.");
 
         command.SetAction(async _ =>

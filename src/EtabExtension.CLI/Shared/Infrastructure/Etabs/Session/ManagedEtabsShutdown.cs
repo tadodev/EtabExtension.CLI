@@ -78,6 +78,10 @@ public sealed class ManagedEtabsShutdownMachine(
         {
             var recordRetained = ClearMatchingRecord(record, recordMatchesOwned);
             owned.ReleaseOwnedProcessHandle();
+
+            // Exit is already confirmed, so the passive reference cleanup still applies —
+            // an early exit is not a reason to leave COM references held.
+            owned.ReleaseApiReferences();
             return Succeeded(
                 owned.Identity.Pid,
                 forced: false,

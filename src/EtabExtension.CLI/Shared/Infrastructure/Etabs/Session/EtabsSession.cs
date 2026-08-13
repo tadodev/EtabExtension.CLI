@@ -74,8 +74,8 @@ public sealed class EtabsSession : IEtabsSession
 
             if (_owned is null)
             {
-                Console.Error.WriteLine("ℹ Starting ETABS (hidden, shared serve session)...");
-                var launched = _launcher.Launch();
+                Console.Error.WriteLine("ℹ Starting ETABS (shared serve session)...");
+                var launched = Launch();
                 _owned = launched;
                 try
                 {
@@ -123,7 +123,7 @@ public sealed class EtabsSession : IEtabsSession
                 }
 
                 _ready = true;
-                Console.Error.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
+                Console.Error.WriteLine($"✓ ETABS started (PID {_owned.Identity.Pid})");
             }
 
             try
@@ -146,6 +146,30 @@ public sealed class EtabsSession : IEtabsSession
                 _ready = false;
                 throw;
             }
+        }
+    }
+
+    /// <summary>
+    /// Launches, and caches an unresolved launch cleanup as terminal state.
+    ///
+    /// <para>When a failed launch could not prove that the process it started is gone,
+    /// there is no owned handle and no recovery record to describe it. Without caching,
+    /// the next request would relaunch on top of it and a later shutdown would report
+    /// success with <c>processExitConfirmed=true</c> — a clean answer about a process
+    /// nobody resolved.</para>
+    /// </summary>
+    private IManagedEtabsApplication Launch()
+    {
+        try
+        {
+            return _launcher.Launch();
+        }
+        catch (EtabsLaunchException failure) when (failure.Cleanup is { Success: false })
+        {
+            _shutdownResult = failure.Cleanup;
+            _launchFailure = failure;
+            _ready = false;
+            throw;
         }
     }
 
