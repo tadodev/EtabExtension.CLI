@@ -27,6 +27,10 @@ public class GenerateE2KService : IGenerateE2KService
             return Result.Fail<GenerateE2KData>(
                 $"Output file already exists: {outputFilePath}. Use --overwrite to replace.");
 
+        var pathError = PathSafe.GetErrorIfInvalidPath(outputFilePath, "OutputFile");
+        if (pathError is not null)
+            return Result.Fail<GenerateE2KData>(pathError);
+
         var outputDir = Path.GetDirectoryName(outputFilePath);
         if (!string.IsNullOrEmpty(outputDir))
             Directory.CreateDirectory(outputDir);
