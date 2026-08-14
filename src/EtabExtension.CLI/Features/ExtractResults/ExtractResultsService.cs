@@ -61,8 +61,9 @@ public class ExtractResultsService : IExtractResultsService
         if (!File.Exists(request.FilePath))
             return Result.Fail<ExtractResultsData>($"File not found: {request.FilePath}");
 
-        if (string.IsNullOrWhiteSpace(request.OutputDir))
-            return Result.Fail<ExtractResultsData>("OutputDir cannot be empty");
+        var pathError = PathSafe.GetErrorIfInvalidPath(request.OutputDir, "OutputDir");
+        if (pathError is not null)
+            return Result.Fail<ExtractResultsData>(pathError);
 
         // ── Resolve units (fail fast before starting ETABS) ───────────────────
         var (targetUnits, unitsError) = EtabsUnitPreset.Resolve(request.Units);

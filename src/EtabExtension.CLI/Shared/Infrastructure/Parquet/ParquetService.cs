@@ -1,6 +1,7 @@
 // Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
+using EtabExtension.CLI.Shared.Common;
 using Parquet;
 using Parquet.Data;
 using Parquet.Schema;
@@ -27,6 +28,10 @@ public class ParquetService : IParquetService
         List<string> fieldNames,
         List<string> flatData)
     {
+        var pathError = PathSafe.GetErrorIfInvalidPath(outputPath, "OutputPath");
+        if (pathError is not null)
+            return new ParquetWriteResult(false, 0, outputPath, pathError);
+
         if (fieldNames.Count == 0)
             return new ParquetWriteResult(false, 0, outputPath, "Table has no fields");
 
