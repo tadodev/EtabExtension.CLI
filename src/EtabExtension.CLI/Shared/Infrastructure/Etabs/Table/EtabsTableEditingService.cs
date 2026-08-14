@@ -166,14 +166,11 @@ public class EtabsTableEditingService : IEtabsTableEditingService
             {
                 AssertTableLoaded(table, tableKey);
                 var rows = table.GetStructuredData();
+                var rowLookup = BuildRowLookup(rows, keyField);
 
                 foreach (var (keyValue, newValue) in updates)
                 {
-                    var row = rows.FirstOrDefault(r =>
-                        r.TryGetValue(keyField, out var v) &&
-                        string.Equals(v, keyValue, StringComparison.OrdinalIgnoreCase));
-
-                    if (row is null)
+                    if (!rowLookup.TryGetValue(keyValue, out var row))
                     {
                         _logger.LogWarning(
                             "Row with {KeyField}='{KeyValue}' not found in '{TableKey}' — skipped",
@@ -219,14 +216,11 @@ public class EtabsTableEditingService : IEtabsTableEditingService
             {
                 AssertTableLoaded(table, tableKey);
                 var rows = table.GetStructuredData();
+                var rowLookup = BuildRowLookup(rows, keyField);
 
                 foreach (var (keyValue, factor) in scaleFactors)
                 {
-                    var row = rows.FirstOrDefault(r =>
-                        r.TryGetValue(keyField, out var v) &&
-                        string.Equals(v, keyValue, StringComparison.OrdinalIgnoreCase));
-
-                    if (row is null)
+                    if (!rowLookup.TryGetValue(keyValue, out var row))
                     {
                         _logger.LogWarning(
                             "Row with {KeyField}='{KeyValue}' not found in '{TableKey}' — skipped",
@@ -269,6 +263,25 @@ public class EtabsTableEditingService : IEtabsTableEditingService
             throw new InvalidOperationException(
                 $"Failed to load table '{tableKey}' for editing. " +
                 $"ReturnCode={table.ReturnCode}, Error='{table.ErrorMessage}'");
+    }
+
+    internal static Dictionary<string, Dictionary<string, string>> BuildRowLookup(
+        IEnumerable<Dictionary<string, string>> rows,
+        string keyField)
+    {
+        var lookup = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var row in rows)
+        {
+            if (row.TryGetValue(keyField, out var keyValue)
+                && keyValue is not null
+                && !lookup.ContainsKey(keyValue))
+            {
+                lookup[keyValue] = row;
+            }
+        }
+
+        return lookup;
     }
 
     private static Dictionary<string, string> FindRow(
