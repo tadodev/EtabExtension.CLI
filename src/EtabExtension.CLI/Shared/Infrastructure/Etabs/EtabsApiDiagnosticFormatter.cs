@@ -5,6 +5,13 @@ public static class EtabsApiErrorCodes
     public const string ComOperationFailed = "ETABS_COM_OPERATION_FAILED";
     public const string ApiCallFailed = "ETABS_API_CALL_FAILED";
     public const string InfrastructureOperationFailed = "ETABS_INFRASTRUCTURE_OPERATION_FAILED";
+
+    /// <summary>
+    /// A CSI call reported success but the resulting model state contradicts it —
+    /// e.g. <c>cFile.OpenFile</c> returned zero while ETABS still reports a blank or
+    /// foreign current model.
+    /// </summary>
+    public const string ModelOpenNotConfirmed = "ETABS_MODEL_OPEN_NOT_CONFIRMED";
 }
 
 public static class EtabsApiDiagnosticFormatter

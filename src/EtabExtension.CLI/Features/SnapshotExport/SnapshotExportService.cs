@@ -17,20 +17,43 @@ using System.Text.Json;
 
 namespace EtabExtension.CLI.Features.SnapshotExport;
 
+/// <summary>
+/// <c>snapshot-export</c> — the command the desktop Commit path actually calls.
+///
+/// <para>Stages, in order, each failing explicitly with a bounded diagnostic before
+/// the next one runs: open the exact requested EDB (through the canonical
+/// <see cref="IEtabsModelOpener"/>, the same boundary <c>open-model</c> uses),
+/// normalize units, export a non-empty E2K, extract the snapshot tables, collect and
+/// write metadata, then write run metrics.</para>
+/// </summary>
 public class SnapshotExportService : ISnapshotExportService
 {
     private readonly IEtabsTableServicesFactory _tableFactory;
     private readonly TableExtractorRegistry _registry;
     private readonly IParquetService _parquet;
+    private readonly IEtabsModelOpener _opener;
 
     public SnapshotExportService(
         IEtabsTableServicesFactory tableFactory,
         TableExtractorRegistry registry,
-        IParquetService parquet)
+        IParquetService parquet,
+        IEtabsModelOpener opener)
     {
         _tableFactory = tableFactory;
         _registry = registry;
         _parquet = parquet;
+        _opener = opener;
+    }
+
+    /// <summary>The export stages, in execution order, as they appear in diagnostics.</summary>
+    internal static class Stages
+    {
+        public const string OpenModel = "openModel";
+        public const string NormaliseUnits = "normaliseUnits";
+        public const string ExportE2K = "exportE2k";
+        public const string ExtractTables = "extractTables";
+        public const string CollectMetadata = "collectMetadata";
+        public const string WriteMetrics = "writeMetrics";
     }
 
     // One-shot: start a hidden ETABS, export, dispose it. Unchanged behavior.
@@ -61,11 +84,12 @@ public class SnapshotExportService : ISnapshotExportService
             EtabsSessionHelpers.HideIfVisible(app);
             Console.Error.WriteLine($"✓ ETABS started hidden (v{app.FullVersion})");
 
-            return await ExecuteAsync(app, filePath, outputDir, request, prep, metricsBuilder, totalSw);
+            return await ExecuteAsync(app, filePath, outputDir, prep, metricsBuilder, totalSw);
         }
         catch (Exception ex)
         {
-            return Result.Fail<SnapshotExportData>($"ETABS COM error: {ex.Message}");
+            return Result.Fail<SnapshotExportData>(
+                EtabsApiDiagnosticFormatter.Exception("snapshot-export.startEtabs", ex));
         }
         finally
         {
@@ -90,17 +114,10 @@ public class SnapshotExportService : ISnapshotExportService
         Console.Error.WriteLine($"ℹ snapshot-export (shared session): {filePath}");
         var metricsBuilder = new RunMetricsBuilder("snapshot-export", filePath, outputDir);
         var totalSw = Stopwatch.StartNew();
-        try
-        {
-            return await ExecuteAsync(app, filePath, outputDir, request, prep, metricsBuilder, totalSw);
-        }
-        catch (Exception ex)
-        {
-            return Result.Fail<SnapshotExportData>($"ETABS COM error: {ex.Message}");
-        }
+        return await ExecuteAsync(app, filePath, outputDir, prep, metricsBuilder, totalSw);
     }
 
-    private readonly record struct Preparation(
+    internal readonly record struct Preparation(
         string? Error,
         TableSelections? Tables,
         Units? TargetUnits,
@@ -109,11 +126,17 @@ public class SnapshotExportService : ISnapshotExportService
         string MetadataPath,
         string MetricsPath);
 
-    private static Preparation Prepare(string filePath, string outputDir, SnapshotExportRequest request)
+    /// <summary>
+    /// Resolves everything the export needs before a single COM call is made: the
+    /// model path, the unit preset, the table selection, and the four artifact paths
+    /// — all of which are built under the caller's requested output directory.
+    /// </summary>
+    internal static Preparation Prepare(string filePath, string outputDir, SnapshotExportRequest request)
     {
-        if (!File.Exists(filePath))
+        var pathError = EtabsModelOpen.ValidateModelPath(filePath);
+        if (pathError is not null)
         {
-            return new Preparation($"File not found: {filePath}", null, default, "", "", "", "");
+            return new Preparation(pathError, null, default, "", "", "", "");
         }
 
         if (string.IsNullOrWhiteSpace(outputDir))
@@ -146,39 +169,68 @@ public class SnapshotExportService : ISnapshotExportService
         ETABSApplication app,
         string filePath,
         string outputDir,
-        SnapshotExportRequest request,
         Preparation prep,
         RunMetricsBuilder metricsBuilder,
         Stopwatch totalSw)
     {
+        var stage = Stages.OpenModel;
+        try
+        {
+            return await RunStagesAsync(
+                app, filePath, outputDir, prep, metricsBuilder, totalSw,
+                current => stage = current);
+        }
+        catch (Exception ex)
+        {
+            // Anything the stages did not already turn into an explicit failure is
+            // still attributed to the stage that was running when it escaped.
+            return Result.Fail<SnapshotExportData>(
+                EtabsApiDiagnosticFormatter.Exception($"snapshot-export.{stage}", ex));
+        }
+    }
+
+    private async Task<Result<SnapshotExportData>> RunStagesAsync(
+        ETABSApplication app,
+        string filePath,
+        string outputDir,
+        Preparation prep,
+        RunMetricsBuilder metricsBuilder,
+        Stopwatch totalSw,
+        Action<string> enterStage)
+    {
+        enterStage(Stages.OpenModel);
         var openResult = await metricsBuilder.MeasureAsync(
-            "openModel",
-            () => EtabsSessionHelpers.OpenFileAsync(app, filePath));
+            Stages.OpenModel,
+            () => Task.FromResult(_opener.Open(app, filePath, save: false)));
         if (!openResult.Success)
         {
             return Result.Fail<SnapshotExportData>(openResult.Error ?? "OpenFile failed");
         }
 
+        enterStage(Stages.NormaliseUnits);
         var unitSnapshot = await metricsBuilder.MeasureAsync(
-            "normaliseUnits",
+            Stages.NormaliseUnits,
             () => EtabsSessionHelpers.NormaliseUnitsAsync(app, prep.TargetUnits!));
 
+        enterStage(Stages.ExportE2K);
         Console.Error.WriteLine("ℹ Exporting to .e2k...");
         var exportRet = metricsBuilder.Measure(
-            "exportE2k",
+            Stages.ExportE2K,
             () => app.Model.Files.ExportFile(prep.E2kFile, eFileTypeIO.TextFile));
-        if (exportRet != 0 || !File.Exists(prep.E2kFile))
+        var exported = ValidateExportedE2K(exportRet, prep.E2kFile);
+        if (!exported.Success)
         {
-            return Result.Fail<SnapshotExportData>($"ExportFile failed (ret={exportRet})");
+            return Result.Fail<SnapshotExportData>(exported.Error!);
         }
 
-        var e2kSize = new FileInfo(prep.E2kFile).Length;
+        var e2kSize = exported.Data;
         Console.Error.WriteLine($"✓ Exported ({e2kSize / 1024.0:F1} KB)");
 
+        enterStage(Stages.ExtractTables);
         var isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
         var isLocked = app.Model.ModelInfo.IsLocked();
         var outcomes = await metricsBuilder.MeasureAsync(
-            "extractTables",
+            Stages.ExtractTables,
             () => EtabsSessionHelpers.ExtractTablesOnOpenModelAsync(
                 app,
                 prep.Tables!,
@@ -189,28 +241,23 @@ public class SnapshotExportService : ISnapshotExportService
                 _registry,
                 _parquet));
 
-        ModelMetadata? metadata = null;
-        string? writtenMetadataPath = null;
-        try
-        {
-            metadata = await metricsBuilder.MeasureAsync(
-                "collectMetadata",
-                () => EtabsSessionHelpers.CollectModelMetadataAsync(app, filePath, unitSnapshot));
+        // Metadata is part of the Commit contract, not a nicety: a success response
+        // promises a metadata path, so a collection or write failure fails the stage.
+        enterStage(Stages.CollectMetadata);
+        var metadata = await metricsBuilder.MeasureAsync(
+            Stages.CollectMetadata,
+            () => EtabsSessionHelpers.CollectModelMetadataAsync(app, filePath, unitSnapshot));
 
-            Console.Error.WriteLine("ℹ Writing model-metadata.json");
-            var metadataJson = JsonSerializer.Serialize(
-                metadata,
-                AnalyzeAndExtractService.MetadataJsonOptions);
-            await metricsBuilder.MeasureAsync(
-                "writeMetadata",
-                () => File.WriteAllTextAsync(prep.MetadataPath, metadataJson));
-            writtenMetadataPath = prep.MetadataPath;
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"⚠ Metadata collection failed: {ex.Message}");
-        }
+        Console.Error.WriteLine("ℹ Writing model-metadata.json");
+        var metadataJson = JsonSerializer.Serialize(
+            metadata,
+            AnalyzeAndExtractService.MetadataJsonOptions);
+        await metricsBuilder.MeasureAsync(
+            "writeMetadata",
+            () => File.WriteAllTextAsync(prep.MetadataPath, metadataJson));
+        var writtenMetadataPath = prep.MetadataPath;
 
+        enterStage(Stages.WriteMetrics);
         totalSw.Stop();
         var metrics = metricsBuilder.Build(totalSw.ElapsedMilliseconds);
         Console.Error.WriteLine("ℹ Writing run-metrics.json");
@@ -242,6 +289,32 @@ public class SnapshotExportService : ISnapshotExportService
             Units = unitSnapshot.Active,
             TotalElapsedMs = totalSw.ElapsedMilliseconds
         });
+    }
+
+    /// <summary>
+    /// A zero return from <c>cFile.ExportFile</c> is not proof of an export: the
+    /// Commit contract needs a file on disk with content in it. Returns the byte
+    /// count on success.
+    /// </summary>
+    internal static Result<long> ValidateExportedE2K(int returnCode, string e2kFile)
+    {
+        if (returnCode != 0)
+        {
+            return Result.Fail<long>(
+                EtabsApiDiagnosticFormatter.ApiReturn("cFile.ExportFile", returnCode));
+        }
+
+        if (!File.Exists(e2kFile))
+        {
+            return Result.Fail<long>(EtabsApiDiagnosticFormatter.Bounded(
+                $"cFile.ExportFile reported success but wrote no file at '{e2kFile}'"));
+        }
+
+        var size = new FileInfo(e2kFile).Length;
+        return size > 0
+            ? Result.Ok(size)
+            : Result.Fail<long>(EtabsApiDiagnosticFormatter.Bounded(
+                $"cFile.ExportFile wrote an empty E2K at '{e2kFile}'"));
     }
 
     private static string SafeFileName(string? value, string fallback) =>

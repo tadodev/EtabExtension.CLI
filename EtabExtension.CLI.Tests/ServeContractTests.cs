@@ -1,6 +1,7 @@
 using System.Text.Json;
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 using EtabExtension.CLI.Features.Serve;
+using EtabExtension.CLI.Features.SnapshotExport.Models;
 using Xunit;
 
 namespace EtabExtension.CLI.Tests;
@@ -31,6 +32,27 @@ public class ServeContractTests
         Assert.Equal(@"C:\v1\model.edb", locator.FilePath);
         Assert.Equal(@"C:\v1\results", locator.OutputDir);
         Assert.Equal("US_Kip_Ft", request.Units);
+    }
+
+    [Fact]
+    public void FlattenedSnapshotExportRequestYieldsLocatorAndRequestFromTheSameObject()
+    {
+        // Exactly what request_from_args produces for "snapshot-export" — the shape the
+        // desktop Commit path sends.
+        var element = JsonSerializer.Deserialize<JsonElement>(
+            """{"filePath":"D:\\Work\\tadoEng\\TestModel\\sample_v2.EDB","outputDir":"D:\\snapshot","units":"US_Kip_Ft","e2kFileName":"model.e2k","materialsDirName":"materials","metadataFileName":"model-metadata.json","metricsFileName":"run-metrics.json","extractionProfile":"snapshot","tables":{}}""");
+
+        var locator = element.Deserialize<ServeFileLocator>(Opts)!;
+        var request = element.Deserialize<SnapshotExportRequest>(Opts)!;
+
+        Assert.Equal(@"D:\Work\tadoEng\TestModel\sample_v2.EDB", locator.FilePath);
+        Assert.Equal(@"D:\snapshot", locator.OutputDir);
+        Assert.Equal("US_Kip_Ft", request.Units);
+        Assert.Equal("model.e2k", request.E2KFileName);
+        Assert.Equal("materials", request.MaterialsDirName);
+        Assert.Equal("model-metadata.json", request.MetadataFileName);
+        Assert.Equal("run-metrics.json", request.MetricsFileName);
+        Assert.Equal("snapshot", request.ExtractionProfile);
     }
 
     [Fact]

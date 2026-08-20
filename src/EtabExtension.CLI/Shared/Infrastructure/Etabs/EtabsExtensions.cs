@@ -15,6 +15,11 @@ public static class EtabsExtensions
         // Nothing shared at infra level — each feature owns its own ETABS lifecycle.
         // Mode A and Mode B instances are created per-command, not injected as singletons.
 
+        // The one managed-app model-open boundary, shared by open-model and
+        // snapshot-export so their OpenFile behavior cannot diverge. Stateless: it
+        // owns no process, only the CSI call sequence against a caller-owned app.
+        services.AddSingleton<IEtabsModelOpener, EtabsModelOpener>();
+
         // Shared parquet writer — singleton is fine, it is stateless
         services.AddSingleton<IParquetService, ParquetService>();
 

@@ -1,9 +1,17 @@
 using EtabExtension.CLI.Features.OpenModel;
+using EtabExtension.CLI.Features.OpenModel.Models;
+using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using Xunit;
 
 namespace EtabExtension.CLI.Tests;
 
+/// <summary>
+/// The validated <c>open-model</c> daemon boundary. It is now nothing but the shared
+/// <see cref="EtabsModelOpen"/> primitive plus a pure projection onto
+/// <see cref="OpenModelData"/>, so these assertions describe the same COM boundary
+/// that <c>snapshot-export</c> uses — the two diagnostics cannot drift apart.
+/// </summary>
 public sealed class OpenModelDiagnosticsTests
 {
     private const string TargetPath = @"D:\Models\target.edb";
@@ -19,7 +27,7 @@ public sealed class OpenModelDiagnosticsTests
             unchecked((int)0x80004005),
             new InvalidOperationException("inner\tmessage"));
 
-        var result = OpenModelService.OpenOnAttachedModel(
+        var result = OpenModel(
             TargetPath,
             save: true,
             getCurrentPath: () => throw exception,
@@ -43,7 +51,7 @@ public sealed class OpenModelDiagnosticsTests
     {
         var openCalls = 0;
 
-        var result = OpenModelService.OpenOnAttachedModel(
+        var result = OpenModel(
             TargetPath,
             save: true,
             getCurrentPath: () => CurrentPath,
@@ -67,7 +75,7 @@ public sealed class OpenModelDiagnosticsTests
     {
         var exception = new TestException("save failed", unchecked((int)0x80070005));
 
-        var result = OpenModelService.OpenOnAttachedModel(
+        var result = OpenModel(
             TargetPath,
             save: true,
             getCurrentPath: () => CurrentPath,
@@ -82,7 +90,7 @@ public sealed class OpenModelDiagnosticsTests
     [Fact]
     public void OpenNonzeroReturnsExactBoundedApiDiagnostic()
     {
-        var result = OpenModelService.OpenOnAttachedModel(
+        var result = OpenModel(
             TargetPath,
             save: false,
             getCurrentPath: () => CurrentPath,
@@ -105,7 +113,7 @@ public sealed class OpenModelDiagnosticsTests
     {
         var exception = new TestException("open failed", unchecked((int)0x8000FFFF));
 
-        var result = OpenModelService.OpenOnAttachedModel(
+        var result = OpenModel(
             TargetPath,
             save: false,
             getCurrentPath: () => null,
@@ -122,16 +130,18 @@ public sealed class OpenModelDiagnosticsTests
     {
         var saveCalls = 0;
         var openCalls = 0;
+        var currentPath = CurrentPath;
 
-        var result = OpenModelService.OpenOnAttachedModel(
+        var result = OpenModel(
             TargetPath,
             save: false,
-            getCurrentPath: () => CurrentPath,
+            getCurrentPath: () => currentPath,
             saveFile: _ => { saveCalls++; return 0; },
             openFile: path =>
             {
                 Assert.Equal(TargetPath, path);
                 openCalls++;
+                currentPath = path;
                 return 0;
             });
 
@@ -143,6 +153,14 @@ public sealed class OpenModelDiagnosticsTests
         Assert.Null(result.Data.Pid);
         Assert.False(result.Data.OpenedInNewInstance);
     }
+
+    private static Result<OpenModelData> OpenModel(
+        string filePath,
+        bool save,
+        Func<string?> getCurrentPath,
+        Func<string, int> saveFile,
+        Func<string, int> openFile) => OpenModelService.ToOpenModelData(
+            EtabsModelOpen.OpenOnAttachedModel(filePath, save, getCurrentPath, saveFile, openFile));
 
     private sealed class TestException : Exception
     {

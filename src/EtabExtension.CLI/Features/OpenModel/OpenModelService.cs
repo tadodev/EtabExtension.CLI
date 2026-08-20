@@ -8,8 +8,20 @@ using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.OpenModel;
 
+/// <summary>
+/// <c>open-model</c>.
+///
+/// <para>Every OpenFile in this service — daemon, Mode A, Mode B — is the shared
+/// <see cref="EtabsModelOpen"/> primitive. Only the process lifecycle around it
+/// differs (caller-owned session, ROT attach, or a new visible instance), so the
+/// COM boundary itself is identical to the one <c>snapshot-export</c> uses.</para>
+/// </summary>
 public class OpenModelService : IOpenModelService
 {
+    private readonly IEtabsModelOpener _opener;
+
+    public OpenModelService(IEtabsModelOpener opener) => _opener = opener;
+
     private static async Task<int?> WaitForNewPidAsync(HashSet<int> existingPids)
     {
         var deadline = DateTime.UtcNow.AddSeconds(3);
@@ -33,11 +45,9 @@ public class OpenModelService : IOpenModelService
     {
         await Task.CompletedTask;
 
-        if (!File.Exists(filePath))
-            return Result.Fail<OpenModelData>($"File not found: {filePath}");
-
-        if (!filePath.EndsWith(".edb", StringComparison.OrdinalIgnoreCase))
-            return Result.Fail<OpenModelData>("Only .edb files can be opened");
+        var validation = EtabsModelOpen.ValidateModelPath(filePath);
+        if (validation is not null)
+            return Result.Fail<OpenModelData>(validation);
 
         return newInstance
             ? await OpenInNewInstanceAsync(filePath)
@@ -51,76 +61,23 @@ public class OpenModelService : IOpenModelService
         ETABSApplication app, string filePath, bool save)
     {
         await Task.CompletedTask;
-
-        if (!File.Exists(filePath))
-            return Result.Fail<OpenModelData>($"File not found: {filePath}");
-
-        if (!filePath.EndsWith(".edb", StringComparison.OrdinalIgnoreCase))
-            return Result.Fail<OpenModelData>("Only .edb files can be opened");
-
-        return OpenOnAttachedModel(
-            filePath,
-            save,
-            () => app.Model.ModelInfo.GetModelFilepath(),
-            currentPath => app.Model.Files.SaveFile(currentPath),
-            targetPath => app.Model.Files.OpenFile(targetPath));
+        return ToOpenModelData(_opener.Open(app, filePath, save));
     }
 
-    internal static Result<OpenModelData> OpenOnAttachedModel(
-        string filePath,
-        bool save,
-        Func<string?> getCurrentPath,
-        Func<string, int> saveFile,
-        Func<string, int> openFile)
-    {
-        var activeOperation = "cSapModel.GetModelFilename";
-        try
-        {
-            var currentPath = getCurrentPath();
-            var hasCurrentFile = !string.IsNullOrEmpty(currentPath);
-
-            if (hasCurrentFile && save)
+    /// <summary>
+    /// Projects the canonical open outcome onto the frozen <c>open-model</c> response
+    /// shape. Pure — the COM boundary lives in <see cref="EtabsModelOpen"/>.
+    /// </summary>
+    internal static Result<OpenModelData> ToOpenModelData(Result<ModelOpenOutcome> opened) =>
+        opened.Success && opened.Data is { } outcome
+            ? Result.Ok(new OpenModelData
             {
-                Console.Error.WriteLine("ℹ Saving current file...");
-                activeOperation = "cFile.Save";
-                var saveReturnCode = saveFile(currentPath!);
-                if (saveReturnCode != 0)
-                {
-                    return Result.Fail<OpenModelData>(
-                        EtabsApiDiagnosticFormatter.ApiReturn(
-                            activeOperation,
-                            saveReturnCode));
-                }
-            }
-
-            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
-            activeOperation = "cFile.OpenFile";
-            var openReturnCode = openFile(filePath);
-            if (openReturnCode != 0)
-            {
-                return Result.Fail<OpenModelData>(
-                    EtabsApiDiagnosticFormatter.ApiReturn(
-                        activeOperation,
-                        openReturnCode));
-            }
-
-            Console.Error.WriteLine($"✓ Opened: {Path.GetFileName(filePath)}");
-            return Result.Ok(new OpenModelData
-            {
-                FilePath = filePath,
-                PreviousFilePath = hasCurrentFile ? currentPath : null,
+                FilePath = outcome.RequestedPath,
+                PreviousFilePath = outcome.PreviousFilePath,
                 Pid = null,
                 OpenedInNewInstance = false
-            });
-        }
-        catch (Exception exception)
-        {
-            return Result.Fail<OpenModelData>(
-                EtabsApiDiagnosticFormatter.Exception(
-                    activeOperation,
-                    exception));
-        }
-    }
+            })
+            : Result.Fail<OpenModelData>(opened.Error ?? "OpenFile failed");
 
     // ── Mode A — open in the user's running ETABS ────────────────────────────
 
@@ -159,12 +116,10 @@ public class OpenModelService : IOpenModelService
 
             // OpenFile() closes the current model and opens the new one atomically.
             // No InitializeNewModel needed — OpenFile handles the transition cleanly.
-            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
-            int openRet = app.Model.Files.OpenFile(filePath);
-            if (openRet != 0)
-                return Result.Fail<OpenModelData>($"OpenFile failed (ret={openRet})");
-
-            Console.Error.WriteLine($"✓ Opened: {Path.GetFileName(filePath)}");
+            // Same canonical boundary as the daemon path; only the attach differs.
+            var opened = EtabsModelOpen.OpenOnApp(app, filePath, save: false);
+            if (!opened.Success)
+                return Result.Fail<OpenModelData>(opened.Error ?? "OpenFile failed");
 
             return Result.Ok(new OpenModelData
             {
@@ -206,10 +161,9 @@ public class OpenModelService : IOpenModelService
             // Do NOT hide — user asked for a visible new instance
             Console.Error.WriteLine($"✓ New ETABS instance started (v{app.FullVersion})");
 
-            Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
-            int openRet = app.Model.Files.OpenFile(filePath);
-            if (openRet != 0)
-                return Result.Fail<OpenModelData>($"OpenFile failed (ret={openRet})");
+            var opened = EtabsModelOpen.OpenOnApp(app, filePath, save: false);
+            if (!opened.Success)
+                return Result.Fail<OpenModelData>(opened.Error ?? "OpenFile failed");
 
             var pid = await WaitForNewPidAsync(existingPids);
             if (pid is null)

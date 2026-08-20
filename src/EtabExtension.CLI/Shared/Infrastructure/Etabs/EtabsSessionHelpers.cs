@@ -21,19 +21,20 @@ internal static class EtabsSessionHelpers
         if (app.Application.Visible()) app.Application.Hide();
     }
 
+    /// <summary>
+    /// Opens a model on an already-owned session through the one canonical
+    /// <see cref="EtabsModelOpen"/> primitive. This helper owns no OpenFile call of
+    /// its own, so combined-session commands cannot drift from the validated
+    /// <c>open-model</c> boundary.
+    /// </summary>
     internal static async Task<Result> OpenFileAsync(ETABSApplication app, string filePath)
     {
         await Task.CompletedTask;
 
-        Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(filePath)}");
-        int openRet = app.Model.Files.OpenFile(filePath);
-        if (openRet != 0)
-        {
-            return Result.Fail($"OpenFile failed (ret={openRet})");
-        }
-
-        Console.Error.WriteLine($"✓ Opened ({app.FullVersion})");
-        return Result.Ok();
+        var opened = EtabsModelOpen.OpenOnApp(app, filePath, save: false);
+        return opened.Success
+            ? Result.Ok()
+            : Result.Fail(opened.Error ?? "OpenFile failed");
     }
 
     /// <summary>

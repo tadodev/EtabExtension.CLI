@@ -5,6 +5,8 @@ using EtabExtension.CLI.Features.RunAnalysis;
 using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Features.Serve.Operations;
+using EtabExtension.CLI.Features.SnapshotExport;
+using EtabExtension.CLI.Features.SnapshotExport.Models;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
@@ -283,6 +285,76 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Equal("SI_kN_m_C", runAnalysis.Units);
     }
 
+    [Fact]
+    public async Task SnapshotExportUsesTheSharedServeSessionAndForwardsTheFlattenedRequest()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var snapshot = new FakeSnapshotExportService();
+        var dispatcher = CreateDispatcher(_manager, session, snapshot: snapshot);
+
+        var response = Assert.IsType<Result<SnapshotExportData>>(await dispatcher.DispatchAsync(
+            "snapshot-export",
+            Json("""{"filePath":"C:\\v1\\sample_v2.edb","outputDir":"C:\\v1\\snapshot","units":"US_Kip_Ft","e2kFileName":"model.e2k","materialsDirName":"materials","metadataFileName":"model-metadata.json","metricsFileName":"run-metrics.json","extractionProfile":"snapshot","tables":{}}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.True(response.Success);
+        // Shared session only: the one-shot overload is what would spawn a second ETABS.
+        Assert.Equal(1, snapshot.SharedCalls);
+        Assert.Equal(0, snapshot.OneShotCalls);
+        Assert.Equal(1, session.GetOrStartCalls);
+        Assert.Equal(0, session.GetOrStartOwnedCalls);
+        Assert.Equal(@"C:\v1\sample_v2.edb", snapshot.FilePath);
+        Assert.Equal(@"C:\v1\snapshot", snapshot.OutputDir);
+        Assert.Equal("US_Kip_Ft", snapshot.Request!.Units);
+        Assert.Equal("snapshot", snapshot.Request.ExtractionProfile);
+        Assert.Equal("model.e2k", snapshot.Request.E2KFileName);
+        Assert.Equal("run-metrics.json", snapshot.Request.MetricsFileName);
+        Assert.Equal(@"C:\v1\sample_v2.edb", response.Data!.FilePath);
+        Assert.Equal(@"C:\v1\snapshot", response.Data.OutputDir);
+    }
+
+    [Fact]
+    public async Task SnapshotExportPreservesTheCorrelatedFailureShape()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var snapshot = new FakeSnapshotExportService
+        {
+            Failure = "ETABS_API_CALL_FAILED; operation=cFile.OpenFile; returnCode=23"
+        };
+        var dispatcher = CreateDispatcher(_manager, session, snapshot: snapshot);
+
+        var response = Assert.IsType<Result<SnapshotExportData>>(await dispatcher.DispatchAsync(
+            "snapshot-export",
+            Json("""{"filePath":"C:\\v1\\sample_v2.edb","outputDir":"C:\\v1\\snapshot","tables":{}}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.False(response.Success);
+        Assert.Equal("ETABS_API_CALL_FAILED; operation=cFile.OpenFile; returnCode=23", response.Error);
+        Assert.Null(response.Data);
+        Assert.Equal(1, snapshot.SharedCalls);
+        Assert.Equal(0, snapshot.OneShotCalls);
+    }
+
+    [Fact]
+    public async Task RepeatedSnapshotExportsReuseTheOneSharedSession()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var snapshot = new FakeSnapshotExportService();
+        var dispatcher = CreateDispatcher(_manager, session, snapshot: snapshot);
+        var payload = Json("""{"filePath":"C:\\v1\\sample_v2.edb","outputDir":"C:\\v1\\snapshot","tables":{}}""");
+
+        await dispatcher.DispatchAsync("snapshot-export", payload, TestContext.Current.CancellationToken);
+        await dispatcher.DispatchAsync("snapshot-export", payload, TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, snapshot.SharedCalls);
+        Assert.Equal(0, snapshot.OneShotCalls);
+        Assert.Equal(0, session.GetOrStartOwnedCalls);
+        Assert.Equal(42, session.ProcessId);
+    }
+
     [Theory]
     [InlineData("get-model-state", null)]
     [InlineData("list-wall-properties", null)]
@@ -347,11 +419,12 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         IEtabsSession? session = null,
         IProcessInspector? processes = null,
         IRunAnalysisService? runAnalysis = null,
-        ICachedSessionStatus? cachedStatus = null) => new(
+        ICachedSessionStatus? cachedStatus = null,
+        ISnapshotExportService? snapshot = null) => new(
             session ?? null!,
             null!,
             null!,
-            null!,
+            snapshot ?? null!,
             null!,
             null!,
             null!,
@@ -392,6 +465,7 @@ public sealed class ServeOperationDispatcherTests : IDisposable
     private sealed class FakeSession(bool isStarted = true, int? processId = 42) : IEtabsSession
     {
         public int GetOrStartCalls { get; private set; }
+        public int GetOrStartOwnedCalls { get; private set; }
         public bool IsStarted => isStarted;
         public int? ProcessId => processId;
         public ETABSApplication GetOrStart()
@@ -399,9 +473,47 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             GetOrStartCalls++;
             return null!;
         }
-        public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
+        public IManagedEtabsApplication GetOrStartOwned()
+        {
+            GetOrStartOwnedCalls++;
+            return null!;
+        }
         public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
         public void Dispose() { }
+    }
+
+    private sealed class FakeSnapshotExportService : ISnapshotExportService
+    {
+        public int OneShotCalls { get; private set; }
+        public int SharedCalls { get; private set; }
+        public string? FilePath { get; private set; }
+        public string? OutputDir { get; private set; }
+        public SnapshotExportRequest? Request { get; private set; }
+        public string? Failure { get; init; }
+
+        public Task<Result<SnapshotExportData>> SnapshotExportAsync(
+            string filePath,
+            string outputDir,
+            SnapshotExportRequest request)
+        {
+            OneShotCalls++;
+            return Task.FromResult(Result.Ok(new SnapshotExportData { FilePath = filePath }));
+        }
+
+        public Task<Result<SnapshotExportData>> SnapshotExportOnAppAsync(
+            ETABSApplication app,
+            string filePath,
+            string outputDir,
+            SnapshotExportRequest request)
+        {
+            SharedCalls++;
+            FilePath = filePath;
+            OutputDir = outputDir;
+            Request = request;
+            return Task.FromResult(Failure is null
+                ? Result.Ok(new SnapshotExportData { FilePath = filePath, OutputDir = outputDir })
+                : Result.Fail<SnapshotExportData>(Failure));
+        }
     }
 
     private sealed class FakeProcesses(EtabsProcessObservation observation) : IProcessInspector
