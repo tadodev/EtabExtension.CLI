@@ -1,6 +1,9 @@
-﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+﻿using EtabExtension.CLI.Features.Serve;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace EtabExtension.CLI.Tests;
@@ -648,6 +651,30 @@ public sealed class ManagedEtabsLauncherTests
         Assert.Equal(ManagedEtabsLauncher.OwnershipCensusDeadline, clock.Elapsed);
         Assert.Empty(processes.Guards.Activated);
         Assert.Equal(0, api.StartCount);
+    }
+
+    /// <summary>
+    /// The daemon resolves this launcher out of the container, and the repair added two
+    /// more public constructors to it. Microsoft.Extensions.DependencyInjection picks a
+    /// constructor by what it can resolve, so an overload set it cannot decide between is a
+    /// startup failure that no unit test touching the class directly would ever see.
+    ///
+    /// <para>Resolution is side-effect free by construction here: nothing on the path
+    /// beyond the constructors runs, so no ETABS is discovered, started or looked for.</para>
+    /// </summary>
+    [Fact]
+    public void TheServeContainerCanStillConstructTheLauncher()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<IConfiguration>(
+            new ConfigurationBuilder().AddInMemoryCollection([]).Build());
+        services.AddServeFeature();
+
+        using var provider = services.BuildServiceProvider();
+        using var scope = provider.CreateScope();
+
+        Assert.IsType<ManagedEtabsLauncher>(
+            scope.ServiceProvider.GetRequiredService<IManagedEtabsLauncher>());
     }
 
     [Fact]
