@@ -15,14 +15,15 @@ namespace EtabExtension.CLI.Tests;
 /// invisible to every fake. One of those already shipped as a defect and had to be
 /// caught by a supervised live run. These tests fail on the revert.</para>
 /// </summary>
-public sealed class ModelOpenCsiChoiceTests
+public sealed partial class ModelOpenCsiChoiceTests
 {
     /// <summary>
     /// The call that returns the model's FOLDER rather than its file path (observed,
     /// ETABS 23.3.0). A folder cannot be saved back and cannot confirm which model is
     /// loaded, so nothing on the model-open path may use it.
     /// </summary>
-    private const string FolderApiCallPattern = @"\.\s*GetModelFilepath\s*\(";
+    [GeneratedRegex(@"\.\s*GetModelFilepath\s*\(")]
+    private static partial Regex FolderApiCall();
 
     /// <summary>
     /// The files still permitted to call the folder-returning API, each a known defect
@@ -49,7 +50,7 @@ public sealed class ModelOpenCsiChoiceTests
     public void NoSourceOutsideTheKnownExceptionsCallsTheFolderReturningApi()
     {
         var offenders = ProductionSources()
-            .Where(file => Regex.IsMatch(file.Text, FolderApiCallPattern))
+            .Where(file => FolderApiCall().IsMatch(file.Text))
             .Select(file => file.RelativePath)
             .Where(relative => !AllowedFolderApiCallers.Contains(relative, StringComparer.OrdinalIgnoreCase))
             .Order(StringComparer.OrdinalIgnoreCase)
@@ -71,15 +72,18 @@ public sealed class ModelOpenCsiChoiceTests
     [Fact]
     public void TheFolderApiAllowListHasNoStaleEntries()
     {
-        foreach (var relative in AllowedFolderApiCallers)
-        {
-            var source = ReadRepositoryFile(relative);
+        // Every stale entry at once, not the first: these are deleted during composition
+        // with the branch that repairs them, and reporting them one per run would cost a
+        // rebuild per line.
+        var repaired = AllowedFolderApiCallers
+            .Where(relative => !FolderApiCall().IsMatch(ReadRepositoryFile(relative)))
+            .ToArray();
 
-            Assert.True(
-                Regex.IsMatch(source, FolderApiCallPattern),
-                $"{relative} no longer calls GetModelFilepath() — it has been repaired. " +
-                "Delete its line from AllowedFolderApiCallers so the guard covers it too.");
-        }
+        Assert.True(
+            repaired.Length == 0,
+            $"These files no longer call GetModelFilepath() and have been repaired: " +
+            $"{string.Join(", ", repaired)}. Delete their lines from " +
+            "AllowedFolderApiCallers so the whole-tree guard covers them too.");
     }
 
     /// <summary>

@@ -32,6 +32,37 @@ public sealed class WindowsFileIdentityTests : IDisposable
     }
 
     [Fact]
+    public void AZeroFileIndexIsNoAnswerRatherThanAnIdentity()
+    {
+        // Guards a FAIL-OPEN hazard, not a degradation: a redirector that reports a zero
+        // index would otherwise make every file on the volume compare equal, so a
+        // genuinely different model — even one with a different name — would be accepted
+        // as the requested one with only a warning.
+        Assert.Null(WindowsFileIdentity.IdentityFrom(volume: 0x1234, indexHigh: 0, indexLow: 0));
+
+        Assert.NotNull(WindowsFileIdentity.IdentityFrom(volume: 0x1234, indexHigh: 0, indexLow: 1));
+        Assert.NotNull(WindowsFileIdentity.IdentityFrom(volume: 0x1234, indexHigh: 1, indexLow: 0));
+    }
+
+    [Fact]
+    public void DistinctFilesOnOneVolumeKeepDistinctIdentities()
+    {
+        var left = WindowsFileIdentity.IdentityFrom(volume: 7, indexHigh: 0, indexLow: 11);
+        var right = WindowsFileIdentity.IdentityFrom(volume: 7, indexHigh: 0, indexLow: 12);
+
+        Assert.NotEqual(left, right);
+    }
+
+    [Fact]
+    public void AnUnavailableIndexDescribesItselfInsteadOfReportingErrorZero()
+    {
+        var result = FileIdentityResult.Unprovable(WindowsFileIdentity.FileIndexUnavailable);
+
+        Assert.Equal("the filesystem reported no file index", result.DescribeFailure());
+        Assert.DoesNotContain("win32Error", result.DescribeFailure(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TheSameFileIsIdenticalToItself()
     {
         var path = CreateFile("model.edb", "edb");

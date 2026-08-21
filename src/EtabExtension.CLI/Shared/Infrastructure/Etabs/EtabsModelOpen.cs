@@ -312,8 +312,7 @@ public static class EtabsModelOpen
                 resolvedPath,
                 openedFull,
                 "ETABS returned success with a path this host could not identify, so it " +
-                "could not be shown to be the requested file; " +
-                $"win32Error={identity.Win32Error}.");
+                $"could not be shown to be the requested file; {identity.DescribeFailure()}.");
     }
 
     private static string TryGetFullPath(string path)

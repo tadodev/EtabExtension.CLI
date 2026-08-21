@@ -35,6 +35,18 @@ internal readonly record struct FileIdentityResult(FileIdentityMatch Match, int 
 
     internal static FileIdentityResult Unprovable(int win32Error) =>
         new(FileIdentityMatch.Unprovable, win32Error);
+
+    /// <summary>
+    /// Why identity could not be established, in words. Keeps the sentinel from
+    /// leaking into diagnostics as a bare number: a reader chasing the hardest case
+    /// should not have to know that -1 is not a Win32 code.
+    /// </summary>
+    internal string DescribeFailure() => Win32Error switch
+    {
+        WindowsFileIdentity.FileIndexUnavailable => "the filesystem reported no file index",
+        0 => "the path could not be opened for identification",
+        _ => $"identification failed with win32Error={Win32Error}"
+    };
 }
 
 /// <summary>
@@ -53,6 +65,13 @@ internal readonly record struct FileIdentityResult(FileIdentityMatch Match, int 
 /// </summary>
 internal static class WindowsFileIdentity
 {
+    /// <summary>
+    /// Not a Win32 code. The call succeeded but the filesystem named no file index, so
+    /// identity is unavailable rather than errored — distinct from 0, which would read
+    /// as "no error occurred" in exactly the case that is hardest to diagnose.
+    /// </summary>
+    internal const int FileIndexUnavailable = -1;
+
     private const uint FileReadAttributes = 0x0080;
     private const uint FileShareAll = 0x00000007; // READ | WRITE | DELETE
     private const uint OpenExisting = 3;
@@ -129,18 +148,31 @@ internal static class WindowsFileIdentity
             return (null, Marshal.GetLastWin32Error());
         }
 
-        // Some network redirectors and filesystems report a zero index. That is "no
-        // answer", not "index zero" — treating it as an identity would make every such
-        // file identical to every other.
-        if (information.FileIndexHigh == 0 && information.FileIndexLow == 0)
-        {
-            return (null, 0);
-        }
+        var identity = IdentityFrom(
+            information.VolumeSerialNumber,
+            information.FileIndexHigh,
+            information.FileIndexLow);
 
-        return (
-            (information.VolumeSerialNumber, information.FileIndexHigh, information.FileIndexLow),
-            0);
+        return identity is null ? (null, FileIndexUnavailable) : (identity, 0);
     }
+
+    /// <summary>
+    /// Maps a raw <c>BY_HANDLE_FILE_INFORMATION</c> triple to an identity, or null when
+    /// the filesystem named no file.
+    ///
+    /// <para>Some network redirectors and filesystems report a zero index. That is "no
+    /// answer", not "index zero": treating it as an identity makes every such file
+    /// compare equal to every other on the same volume — which fails OPEN, silently
+    /// accepting a different model as the requested one. Separated from the interop so
+    /// the rule is reachable by test.</para>
+    /// </summary>
+    internal static (uint Volume, uint IndexHigh, uint IndexLow)? IdentityFrom(
+        uint volume,
+        uint indexHigh,
+        uint indexLow) =>
+        indexHigh == 0 && indexLow == 0
+            ? null
+            : (volume, indexHigh, indexLow);
 
     // Classic DllImport rather than the source-generated LibraryImport: the latter
     // requires AllowUnsafeBlocks project-wide, which is far too broad a change to make
