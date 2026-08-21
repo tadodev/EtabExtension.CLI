@@ -139,6 +139,12 @@ public sealed class EtabsSession : IEtabsSession
                 // success line straight after failing to confirm it; here an unconfirmed
                 // hidden state ends the session on the same path a failed
                 // InitializeNewModel does, so that line can only ever follow a proof.
+                //
+                // What is proven changed after #20: the gate is the exact-owned Windows
+                // census, not cOAPI.Visible(). InitializeNewModel is precisely when ETABS
+                // builds the (Untitled) model behind its frame, so this second census is
+                // where a window that surfaced during initialization has to be accounted
+                // for — the guard will already have taken it down on the window event.
                 var creationFailure = Initialize(launched)
                     ?? CompleteReadiness(launched)
                     ?? ConfirmHiddenForBackgroundWork(launched);
@@ -286,45 +292,44 @@ public sealed class EtabsSession : IEtabsSession
     }
 
     /// <summary>
-    /// The second and last hide of a session's life, taken once
+    /// The second and last background-suppression proof of a session's life, taken once
     /// <c>InitializeNewModel</c> has produced the blank model and the EtabSharp wrap
     /// exists, and still before the application is handed to any command.
     ///
-    /// <para>The launcher already hid the application at <c>ApplicationStart</c>. This is
-    /// not redundant: ETABS finishes building its UI well after the start call returns —
-    /// the #20 timeline shows the window arriving 5.15 s after process creation — and
-    /// Cardex documents nothing about when. A second read costs one CSI call and covers
-    /// the case where the first hide found nothing to hide.</para>
+    /// <para>The launcher already proved suppression right after <c>ApplicationStart</c>.
+    /// This is not redundant: <c>InitializeNewModel</c> is what puts the blank
+    /// <c>(Untitled)</c> model behind the frame, and the #20 timeline shows ETABS building
+    /// UI long after the start call returns. A second exact-owned census costs one window
+    /// enumeration and covers everything that surfaced in between.</para>
     ///
-    /// <para><b>Failure is terminal.</b> An unconfirmed hidden state returns a launch
-    /// failure rather than a warning, and the caller tears the session down through the
-    /// same cleanup a failed initialization uses — the authoritative owned process is
-    /// exited, not left running with an unproven window. Warning and continuing is exactly
-    /// what #20 measured and rejected.</para>
+    /// <para><b>Failure is terminal.</b> An unproven Windows state returns a launch failure
+    /// rather than a warning, and the caller tears the session down through the same
+    /// cleanup a failed initialization uses — the authoritative owned process is exited,
+    /// not left running with a window on screen.</para>
     ///
     /// <para>It runs ONLY while the session is being created. That is the whole reason a
     /// background command can safely reuse a session the user asked to see: nothing on the
-    /// command path ever hides anything.</para>
+    /// command path ever suppresses anything.</para>
     /// </summary>
     private (string Code, string Diagnostic, Exception? Exception)? ConfirmHiddenForBackgroundWork(
         IManagedEtabsApplication owned)
     {
-        var outcome = owned.EnsureHiddenForBackgroundWork();
-        if (!outcome.Confirmed)
+        var confirmation = owned.ConfirmWindowsSuppressed();
+        if (!confirmation.Confirmed)
         {
             return (
                 EtabsLaunchErrorCodes.HiddenStateNotEstablished,
-                outcome.Diagnostic
-                    ?? "Managed ETABS could not be confirmed hidden before use.",
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    confirmation.Diagnostic
+                        ?? "Managed ETABS window suppression could not be confirmed.",
+                    "stage=after cSapModel.InitializeNewModel"),
                 (Exception?)null);
         }
 
-        // Paired with the launcher's line, this says which of the two hides did the work
-        // and how hard CSI had to be waited on for it.
-        _diagnostics.WriteLine(outcome.Changed
-            ? "ℹ ETABS hidden before use (a window appeared during model initialization; " +
-                $"reads={outcome.Reads}, waitedMs={(long)outcome.Waited.TotalMilliseconds})."
-            : "ℹ ETABS was already hidden before use.");
+        _diagnostics.WriteLine(
+            "✓ ETABS background UI suppression confirmed before use " +
+            $"(observations={confirmation.Observations}, " +
+            $"waitedMs={(long)confirmation.Waited.TotalMilliseconds}).");
         return null;
     }
 
@@ -335,25 +340,36 @@ public sealed class EtabsSession : IEtabsSession
         {
             var owned = GetOrStartOwned();
 
-            // Order is the contract. The caller has already confirmed the requested model
-            // is open; the background window suppression is retired FIRST — permanently,
-            // and putting back exactly the windows it hid — and only then is the CSI
-            // visible transition issued. Releasing after the transition would leave the
-            // guard free to take the engineer's window straight back down, and there is no
-            // path that re-arms it afterwards.
+            // Order is the contract, and every step of it is load bearing.
+            //
+            // The caller has already confirmed the requested model is open. Background
+            // suppression is retired FIRST — permanently, and putting back the windows it
+            // hid that are still its own. That restore is what actually reaches the screen:
+            // with cOAPI.Visible() stuck true, the CSI policy below reads "already visible"
+            // and issues no Unhide at all, so a reveal that leaned on CSI would leave the
+            // engineer with nothing. Retiring after the transition would instead leave the
+            // guard free to take the window straight back down, and nothing re-arms it.
             owned.ReleaseWindowGuardForExplicitUserAction();
 
-            var outcome = owned.EnsureVisibleForExplicitUserAction();
-            if (!outcome.Confirmed)
+            // Best-effort hint. Its answer is logged, never gated on.
+            var csi = owned.EnsureVisibleForExplicitUserAction();
+
+            // THE gate: Windows itself must report an owned top-level ETABS window on
+            // screen. "Open in ETABS" that shows nothing has not done what was asked,
+            // whatever CSI says about it.
+            var windows = owned.ConfirmWindowsRevealed();
+            if (!windows.Confirmed)
             {
-                return Result.Fail(outcome.Diagnostic
-                    ?? "Managed ETABS could not be confirmed visible.");
+                return Result.Fail(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    windows.Diagnostic
+                        ?? "No owned ETABS window could be confirmed visible.",
+                    $"csiConfirmed={csi.Confirmed}; csiChanged={csi.Changed}"));
             }
 
-            if (outcome.Changed)
-            {
-                _diagnostics.WriteLine($"✓ ETABS shown (PID {owned.Identity.Pid})");
-            }
+            _diagnostics.WriteLine(
+                $"✓ ETABS shown (PID {owned.Identity.Pid}; " +
+                $"visibleOwnedWindows={windows.ObservedWindows.Count}, " +
+                $"csiConfirmed={csi.Confirmed})");
 
             return Result.Ok();
         }

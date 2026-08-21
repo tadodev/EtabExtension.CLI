@@ -20,10 +20,14 @@ public static class EtabsLaunchErrorCodes
     public const string ModelInitializationFailed = "ETABS_MODEL_INITIALIZATION_FAILED";
 
     /// <summary>
-    /// The managed session could not be proven hidden, so it must not be handed to a
-    /// background command at all. Warning and continuing was the RC policy; the #20
-    /// supervised certification measured a materially visible ETABS window through it
-    /// and rejected the candidate for it.
+    /// The exact-owned Windows census could not prove that no owned ETABS window is on
+    /// screen, so the session must not be handed to a background command at all.
+    ///
+    /// <para>Warning and continuing was the RC policy, and #20 measured a materially
+    /// visible ETABS window through it. The gate behind this code is now the Windows
+    /// census rather than <c>cOAPI.Visible()</c> — the same certification proved that flag
+    /// never clears on ETABS 23.3, so gating on it refused sessions whose windows were
+    /// actually suppressed.</para>
     /// </summary>
     public const string HiddenStateNotEstablished = "ETABS_HIDDEN_STATE_NOT_ESTABLISHED";
     public const string RecoveryRecordWriteFailed = "ETABS_RECOVERY_RECORD_WRITE_FAILED";
@@ -412,6 +416,24 @@ public interface IManagedEtabsApplication
     ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction();
 
     /// <summary>
+    /// THE background-readiness gate: proves from the exact-owned Windows census that no
+    /// owned top-level window is on screen.
+    ///
+    /// <para>This replaced <c>cOAPI.Visible()</c> as the acceptance authority after #20
+    /// measured that flag staying true through 94 reads while the real windows were
+    /// suppressed. <see cref="EnsureHiddenForBackgroundWork"/> is still called, but its
+    /// answer is telemetry; this one decides.</para>
+    /// </summary>
+    ManagedEtabsWindowConfirmation ConfirmWindowsSuppressed();
+
+    /// <summary>
+    /// THE explicit-reveal gate: proves from the same census that an owned top-level window
+    /// IS on screen. Called only after suppression has been permanently retired and the CSI
+    /// hint has been given its chance.
+    /// </summary>
+    ManagedEtabsWindowConfirmation ConfirmWindowsRevealed();
+
+    /// <summary>
     /// Permanently ends the Windows startup window suppression for this session and puts
     /// back exactly the windows it hid, because the USER asked to see ETABS.
     ///
@@ -465,6 +487,14 @@ public sealed class ManagedEtabsApplication(
     /// <inheritdoc />
     public ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction() =>
         ManagedEtabsVisibility.EnsureVisible(rawApi, visibility);
+
+    /// <inheritdoc />
+    public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressed() =>
+        windowGuard.ConfirmSuppressed();
+
+    /// <inheritdoc />
+    public ManagedEtabsWindowConfirmation ConfirmWindowsRevealed() =>
+        windowGuard.ConfirmRevealed();
 
     /// <inheritdoc />
     public void ReleaseWindowGuardForExplicitUserAction() =>

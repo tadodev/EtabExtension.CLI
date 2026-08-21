@@ -488,7 +488,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         _diagnostics = diagnostics;
         _windowGuards = windowGuards;
         _clock = clock;
-        _visibility = ManagedEtabsVisibilityPolicy.Default with { Clock = clock };
+        _visibility = ManagedEtabsVisibilityPolicy.Telemetry with { Clock = clock };
     }
 
     /// <summary>The convergence policy this launcher hands to the session it creates.</summary>
@@ -525,7 +525,8 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             windowGuard = ActivateWindowGuard(ownedProcess);
 
             StartApplication(rawApi);
-            HideBeforeAnythingElseTouchesIt(rawApi);
+            AskCsiToHide(rawApi);
+            RequireWindowsSuppressed(windowGuard, "after cOAPI.ApplicationStart");
             RequireSapModel(rawApi);
 
             var version = ReadVersion(identity.ExecutablePath);
@@ -622,37 +623,52 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     }
 
     /// <summary>
-    /// Puts the just-started application into the background-work state, immediately after
-    /// <c>ApplicationStart</c> returns and before the version probe, the recovery record,
-    /// or <c>InitializeNewModel</c>.
+    /// Asks CSI to hide the application it just started, once, and records what it said.
     ///
-    /// <para><b>Now a launch failure.</b> It used to warn and continue, on the reasoning
-    /// that an ETABS which refuses to hide is still a working ETABS. The supervised #20
-    /// certification measured what that policy costs — a materially visible window for
-    /// 5.19 s of a background run, and a "started hidden" success line printed straight
-    /// after two "not confirmed" warnings — and rejected the candidate for it. An unproven
-    /// hidden state now ends the session instead, and the launch cleanup envelope
-    /// terminates the exact owned process it started.</para>
+    /// <para><b>Telemetry, not a gate.</b> #20 measured <c>cOAPI.Hide()</c> returning
+    /// success and <c>cOAPI.Visible()</c> then holding true for 94 reads across 10.014 s,
+    /// while the exact-owned window census showed the windows being suppressed the whole
+    /// time. Failing a session on that flag refused sessions that were, in fact, hidden —
+    /// which is how a working candidate came back from certification with
+    /// <c>snapshot-export success=false</c>. The call is still made because it costs one
+    /// CSI round trip and would be the cheaper mechanism on a build where it works; the
+    /// decision belongs to <see cref="RequireWindowsSuppressed"/>.</para>
     /// </summary>
-    private void HideBeforeAnythingElseTouchesIt(IEtabsRawApi rawApi)
+    private void AskCsiToHide(IEtabsRawApi rawApi)
     {
         var outcome = ManagedEtabsVisibility.EnsureHidden(rawApi, _visibility);
-        if (!outcome.Confirmed)
+        _diagnostics.WriteLine(outcome.Confirmed
+            ? $"ℹ cOAPI.Hide agreed (changed={outcome.Changed}, reads={outcome.Reads})."
+            : "ℹ cOAPI.Hide did not agree; Windows window state is the authority. " +
+                outcome.Diagnostic);
+    }
+
+    /// <summary>
+    /// The authoritative background-readiness gate: the exact-owned Windows census must
+    /// report no visible top-level window before startup goes any further.
+    ///
+    /// <para>A launch failure when it cannot be proven — warning and continuing is what
+    /// #20 rejected, and this is deliberately NOT that policy with a new implementation
+    /// underneath: the thing being proven is now real Windows state rather than a CSI
+    /// flag, and the diagnostic names the offending handles.</para>
+    /// </summary>
+    private void RequireWindowsSuppressed(IManagedEtabsWindowGuard guard, string stage)
+    {
+        var confirmation = guard.ConfirmSuppressed();
+        if (!confirmation.Confirmed)
         {
             throw new EtabsLaunchException(
                 EtabsLaunchErrorCodes.HiddenStateNotEstablished,
-                outcome.Diagnostic
-                    ?? "Managed ETABS could not be confirmed hidden at startup.");
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    confirmation.Diagnostic
+                        ?? "Managed ETABS window suppression could not be confirmed.",
+                    $"stage={stage}"));
         }
 
-        // Whether this hide CAUGHT anything, and how long CSI took to agree, are the facts
-        // the live gate needs and cannot reconstruct afterwards. "Changed" means
-        // ApplicationStart had already put a window up and this call took it down; the read
-        // count and wait say whether CSI applied it immediately or had to be waited out.
-        _diagnostics.WriteLine(outcome.Changed
-            ? "ℹ ETABS hidden at startup (a window was already visible; " +
-                $"reads={outcome.Reads}, waitedMs={(long)outcome.Waited.TotalMilliseconds})."
-            : "ℹ ETABS was already hidden at startup (no window had appeared yet).");
+        _diagnostics.WriteLine(
+            $"✓ ETABS background UI suppression confirmed {stage} " +
+            $"(observations={confirmation.Observations}, " +
+            $"waitedMs={(long)confirmation.Waited.TotalMilliseconds}).");
     }
 
     private static void RequireSapModel(IEtabsRawApi rawApi)

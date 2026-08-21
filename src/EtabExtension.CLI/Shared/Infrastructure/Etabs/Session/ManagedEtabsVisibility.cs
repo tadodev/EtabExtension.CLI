@@ -94,6 +94,23 @@ public sealed record ManagedEtabsVisibilityPolicy(
         TimeSpan.FromMilliseconds(100),
         SystemManagedEtabsClock.Instance);
 
+    /// <summary>
+    /// The policy the managed session actually ships with, now that CSI is telemetry
+    /// rather than an acceptance gate.
+    ///
+    /// <para>#20 measured <c>cOAPI.Visible()</c> holding true for 94 reads across 10.014 s
+    /// after a successful <c>Hide()</c> — on ETABS 23.3 that flag does not track the hide
+    /// at all. Spending the full ten-second budget waiting for a transition that never
+    /// happens would add ten seconds to every session start and change no decision, because
+    /// the exact-owned HWND census is what gates readiness. A short budget still records
+    /// the answer honestly on a build where CSI does converge, and costs half a second on
+    /// one where it does not.</para>
+    /// </summary>
+    public static ManagedEtabsVisibilityPolicy Telemetry { get; } = new(
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(50),
+        SystemManagedEtabsClock.Instance);
+
     /// <summary>A zero or negative interval would make the convergence loop unbounded.</summary>
     public TimeSpan PollInterval { get; } = PollInterval > TimeSpan.Zero
         ? PollInterval
