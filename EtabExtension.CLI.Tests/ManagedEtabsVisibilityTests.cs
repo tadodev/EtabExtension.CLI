@@ -337,11 +337,17 @@ public sealed class ManagedEtabsVisibilityTests
         public bool Visible()
         {
             Events.Add("visible");
-            if (ReadException is not null) throw ReadException;
+            if (ReadException is not null)
+            {
+                throw ReadException;
+            }
             if (_pendingDeferredReads > 0)
             {
                 _pendingDeferredReads--;
-                if (_pendingDeferredReads == 0) IsVisible = false;
+                if (_pendingDeferredReads == 0)
+                {
+                    IsVisible = false;
+                }
                 return true;
             }
 
@@ -352,14 +358,23 @@ public sealed class ManagedEtabsVisibilityTests
         {
             Events.Add("hide");
             HideCalls++;
-            if (TransitionException is not null) throw TransitionException;
+            if (TransitionException is not null)
+            {
+                throw TransitionException;
+            }
             if (TransitionReturnCode != 0)
             {
-                if (HidesDespiteNonZeroReturn) IsVisible = false;
+                if (HidesDespiteNonZeroReturn)
+                {
+                    IsVisible = false;
+                }
                 return TransitionReturnCode;
             }
 
-            if (IgnoreTransition) return 0;
+            if (IgnoreTransition)
+            {
+                return 0;
+            }
             if (VisibleReadsBeforeHideLands > 0)
             {
                 _pendingDeferredReads = VisibleReadsBeforeHideLands;
@@ -374,8 +389,14 @@ public sealed class ManagedEtabsVisibilityTests
         {
             Events.Add("unhide");
             UnhideCalls++;
-            if (TransitionException is not null) throw TransitionException;
-            if (TransitionReturnCode == 0 && !IgnoreTransition) IsVisible = true;
+            if (TransitionException is not null)
+            {
+                throw TransitionException;
+            }
+            if (TransitionReturnCode == 0 && !IgnoreTransition)
+            {
+                IsVisible = true;
+            }
             return TransitionReturnCode;
         }
     }
