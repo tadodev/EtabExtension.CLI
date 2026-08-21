@@ -561,7 +561,18 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             _diagnostics.WriteLine(
                 "⚠ Managed ETABS could not be confirmed hidden at startup; a window may be " +
                 $"visible during background work. {outcome.Diagnostic}");
+            return;
         }
+
+        // Whether this hide CAUGHT anything is the fact the live gate needs, and it is not
+        // recoverable after the fact. "Changed" means ApplicationStart had already put a
+        // window up and this call took it down — the RC1 symptom, closed here. "Already
+        // hidden" means ETABS had not built its UI yet, so any window that does appear is
+        // caught by the session's second hide instead, roughly six seconds later. Both
+        // outcomes end hidden; only this line says which one happened.
+        _diagnostics.WriteLine(outcome.Changed
+            ? "ℹ ETABS hidden at startup (a window was already visible)."
+            : "ℹ ETABS was already hidden at startup (no window had appeared yet).");
     }
 
     private static void RequireSapModel(IEtabsRawApi rawApi)

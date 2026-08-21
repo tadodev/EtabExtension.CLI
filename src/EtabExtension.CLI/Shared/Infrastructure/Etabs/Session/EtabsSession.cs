@@ -260,7 +260,13 @@ public sealed class EtabsSession : IEtabsSession
     /// not redundant: the RC1 timeline shows the window becoming visible at +8.5 s and
     /// only reporting <c>(Untitled)</c> at +14.8 s, so ETABS finishes building its UI well
     /// after the start call returns — and Cardex documents nothing about when. A second
-    /// read costs one CSI call and closes that gap.</para>
+    /// read costs one CSI call and covers the case where the first hide found nothing to
+    /// hide.</para>
+    ///
+    /// <para>It closes that gap only in the sense that the window is down BY THIS POINT.
+    /// If the first hide reported nothing to hide and this one did the work, ETABS was on
+    /// screen for the interval between them — the reason both sites log which of them
+    /// acted, so the supervised live run can measure the residual instead of guessing.</para>
     ///
     /// <para>It runs ONLY while the session is being created. That is the whole reason a
     /// background command can safely reuse a session the user asked to see: nothing on the
@@ -274,7 +280,16 @@ public sealed class EtabsSession : IEtabsSession
             Console.Error.WriteLine(
                 "⚠ Managed ETABS could not be confirmed hidden before use; a window may be " +
                 $"visible during background work. {outcome.Diagnostic}");
+            return;
         }
+
+        // Paired with the launcher's line, this says which of the two hides did the work.
+        // "Changed" here means the window only appeared during InitializeNewModel, so it
+        // was on screen for the seconds in between — a residual no test can observe and
+        // the one thing the #20 live gate cannot reconstruct afterwards.
+        Console.Error.WriteLine(outcome.Changed
+            ? "ℹ ETABS hidden before use (a window appeared during model initialization)."
+            : "ℹ ETABS was already hidden before use.");
     }
 
     /// <inheritdoc />

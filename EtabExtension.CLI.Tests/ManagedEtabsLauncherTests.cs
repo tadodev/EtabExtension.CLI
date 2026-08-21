@@ -1,4 +1,5 @@
-﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
+﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
 using Xunit;
 
@@ -410,13 +411,20 @@ public sealed class ManagedEtabsLauncherTests
     /// identity and recovery semantics are unchanged by CLI #22 — a session that cannot
     /// be hidden is loud on stderr and still usable, because failing Commit outright over
     /// a window would be a worse outcome than the window.
+    ///
+    /// <para>Each row carries the code it must produce. Asserting only that the text says
+    /// "ETABS" and "hidden" would pass on the static prefix alone: deleting the interpolated
+    /// diagnostic — the only part naming the CSI call that disagreed, and the thing the XML
+    /// doc promises — would go unnoticed, and the two rows would be indistinguishable.</para>
     /// </summary>
     [Theory]
-    [InlineData(true, false)]
-    [InlineData(false, true)]
+    [InlineData(true, false, EtabsApiErrorCodes.ApiCallFailed, "returnCode=1")]
+    [InlineData(false, true, EtabsApiErrorCodes.VisibilityNotConfirmed, "observed=visible")]
     public void AHideThatCannotBeConfirmedIsLoudButDoesNotFailTheLaunch(
         bool nonZeroReturn,
-        bool ignoreHide)
+        bool ignoreHide,
+        string expectedCode,
+        string expectedDetail)
     {
         var api = new FakeRawApi
         {
@@ -432,11 +440,49 @@ public sealed class ManagedEtabsLauncherTests
             diagnostics);
 
         var managed = launcher.Launch();
+        var text = diagnostics.ToString();
 
         Assert.Equal(Identity, managed.Identity);
         Assert.Equal(1, api.HideCalls);
-        Assert.Contains("ETABS", diagnostics.ToString(), StringComparison.Ordinal);
-        Assert.Contains("hidden", diagnostics.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("hidden", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(expectedCode, text, StringComparison.Ordinal);
+        Assert.Contains(
+            $"operation={ManagedEtabsVisibility.HideOperation}",
+            text,
+            StringComparison.Ordinal);
+        Assert.Contains(expectedDetail, text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Whether the startup hide CAUGHT a window is the fact the supervised live gate needs
+    /// and cannot reconstruct afterwards, so it is reported either way. "Already hidden"
+    /// means ETABS had not built its UI yet and any window will be caught later by the
+    /// session's second hide — a materially different outcome from this hide taking a
+    /// visible window down.
+    /// </summary>
+    [Theory]
+    [InlineData(true, "a window was already visible")]
+    [InlineData(false, "no window had appeared yet")]
+    public void LaunchReportsWhetherTheStartupHideCaughtAWindow(
+        bool visibleAfterStart,
+        string expectedPhrase)
+    {
+        var api = new FakeRawApi { VisibleAfterStart = visibleAfterStart };
+        var diagnostics = new StringWriter();
+        var launcher = new ManagedEtabsLauncher(
+            new FakeProcesses { AfterStart = [Identity] },
+            new FakeResolver(Identity.ExecutablePath),
+            new FakeApiFactory(api, []),
+            new FakeVersionProbe(),
+            diagnostics);
+
+        launcher.Launch();
+
+        Assert.Contains(expectedPhrase, diagnostics.ToString(), StringComparison.Ordinal);
+        Assert.False(api.IsVisible);
+        // Cardex: Hide on an already-hidden application returns an error, so the second row
+        // must not have called it at all.
+        Assert.Equal(visibleAfterStart ? 1 : 0, api.HideCalls);
     }
 
     [Fact]
@@ -482,8 +528,12 @@ public sealed class ManagedEtabsLauncherTests
     [Fact]
     public void RawApiBoundaryExposesLifecycleAndVisibilityAndNothingElse()
     {
-        var members = typeof(IEtabsRawApi).GetMembers()
-            .Concat(typeof(IEtabsVisibilityApi).GetMembers())
+        // Walks the real interface graph rather than a hand-written pair, so a future third
+        // base interface cannot smuggle members past a test whose entire claim is "nothing
+        // else". The version this replaced had the same blind spot.
+        var members = typeof(IEtabsRawApi).GetInterfaces()
+            .Append(typeof(IEtabsRawApi))
+            .SelectMany(contract => contract.GetMembers())
             .Select(member => member.Name)
             .Where(name => !name.StartsWith("get_", StringComparison.Ordinal))
             .Distinct(StringComparer.Ordinal)
@@ -583,6 +633,7 @@ public sealed class ManagedEtabsLauncherTests
         public Exception? OapiVersionException { get; set; }
         public int HideReturnCode { get; set; }
         public bool IgnoreHide { get; set; }
+        public bool VisibleAfterStart { get; set; } = true;
         public bool IsVisible { get; private set; }
         public int HideCalls { get; private set; }
         public int UnhideCalls { get; private set; }
@@ -601,9 +652,10 @@ public sealed class ManagedEtabsLauncherTests
             Events.Add("application-start");
             StartCount++;
             // Cardex documents no visibility argument on ApplicationStart and says nothing
-            // about the resulting state; the supervised RC1 run observed a window arriving.
-            // The fake reproduces the observed case, which is the one that matters.
-            IsVisible = true;
+            // about the resulting state. The supervised RC1 run observed a window arriving,
+            // which is the default here — but the timeline is equally consistent with the
+            // window not existing yet, so that case is expressible too.
+            IsVisible = VisibleAfterStart;
             return StartException is null ? StartReturnCode : throw StartException;
         }
 

@@ -26,9 +26,13 @@ namespace EtabExtension.CLI.Tests;
 /// and they scan the WHOLE production assembly rather than a list of known files. Per
 /// method matters here: <c>ServeDispatcher</c> hosts both intents, so a type-level rule
 /// could not tell "open-model reveals ETABS" from "snapshot-export reveals ETABS" —
-/// which is the one distinction the issue is about. The test project compiles the
-/// production sources directly, so the assembly inspected here is the code the sidecar
-/// ships.</para>
+/// which is the one distinction the issue is about.</para>
+///
+/// <para>What is actually inspected is <c>EtabExtension.CLI.Tests.dll</c>, built Debug
+/// from the same production sources the sidecar compiles (the test project includes
+/// <c>src/EtabExtension.CLI/**/*.cs</c>, excluding only <c>Program.cs</c>). It is not the
+/// shipped binary — a Release-only difference would not be seen here — but the call graph
+/// it carries is the same code, which is what these rules are about.</para>
 /// </summary>
 public sealed class EtabsVisibilityWiringTests
 {
@@ -58,12 +62,70 @@ public sealed class EtabsVisibilityWiringTests
     ];
 
     /// <summary>
-    /// The complete set of production methods allowed to ask the shared session to show
-    /// ETABS. One entry, and it is the explicit-open path.
+    /// Every seam through which ETABS can be put on screen — not just the one the
+    /// dispatcher happens to use today.
+    ///
+    /// <para>Keying this rule on a single string was a real hole, demonstrated rather than
+    /// imagined: <c>EnsureVisibleForExplicitUserAction</c> is public on
+    /// <see cref="IManagedEtabsApplication"/>, and every handler can obtain one from
+    /// <c>_session.GetOrStartOwned()</c>. A background command calling THAT reveals ETABS
+    /// with the entire suite green, and the CSI-owner rule cannot see it either because the
+    /// <c>Unhide</c> still happens inside allow-listed <c>EtabsRawApi</c>. The rule has to
+    /// name the whole chain — interface and implementation at each level — because reaching
+    /// any link of it is reaching the screen.</para>
+    /// </summary>
+    private static readonly string[] RevealSeams =
+    [
+        $"{typeof(IEtabsSession).FullName}.{nameof(IEtabsSession.RevealForExplicitUserRequest)}",
+        $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}",
+        $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.EnsureVisibleForExplicitUserAction),
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.EnsureVisibleForExplicitUserAction),
+        $"{typeof(ManagedEtabsVisibility).FullName}.{nameof(ManagedEtabsVisibility.EnsureVisible)}"
+    ];
+
+    /// <summary>
+    /// The mirror on the hide side. A background command that HIDES a window the user
+    /// explicitly asked for is the inverse regression, and it is expressible through
+    /// exactly the same public seams.
+    /// </summary>
+    private static readonly string[] HideSeams =
+    [
+        $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.EnsureHiddenForBackgroundWork),
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.EnsureHiddenForBackgroundWork),
+        $"{typeof(ManagedEtabsVisibility).FullName}.{nameof(ManagedEtabsVisibility.EnsureHidden)}"
+    ];
+
+    /// <summary>
+    /// The complete set of production methods allowed to touch a reveal seam: the intent
+    /// decision, then each link of the chain it delegates through. Anything else is a
+    /// command deciding on its own that ETABS should be on screen.
     /// </summary>
     private static readonly string[] RevealCallers =
     [
-        "EtabExtension.CLI.Features.Serve.ServeDispatcher.RevealAfterConfirmedOpen"
+        // The intent decision, and the only entry point.
+        "EtabExtension.CLI.Features.Serve.ServeDispatcher.RevealAfterConfirmedOpen",
+        // The chain it delegates through.
+        $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}",
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.EnsureVisibleForExplicitUserAction)
+    ];
+
+    /// <summary>
+    /// The complete set of production methods allowed to touch a hide seam. Both entry
+    /// points run only while a session is being created; nothing on a command path is
+    /// listed, and that absence is what makes reuse of a user-revealed session safe.
+    /// </summary>
+    private static readonly string[] HideCallers =
+    [
+        "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+            ".HideBeforeAnythingElseTouchesIt",
+        $"{typeof(EtabsSession).FullName}.ConfirmHiddenForBackgroundWork",
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.EnsureHiddenForBackgroundWork)
     ];
 
     /// <summary>
@@ -119,10 +181,9 @@ public sealed class EtabsVisibilityWiringTests
     public void TheManagedLaunchHidesTheApplicationItStarted()
     {
         Assert.True(
-            Reaches(
+            ReachesAny(
                 "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher.Launch",
-                $"{typeof(ManagedEtabsVisibility).FullName}." +
-                nameof(ManagedEtabsVisibility.EnsureHidden)),
+                HideSeams),
             "ManagedEtabsLauncher.Launch no longer hides the application it started. A managed " +
             "session exists to do background work; nothing may reach the screen between " +
             "ApplicationStart and an explicit user request.");
@@ -138,83 +199,159 @@ public sealed class EtabsVisibilityWiringTests
     public void TheSessionReAssertsHiddenBeforeHandingTheApplicationOut()
     {
         Assert.True(
-            Reaches(
-                "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.EtabsSession.GetOrStartOwned",
-                $"{typeof(IManagedEtabsApplication).FullName}." +
-                nameof(IManagedEtabsApplication.EnsureHiddenForBackgroundWork)),
+            ReachesAny(
+                $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.GetOrStartOwned)}",
+                HideSeams),
             "EtabsSession no longer confirms the managed application hidden before handing it " +
             "to a command.");
     }
 
     /// <summary>
+    /// Both hide sites must report whether they actually caught a window.
+    ///
+    /// <para>This is instrumentation, so no behavioral test can miss its removal — but it
+    /// is the one fact the supervised #20 run cannot reconstruct afterwards. The RC1
+    /// timeline is compatible with two very different outcomes: either
+    /// <c>ApplicationStart</c> returns with a window already up and the startup hide takes
+    /// it straight down, or the window does not exist yet, the startup hide finds nothing,
+    /// and the session's hide only acts after <c>InitializeNewModel</c> — leaving ETABS on
+    /// screen for the seconds in between. Reading <c>Changed</c> at both sites is what
+    /// tells those apart.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(
+        "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+        ".HideBeforeAnythingElseTouchesIt")]
+    [InlineData(
+        "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.EtabsSession" +
+        ".ConfirmHiddenForBackgroundWork")]
+    public void EachHideSiteReportsWhetherItCaughtAWindow(string hideSite)
+    {
+        var calls = Calls(hideSite);
+
+        Assert.Contains(
+            $"{typeof(ManagedEtabsVisibilityOutcome).FullName}." +
+            $"get_{nameof(ManagedEtabsVisibilityOutcome.Changed)}",
+            calls,
+            StringComparer.Ordinal);
+        Assert.Contains("System.IO.TextWriter.WriteLine", calls, StringComparer.Ordinal);
+    }
+
+    /// <summary>
     /// The acceptance criterion — "focused tests … fail if the two intents collapse to one
-    /// behavior" — stated over the compiled assembly. Any method other than the explicit
-    /// open path asking for a reveal fails here, including a sibling dispatch method that
-    /// looks harmless in review.
+    /// behavior" — stated over the compiled assembly. Any method outside the declared chain
+    /// touching ANY reveal seam fails here, including a sibling dispatch method that looks
+    /// harmless in review.
     /// </summary>
     [Fact]
     public void OnlyTheExplicitOpenPathAsksForEtabsToBeShown()
     {
-        var reveal = $"{typeof(IEtabsSession).FullName}." +
-            nameof(IEtabsSession.RevealForExplicitUserRequest);
-
-        var offenders = ProductionCalls
-            .Where(method => method.Value.Contains(reveal, StringComparer.Ordinal))
-            .Select(method => method.Key)
-            .Where(name => !RevealCallers.Contains(name, StringComparer.Ordinal))
-            .Order(StringComparer.Ordinal)
-            .ToArray();
+        var offenders = OffendersAgainst(RevealSeams, RevealCallers);
 
         Assert.True(
             offenders.Length == 0,
-            $"These methods ask the shared session to show ETABS: {string.Join(", ", offenders)}. " +
-            "Only the explicit open-model path may, and only after the requested model is " +
-            "confirmed open. A background command that reveals ETABS is the CLI #22 defect.");
+            $"These methods can put ETABS on screen: {string.Join(", ", offenders)}. Only the " +
+            "explicit open-model path may, and only after the requested model is confirmed " +
+            "open. A background command that reveals ETABS is the CLI #22 defect.");
     }
 
     /// <summary>
-    /// The other direction: the allow-listed caller must actually make the call, so the
-    /// list cannot silently describe a path that no longer reveals anything, and the
-    /// open-model handler must actually reach it.
+    /// The inverse regression, guarded identically. A command that hides the window an
+    /// engineer explicitly opened is just as wrong as one that shows a window nobody asked
+    /// for, and it is expressible through the same public seams.
+    /// </summary>
+    [Fact]
+    public void OnlyTheSessionCreationPathHidesEtabs()
+    {
+        var offenders = OffendersAgainst(HideSeams, HideCallers);
+
+        Assert.True(
+            offenders.Length == 0,
+            $"These methods can hide ETABS: {string.Join(", ", offenders)}. Hiding happens only " +
+            "while a session is being created, before any command can hold it. A command that " +
+            "hides would yank away a window the user explicitly opened.");
+    }
+
+    /// <summary>
+    /// The other direction: every allow-listed caller must actually touch a seam, so neither
+    /// list can silently describe a path that no longer does anything, and the open-model
+    /// handler must actually reach the reveal.
     /// </summary>
     [Fact]
     public void TheExplicitOpenPathReallyDoesRevealAndIsReachedFromTheOpenDispatch()
     {
-        var reveal = $"{typeof(IEtabsSession).FullName}." +
-            nameof(IEtabsSession.RevealForExplicitUserRequest);
-
         Assert.All(
             RevealCallers,
-            caller => Assert.Contains(reveal, Calls(caller), StringComparer.Ordinal));
+            caller => Assert.Contains(
+                Calls(caller),
+                call => RevealSeams.Contains(call, StringComparer.Ordinal)));
+        Assert.All(
+            HideCallers,
+            caller => Assert.Contains(
+                Calls(caller),
+                call => HideSeams.Contains(call, StringComparer.Ordinal)));
         Assert.True(
-            Reaches($"{typeof(ServeDispatcher).FullName}.{OpenDispatch}", reveal),
+            ReachesAny($"{typeof(ServeDispatcher).FullName}.{OpenDispatch}", RevealSeams),
             "open-model no longer ends with ETABS visible.");
     }
 
     /// <summary>
     /// The acceptance criterion in its sharpest form. <c>ServeDispatcher</c> hosts every
-    /// command, so this walks its dispatch handlers and requires that exactly one of them
-    /// — the explicit open — can reach the reveal at all. Collapsing the two intents, in
-    /// either direction, fails here.
+    /// command, so this walks its dispatch handlers and requires that exactly one of them —
+    /// the explicit open — can reach a reveal seam at all, and that none of them can reach a
+    /// hide seam. Collapsing the two intents, in either direction, fails here.
+    ///
+    /// <para>The handler list comes from reflection and is compared for EQUALITY, not
+    /// counted. A scanner regression that dropped every async handler still left nine
+    /// non-async ones behind — enough to sail through a "found more than a few" canary while
+    /// silently exempting the one handler this issue is about.</para>
     /// </summary>
     [Fact]
-    public void ExactlyOneDispatchHandlerCanEverPutEtabsOnScreen()
+    public void ExactlyOneDispatchHandlerCanEverPutEtabsOnScreenAndNoneCanHideIt()
     {
-        var reveal = $"{typeof(IEtabsSession).FullName}." +
-            nameof(IEtabsSession.RevealForExplicitUserRequest);
-        var dispatchHandlers = ProductionCalls.Keys
-            .Where(name => name.StartsWith($"{typeof(ServeDispatcher).FullName}.Dispatch", StringComparison.Ordinal))
+        // Public as well as private: the public DispatchAsync router is named Dispatch* and
+        // shows up in the IL scan, so excluding it here would make the two sides disagree
+        // for a reason that has nothing to do with visibility. It routes through a delegate
+        // table, so it reaches no seam of its own — and that is worth asserting, not hiding.
+        var expected = typeof(ServeDispatcher)
+            .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .Select(method => method.Name)
+            .Where(name => name.StartsWith("Dispatch", StringComparison.Ordinal))
+            .Select(name => $"{typeof(ServeDispatcher).FullName}.{name}")
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        var scanned = ProductionCalls.Keys
+            .Where(name => name.StartsWith(
+                $"{typeof(ServeDispatcher).FullName}.Dispatch",
+                StringComparison.Ordinal))
             .Order(StringComparer.Ordinal)
             .ToArray();
 
-        Assert.True(dispatchHandlers.Length > 5, "The dispatch-handler scan found almost nothing.");
+        // The scan must see every declared handler. If it ever sees fewer, the rules below
+        // are quietly exempting whichever ones went missing.
+        Assert.Equal(expected, scanned);
 
-        var revealing = dispatchHandlers.Where(handler => Reaches(handler, reveal)).ToArray();
-
-        Assert.Equal([$"{typeof(ServeDispatcher).FullName}.{OpenDispatch}"], revealing);
+        Assert.Equal(
+            [$"{typeof(ServeDispatcher).FullName}.{OpenDispatch}"],
+            scanned.Where(handler => ReachesAny(handler, RevealSeams)).ToArray());
+        Assert.Equal(
+            [],
+            scanned.Where(handler => ReachesAny(handler, HideSeams)).ToArray());
     }
 
     private const string OpenDispatch = "DispatchOpenModelAsync";
+
+    /// <summary>
+    /// Every production method that touches one of <paramref name="seams"/> directly and is
+    /// not on <paramref name="allowed"/>.
+    /// </summary>
+    private static string[] OffendersAgainst(string[] seams, string[] allowed) => ProductionCalls
+        .Where(method => method.Value.Any(call => seams.Contains(call, StringComparer.Ordinal)))
+        .Select(method => method.Key)
+        .Where(name => !allowed.Contains(name, StringComparer.Ordinal))
+        .Order(StringComparer.Ordinal)
+        .ToArray();
 
     private static IReadOnlyList<string> Calls(string methodFullName)
     {
@@ -225,12 +362,12 @@ public sealed class EtabsVisibilityWiringTests
     }
 
     /// <summary>
-    /// Whether <paramref name="target"/> is callable from <paramref name="from"/> through
-    /// production code. Transitive on purpose: moving a call one helper deeper is the
-    /// cheapest way to slip past a direct-call assertion, and it changes nothing about what
-    /// the daemon actually does.
+    /// Whether any of <paramref name="targets"/> is callable from <paramref name="from"/>
+    /// through production code. Transitive on purpose: moving a call one helper deeper is
+    /// the cheapest way to slip past a direct-call assertion, and it changes nothing about
+    /// what the daemon actually does.
     /// </summary>
-    private static bool Reaches(string from, string target)
+    private static bool ReachesAny(string from, string[] targets)
     {
         Assert.True(
             ProductionCalls.ContainsKey(from),
@@ -243,7 +380,7 @@ public sealed class EtabsVisibilityWiringTests
         {
             foreach (var call in ProductionCalls[pending.Dequeue()])
             {
-                if (string.Equals(call, target, StringComparison.Ordinal))
+                if (targets.Contains(call, StringComparer.Ordinal))
                 {
                     return true;
                 }
