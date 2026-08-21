@@ -18,6 +18,14 @@ public static class EtabsLaunchErrorCodes
     public const string ProcessIdentityFailed = "ETABS_PROCESS_IDENTITY_FAILED";
     public const string ExternalOrAmbiguousInstance = "ETABS_EXTERNAL_OR_AMBIGUOUS_INSTANCE";
     public const string ModelInitializationFailed = "ETABS_MODEL_INITIALIZATION_FAILED";
+
+    /// <summary>
+    /// The managed session could not be proven hidden, so it must not be handed to a
+    /// background command at all. Warning and continuing was the RC policy; the #20
+    /// supervised certification measured a materially visible ETABS window through it
+    /// and rejected the candidate for it.
+    /// </summary>
+    public const string HiddenStateNotEstablished = "ETABS_HIDDEN_STATE_NOT_ESTABLISHED";
     public const string RecoveryRecordWriteFailed = "ETABS_RECOVERY_RECORD_WRITE_FAILED";
 }
 
@@ -403,6 +411,22 @@ public interface IManagedEtabsApplication
     /// </summary>
     ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction();
 
+    /// <summary>
+    /// Permanently ends the Windows startup window suppression for this session and puts
+    /// back exactly the windows it hid, because the USER asked to see ETABS.
+    ///
+    /// <para>Called once, from the explicit reveal, and only after the requested model is
+    /// confirmed open. There is no counterpart: the guard cannot be re-armed, which is
+    /// what makes a later background command reusing this session safe.</para>
+    /// </summary>
+    void ReleaseWindowGuardForExplicitUserAction();
+
+    /// <summary>
+    /// Deterministic teardown of the window guard on the shutdown path. Restores nothing —
+    /// a session being torn down must not flash a window on its way out.
+    /// </summary>
+    void DisposeWindowGuard();
+
     bool HasExited { get; }
     bool WaitForExit(TimeSpan timeout);
     void Kill();
@@ -421,6 +445,8 @@ public sealed class ManagedEtabsApplication(
     ManagedProcessIdentity identity,
     Guid launchRecordId,
     IOwnedEtabsProcess ownedProcess,
+    IManagedEtabsWindowGuard windowGuard,
+    ManagedEtabsVisibilityPolicy visibility,
     ManagedEtabsApiVersion version) : IManagedEtabsApplication
 {
     public ETABSApplication Application => rawApi.Application;
@@ -434,11 +460,18 @@ public sealed class ManagedEtabsApplication(
 
     /// <inheritdoc />
     public ManagedEtabsVisibilityOutcome EnsureHiddenForBackgroundWork() =>
-        ManagedEtabsVisibility.EnsureHidden(rawApi);
+        ManagedEtabsVisibility.EnsureHidden(rawApi, visibility);
 
     /// <inheritdoc />
     public ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction() =>
-        ManagedEtabsVisibility.EnsureVisible(rawApi);
+        ManagedEtabsVisibility.EnsureVisible(rawApi, visibility);
+
+    /// <inheritdoc />
+    public void ReleaseWindowGuardForExplicitUserAction() =>
+        windowGuard.ReleaseForExplicitUserAction();
+
+    /// <inheritdoc />
+    public void DisposeWindowGuard() => windowGuard.Dispose();
 
     /// <summary>Wraps the same started object once initialization has returned zero.</summary>
     public void CompleteApiReadiness() => rawApi.CompleteApiReadiness(

@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using EtabExtension.CLI.Shared.Common;
 using EtabSharp.Core;
 
@@ -29,6 +30,14 @@ public sealed class EtabsSession : IEtabsSession
     private readonly IProcessInspector _processes;
     private readonly ISessionRecordStore _records;
     private readonly IManagedEtabsShutdownMachine _shutdownMachine;
+
+    // Borrowed, never owned: this is Console.Error in production and a test's buffer under
+    // test, so the session must not close it when it disposes.
+    [SuppressMessage(
+        "Usage",
+        "CA2213:Disposable fields should be disposed",
+        Justification = "The diagnostics writer is owned by the caller, not by the session.")]
+    private readonly TextWriter _diagnostics;
     private readonly object _gate = new();
     private IManagedEtabsApplication? _owned;
     private bool _ready;
@@ -48,11 +57,22 @@ public sealed class EtabsSession : IEtabsSession
         IProcessInspector processes,
         ISessionRecordStore records,
         IManagedEtabsShutdownMachine shutdownMachine)
+        : this(launcher, processes, records, shutdownMachine, Console.Error)
+    {
+    }
+
+    internal EtabsSession(
+        IManagedEtabsLauncher launcher,
+        IProcessInspector processes,
+        ISessionRecordStore records,
+        IManagedEtabsShutdownMachine shutdownMachine,
+        TextWriter diagnostics)
     {
         _launcher = launcher;
         _processes = processes;
         _records = records;
         _shutdownMachine = shutdownMachine;
+        _diagnostics = diagnostics;
     }
 
     public bool IsStarted
@@ -86,7 +106,7 @@ public sealed class EtabsSession : IEtabsSession
 
             if (_owned is null)
             {
-                Console.Error.WriteLine("ℹ Starting ETABS (shared serve session)...");
+                _diagnostics.WriteLine("ℹ Starting ETABS (shared serve session)...");
                 var launched = Launch();
                 _owned = launched;
                 try
@@ -114,9 +134,15 @@ public sealed class EtabsSession : IEtabsSession
                     throw _launchFailure;
                 }
 
-                var initializationFailure = Initialize(launched)
-                    ?? CompleteReadiness(launched);
-                if (initializationFailure is not null)
+                // Readiness and hidden state are one gate, not two. The candidate #20
+                // rejected treated the hide as advisory and printed a "started hidden"
+                // success line straight after failing to confirm it; here an unconfirmed
+                // hidden state ends the session on the same path a failed
+                // InitializeNewModel does, so that line can only ever follow a proof.
+                var creationFailure = Initialize(launched)
+                    ?? CompleteReadiness(launched)
+                    ?? ConfirmHiddenForBackgroundWork(launched);
+                if (creationFailure is not null)
                 {
                     var cleanup = _shutdownMachine.Shutdown(launched);
                     _shutdownResult = cleanup;
@@ -126,17 +152,16 @@ public sealed class EtabsSession : IEtabsSession
                     }
                     _ready = false;
                     _launchFailure = new EtabsLaunchException(
-                        EtabsLaunchErrorCodes.ModelInitializationFailed,
+                        creationFailure.Value.Code,
                         WithTerminalFacts(
-                            initializationFailure.Value.Diagnostic,
+                            creationFailure.Value.Diagnostic,
                             cleanup),
-                        initializationFailure.Value.Exception);
+                        creationFailure.Value.Exception);
                     throw _launchFailure;
                 }
 
-                ConfirmHiddenForBackgroundWork(launched);
                 _ready = true;
-                Console.Error.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
+                _diagnostics.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
             }
 
             try
@@ -191,7 +216,7 @@ public sealed class EtabsSession : IEtabsSession
     /// zero. A wrap failure is a launch failure: the session must not be exposed holding a
     /// handle nothing can use.
     /// </summary>
-    private static (string Diagnostic, Exception? Exception)? CompleteReadiness(
+    private static (string Code, string Diagnostic, Exception? Exception)? CompleteReadiness(
         IManagedEtabsApplication owned)
     {
         try
@@ -201,13 +226,16 @@ public sealed class EtabsSession : IEtabsSession
         }
         catch (Exception exception)
         {
-            return (EtabsApiDiagnosticFormatter.InfrastructureException(
-                "ETABSWrapper.WrapExisting",
-                exception), exception);
+            return (
+                EtabsLaunchErrorCodes.ModelInitializationFailed,
+                EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "ETABSWrapper.WrapExisting",
+                    exception),
+                exception);
         }
     }
 
-    private static (string Diagnostic, Exception? Exception)? Initialize(
+    private static (string Code, string Diagnostic, Exception? Exception)? Initialize(
         IManagedEtabsApplication owned)
     {
         try
@@ -215,15 +243,21 @@ public sealed class EtabsSession : IEtabsSession
             var returnCode = owned.InitializeNewModel();
             return returnCode == 0
                 ? null
-                : (EtabsApiDiagnosticFormatter.ApiReturn(
-                    "cSapModel.InitializeNewModel",
-                    returnCode), null);
+                : (
+                    EtabsLaunchErrorCodes.ModelInitializationFailed,
+                    EtabsApiDiagnosticFormatter.ApiReturn(
+                        "cSapModel.InitializeNewModel",
+                        returnCode),
+                    (Exception?)null);
         }
         catch (Exception exception)
         {
-            return (EtabsApiDiagnosticFormatter.Exception(
-                "cSapModel.InitializeNewModel",
-                exception), exception);
+            return (
+                EtabsLaunchErrorCodes.ModelInitializationFailed,
+                EtabsApiDiagnosticFormatter.Exception(
+                    "cSapModel.InitializeNewModel",
+                    exception),
+                exception);
         }
     }
 
@@ -257,39 +291,41 @@ public sealed class EtabsSession : IEtabsSession
     /// exists, and still before the application is handed to any command.
     ///
     /// <para>The launcher already hid the application at <c>ApplicationStart</c>. This is
-    /// not redundant: the RC1 timeline shows the window becoming visible at +8.5 s and
-    /// only reporting <c>(Untitled)</c> at +14.8 s, so ETABS finishes building its UI well
-    /// after the start call returns — and Cardex documents nothing about when. A second
-    /// read costs one CSI call and covers the case where the first hide found nothing to
-    /// hide.</para>
+    /// not redundant: ETABS finishes building its UI well after the start call returns —
+    /// the #20 timeline shows the window arriving 5.15 s after process creation — and
+    /// Cardex documents nothing about when. A second read costs one CSI call and covers
+    /// the case where the first hide found nothing to hide.</para>
     ///
-    /// <para>It closes that gap only in the sense that the window is down BY THIS POINT.
-    /// If the first hide reported nothing to hide and this one did the work, ETABS was on
-    /// screen for the interval between them — the reason both sites log which of them
-    /// acted, so the supervised live run can measure the residual instead of guessing.</para>
+    /// <para><b>Failure is terminal.</b> An unconfirmed hidden state returns a launch
+    /// failure rather than a warning, and the caller tears the session down through the
+    /// same cleanup a failed initialization uses — the authoritative owned process is
+    /// exited, not left running with an unproven window. Warning and continuing is exactly
+    /// what #20 measured and rejected.</para>
     ///
     /// <para>It runs ONLY while the session is being created. That is the whole reason a
     /// background command can safely reuse a session the user asked to see: nothing on the
     /// command path ever hides anything.</para>
     /// </summary>
-    private static void ConfirmHiddenForBackgroundWork(IManagedEtabsApplication owned)
+    private (string Code, string Diagnostic, Exception? Exception)? ConfirmHiddenForBackgroundWork(
+        IManagedEtabsApplication owned)
     {
         var outcome = owned.EnsureHiddenForBackgroundWork();
         if (!outcome.Confirmed)
         {
-            Console.Error.WriteLine(
-                "⚠ Managed ETABS could not be confirmed hidden before use; a window may be " +
-                $"visible during background work. {outcome.Diagnostic}");
-            return;
+            return (
+                EtabsLaunchErrorCodes.HiddenStateNotEstablished,
+                outcome.Diagnostic
+                    ?? "Managed ETABS could not be confirmed hidden before use.",
+                (Exception?)null);
         }
 
-        // Paired with the launcher's line, this says which of the two hides did the work.
-        // "Changed" here means the window only appeared during InitializeNewModel, so it
-        // was on screen for the seconds in between — a residual no test can observe and
-        // the one thing the #20 live gate cannot reconstruct afterwards.
-        Console.Error.WriteLine(outcome.Changed
-            ? "ℹ ETABS hidden before use (a window appeared during model initialization)."
+        // Paired with the launcher's line, this says which of the two hides did the work
+        // and how hard CSI had to be waited on for it.
+        _diagnostics.WriteLine(outcome.Changed
+            ? "ℹ ETABS hidden before use (a window appeared during model initialization; " +
+                $"reads={outcome.Reads}, waitedMs={(long)outcome.Waited.TotalMilliseconds})."
             : "ℹ ETABS was already hidden before use.");
+        return null;
     }
 
     /// <inheritdoc />
@@ -298,6 +334,15 @@ public sealed class EtabsSession : IEtabsSession
         lock (_gate)
         {
             var owned = GetOrStartOwned();
+
+            // Order is the contract. The caller has already confirmed the requested model
+            // is open; the background window suppression is retired FIRST — permanently,
+            // and putting back exactly the windows it hid — and only then is the CSI
+            // visible transition issued. Releasing after the transition would leave the
+            // guard free to take the engineer's window straight back down, and there is no
+            // path that re-arms it afterwards.
+            owned.ReleaseWindowGuardForExplicitUserAction();
+
             var outcome = owned.EnsureVisibleForExplicitUserAction();
             if (!outcome.Confirmed)
             {
@@ -307,7 +352,7 @@ public sealed class EtabsSession : IEtabsSession
 
             if (outcome.Changed)
             {
-                Console.Error.WriteLine($"✓ ETABS shown (PID {owned.Identity.Pid})");
+                _diagnostics.WriteLine($"✓ ETABS shown (PID {owned.Identity.Pid})");
             }
 
             return Result.Ok();
@@ -338,7 +383,7 @@ public sealed class EtabsSession : IEtabsSession
                 _owned = null;
             }
             _ready = false;
-            Console.Error.WriteLine("ℹ Shared ETABS session shut down.");
+            _diagnostics.WriteLine("ℹ Shared ETABS session shut down.");
             return _shutdownResult;
         }
     }

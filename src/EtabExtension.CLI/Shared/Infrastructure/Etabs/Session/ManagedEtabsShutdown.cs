@@ -57,6 +57,14 @@ public sealed class ManagedEtabsShutdownMachine(
     {
         ArgumentNullException.ThrowIfNull(owned);
 
+        // Deterministic, unconditional, and first. Every route into shutdown — graceful,
+        // forced, identity-mismatched, or a session that had already exited — retires the
+        // Windows window suppression before anything else is attempted, so no sweep thread
+        // outlives the session it was created for and nothing can be suppressed against a
+        // pid that is about to go back to the OS. Disposal restores nothing: a process on
+        // its way out must not flash a window.
+        owned.DisposeWindowGuard();
+
         var record = records.Read();
         var recordMatchesOwned = IdentityMatches(record, owned);
 

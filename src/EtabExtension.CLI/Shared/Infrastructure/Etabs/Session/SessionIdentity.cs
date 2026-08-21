@@ -420,11 +420,30 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 {
     public static readonly TimeSpan ForcedExitTimeout = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// How long the exact-ownership census is given to resolve after
+    /// <c>cHelper.CreateObject</c> started the program.
+    ///
+    /// <para>The census used to run after <c>ApplicationStart</c>, by which point the new
+    /// process had long been enumerable. It now runs immediately after creation — the
+    /// earliest point at which exact ownership can exist at all — and a process that has
+    /// only just been created can briefly refuse to report its main module. That is a
+    /// transient, not an ambiguity, so it is waited out rather than trusted or feared:
+    /// anything still unresolved at the deadline fails closed exactly as before.</para>
+    /// </summary>
+    public static readonly TimeSpan OwnershipCensusDeadline = TimeSpan.FromSeconds(5);
+
+    /// <summary>How often the ownership census is retried while it is still unresolved.</summary>
+    public static readonly TimeSpan OwnershipCensusPollInterval = TimeSpan.FromMilliseconds(25);
+
     private readonly IProcessInspector _processes;
     private readonly IEtabsExecutableResolver _executableResolver;
     private readonly IEtabsRawApiFactory _apiFactory;
     private readonly IEtabsVersionProbe _versionProbe;
     private readonly TextWriter _diagnostics;
+    private readonly IManagedEtabsWindowGuardFactory _windowGuards;
+    private readonly IManagedEtabsClock _clock;
+    private readonly ManagedEtabsVisibilityPolicy _visibility;
 
     public ManagedEtabsLauncher(
         IProcessInspector processes,
@@ -442,14 +461,38 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         IEtabsExecutableResolver executableResolver,
         IEtabsRawApiFactory apiFactory,
         IEtabsVersionProbe versionProbe,
-        TextWriter diagnostics)
+        TextWriter diagnostics) : this(
+            processes,
+            executableResolver,
+            apiFactory,
+            versionProbe,
+            diagnostics,
+            WindowsManagedEtabsWindowGuardFactory.Instance,
+            SystemManagedEtabsClock.Instance)
+    {
+    }
+
+    public ManagedEtabsLauncher(
+        IProcessInspector processes,
+        IEtabsExecutableResolver executableResolver,
+        IEtabsRawApiFactory apiFactory,
+        IEtabsVersionProbe versionProbe,
+        TextWriter diagnostics,
+        IManagedEtabsWindowGuardFactory windowGuards,
+        IManagedEtabsClock clock)
     {
         _processes = processes;
         _executableResolver = executableResolver;
         _apiFactory = apiFactory;
         _versionProbe = versionProbe;
         _diagnostics = diagnostics;
+        _windowGuards = windowGuards;
+        _clock = clock;
+        _visibility = ManagedEtabsVisibilityPolicy.Default with { Clock = clock };
     }
+
+    /// <summary>The convergence policy this launcher hands to the session it creates.</summary>
+    internal ManagedEtabsVisibilityPolicy VisibilityPolicy => _visibility;
 
     public IManagedEtabsApplication Launch()
     {
@@ -461,13 +504,15 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         // every exit path from here must resolve it.
         IEtabsRawApi? rawApi = null;
         IOwnedEtabsProcess? ownedProcess = null;
+        IManagedEtabsWindowGuard? windowGuard = null;
         try
         {
             rawApi = _apiFactory.CreateFromExecutable(executablePath);
-            StartApplication(rawApi);
-            HideBeforeAnythingElseTouchesIt(rawApi);
-            RequireSapModel(rawApi);
 
+            // Ownership first, and as early as CreateObject makes it possible. Preflight
+            // proved zero ETABS processes and CreateObject started exactly one, so this
+            // census is what turns "a process exists" into "this exact process is ours" —
+            // and nothing may be suppressed before that is true.
             var identity = CensusExactlyOneOwnedProcess();
             ownedProcess = _processes.OpenExact(identity)
                 ?? throw new EtabsLaunchException(
@@ -475,17 +520,28 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                     "Could not open an authoritative handle on the started ETABS process " +
                     $"pid={identity.Pid}; its live identity no longer matches the census.");
 
+            // Then, and only then, hold that exact process's windows down — before the
+            // blocking startup work the #20 live run measured a visible window through.
+            windowGuard = ActivateWindowGuard(ownedProcess);
+
+            StartApplication(rawApi);
+            HideBeforeAnythingElseTouchesIt(rawApi);
+            RequireSapModel(rawApi);
+
             var version = ReadVersion(identity.ExecutablePath);
             var managed = new ManagedEtabsApplication(
                 rawApi,
                 identity,
                 Guid.NewGuid(),
                 ownedProcess,
+                windowGuard,
+                _visibility,
                 new ManagedEtabsApiVersion(
                     version.MajorVersion,
                     ReadApiVersion(rawApi),
                     version.FullVersion));
             ownedProcess = null; // ownership transferred to the managed application
+            windowGuard = null;  // and with it the guard's lifetime
             return managed;
         }
         catch (Exception failure)
@@ -494,7 +550,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             // process this attempt started may still be alive with no recovery record to
             // describe it, and the session uses that to refuse both a relaunch and a clean
             // shutdown answer later.
-            var cleanup = CleanUpFailedStart(rawApi, ownedProcess);
+            var cleanup = CleanUpFailedStart(rawApi, ownedProcess, windowGuard);
             var code = failure is EtabsLaunchException typed
                 ? typed.Code
                 : EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance;
@@ -543,35 +599,59 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     }
 
     /// <summary>
-    /// Puts the just-started application into the background-work state, before the
-    /// census, the version probe, the recovery record, or <c>InitializeNewModel</c> — the
-    /// earliest point at which there is an application to hide at all.
+    /// Activates Windows-level suppression of the exact owned process's windows, for the
+    /// whole of the background life of the session it is about to create.
     ///
-    /// <para>Deliberately NOT a launch failure. Startup readiness, identity and recovery
-    /// semantics are unchanged by CLI #22: an ETABS that refuses to hide is still a
-    /// working ETABS, and failing Commit outright over a window would cost the engineer
-    /// more than the window does. The failure is reported on stderr with the CSI operation
-    /// named, so a live run says which call disagreed.</para>
+    /// <para>This is the layer the #20 certification proved was missing. The CSI hide below
+    /// is still the authoritative transition, but it cannot run until
+    /// <c>ApplicationStart</c> returns, and the supervised run measured ETABS on screen for
+    /// 5.19 s inside that call. Suppression is therefore armed first — against the process
+    /// this launcher has already proven it owns, never against "an ETABS window".</para>
+    ///
+    /// <para>Not defended against failure on purpose: an exception here escapes into the
+    /// launch cleanup envelope and fails the session, because a background session that
+    /// cannot suppress its own window is the exact condition #20 rejected.</para>
+    /// </summary>
+    private IManagedEtabsWindowGuard ActivateWindowGuard(IOwnedEtabsProcess ownedProcess)
+    {
+        var guard = _windowGuards.Activate(ownedProcess);
+        _diagnostics.WriteLine(
+            "ℹ ETABS window suppression armed for owned " +
+            $"pid={ownedProcess.Identity.Pid} (released only by an explicit open-model).");
+        return guard;
+    }
+
+    /// <summary>
+    /// Puts the just-started application into the background-work state, immediately after
+    /// <c>ApplicationStart</c> returns and before the version probe, the recovery record,
+    /// or <c>InitializeNewModel</c>.
+    ///
+    /// <para><b>Now a launch failure.</b> It used to warn and continue, on the reasoning
+    /// that an ETABS which refuses to hide is still a working ETABS. The supervised #20
+    /// certification measured what that policy costs — a materially visible window for
+    /// 5.19 s of a background run, and a "started hidden" success line printed straight
+    /// after two "not confirmed" warnings — and rejected the candidate for it. An unproven
+    /// hidden state now ends the session instead, and the launch cleanup envelope
+    /// terminates the exact owned process it started.</para>
     /// </summary>
     private void HideBeforeAnythingElseTouchesIt(IEtabsRawApi rawApi)
     {
-        var outcome = ManagedEtabsVisibility.EnsureHidden(rawApi);
+        var outcome = ManagedEtabsVisibility.EnsureHidden(rawApi, _visibility);
         if (!outcome.Confirmed)
         {
-            _diagnostics.WriteLine(
-                "⚠ Managed ETABS could not be confirmed hidden at startup; a window may be " +
-                $"visible during background work. {outcome.Diagnostic}");
-            return;
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.HiddenStateNotEstablished,
+                outcome.Diagnostic
+                    ?? "Managed ETABS could not be confirmed hidden at startup.");
         }
 
-        // Whether this hide CAUGHT anything is the fact the live gate needs, and it is not
-        // recoverable after the fact. "Changed" means ApplicationStart had already put a
-        // window up and this call took it down — the RC1 symptom, closed here. "Already
-        // hidden" means ETABS had not built its UI yet, so any window that does appear is
-        // caught by the session's second hide instead, roughly six seconds later. Both
-        // outcomes end hidden; only this line says which one happened.
+        // Whether this hide CAUGHT anything, and how long CSI took to agree, are the facts
+        // the live gate needs and cannot reconstruct afterwards. "Changed" means
+        // ApplicationStart had already put a window up and this call took it down; the read
+        // count and wait say whether CSI applied it immediately or had to be waited out.
         _diagnostics.WriteLine(outcome.Changed
-            ? "ℹ ETABS hidden at startup (a window was already visible)."
+            ? "ℹ ETABS hidden at startup (a window was already visible; " +
+                $"reads={outcome.Reads}, waitedMs={(long)outcome.Waited.TotalMilliseconds})."
             : "ℹ ETABS was already hidden at startup (no window had appeared yet).");
     }
 
@@ -664,38 +744,55 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     /// <summary>
     /// Preflight proved zero ETABS processes, so exactly one identified process after
     /// CreateObject is ours by construction. Anything else — none, several, or one that
-    /// could not be identified — fails closed.
+    /// could not be identified — fails closed once the bounded settle deadline is spent.
+    ///
+    /// <para>The wait exists only because this census moved: it now runs immediately after
+    /// <c>CreateObject</c> rather than after <c>ApplicationStart</c>, so that the window
+    /// guard can be armed before the blocking startup work. A process seconds younger can
+    /// still be mid-initialization and refuse to report its main module, which reads as
+    /// "unidentified" and is a transient. It is never resolved OPTIMISTICALLY: only an
+    /// observation of exactly one identified process and nothing unidentified ends the
+    /// loop, and the deadline raises the same typed refusal this method always did.</para>
     /// </summary>
     private ManagedProcessIdentity CensusExactlyOneOwnedProcess()
     {
-        EtabsProcessObservation observation;
-        try
+        var started = _clock.UtcNow;
+        while (true)
         {
-            observation = _processes.ObserveEtabs();
-        }
-        catch (Exception ex)
-        {
-            throw new EtabsLaunchException(
-                EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
-                $"Could not verify exclusive ownership after starting managed ETABS: {ex.Message}",
-                ex);
-        }
+            EtabsProcessObservation observation;
+            try
+            {
+                observation = _processes.ObserveEtabs();
+            }
+            catch (Exception ex)
+            {
+                throw new EtabsLaunchException(
+                    EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+                    $"Could not verify exclusive ownership after starting managed ETABS: {ex.Message}",
+                    ex);
+            }
 
-        if (observation.UnidentifiedCount == 0 && observation.Identified.Count == 1)
-        {
-            return observation.Identified[0];
-        }
+            if (observation.UnidentifiedCount == 0 && observation.Identified.Count == 1)
+            {
+                return observation.Identified[0];
+            }
 
-        var pids = observation.Identified
-            .Select(identity => identity.Pid)
-            .Distinct()
-            .Order()
-            .ToList();
-        throw new EtabsLaunchException(
-            EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
-            "Managed ETABS did not resolve to exactly one owned process: " +
-            $"observedPids=[{string.Join(", ", pids)}], " +
-            $"unidentifiedCount={observation.UnidentifiedCount}.");
+            if (_clock.UtcNow - started >= OwnershipCensusDeadline)
+            {
+                var pids = observation.Identified
+                    .Select(identity => identity.Pid)
+                    .Distinct()
+                    .Order()
+                    .ToList();
+                throw new EtabsLaunchException(
+                    EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance,
+                    "Managed ETABS did not resolve to exactly one owned process: " +
+                    $"observedPids=[{string.Join(", ", pids)}], " +
+                    $"unidentifiedCount={observation.UnidentifiedCount}.");
+            }
+
+            _clock.Wait(OwnershipCensusPollInterval);
+        }
     }
 
     /// <summary>
@@ -717,8 +814,12 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 
     private ManagedEtabsShutdownResult CleanUpFailedStart(
         IEtabsRawApi? rawApi,
-        IOwnedEtabsProcess? ownedProcess)
+        IOwnedEtabsProcess? ownedProcess,
+        IManagedEtabsWindowGuard? windowGuard)
     {
+        // Stop suppressing before anything is asked to exit, and restore nothing: a failed
+        // start must not put a window on screen on its way out.
+        windowGuard?.Dispose();
         var applicationExitReturnCode = RequestRawExit(rawApi);
 
         return ownedProcess is not null
