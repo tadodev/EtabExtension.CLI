@@ -83,31 +83,33 @@ public sealed class ManagedSessionTests
                 "record-write",
                 "initialize",
                 "wrap-existing",
-                // Re-asserted hidden after InitializeNewModel — the call that puts the
+                // Re-proven suppressed after InitializeNewModel — the call that puts the
                 // blank (Untitled) model behind the window — and still before the session
-                // is handed to any command.
-                "ensure-hidden"
+                // is handed to any command. The proof is the exact-owned Windows census,
+                // not cOAPI.Visible(), which #20 showed never clears.
+                "confirm-windows-suppressed"
             ],
             events);
     }
 
     /// <summary>
     /// The background half of the CLI #22 contract. A session created because some
-    /// background command needed COM must be hidden by the time anything can use it, and
-    /// hidden exactly once: re-hiding on every request is how a session the user asked to
-    /// see would get yanked off the screen.
+    /// background command needed COM must be PROVEN suppressed by the time anything can use
+    /// it, and proven exactly once: re-proving on every request would put a Windows census
+    /// on the command path, and re-suppressing is how a session the user asked to see would
+    /// get yanked off the screen.
     /// </summary>
     [Fact]
-    public void ACreatedSessionIsHiddenOnceBeforeAnyCommandCanUseIt()
+    public void ACreatedSessionIsProvenSuppressedOnceBeforeAnyCommandCanUseIt()
     {
         var fixture = VisibilityFixture.Create();
 
         fixture.Session.GetOrStartOwned();
         fixture.Session.GetOrStartOwned();
 
-        Assert.Equal(1, fixture.Managed.HiddenCalls);
-        Assert.False(fixture.Managed.IsVisible);
+        Assert.Equal(1, fixture.Managed.SuppressionConfirmations);
         Assert.Equal(0, fixture.Managed.RevealCalls);
+        Assert.Equal(0, fixture.Managed.RevealConfirmations);
     }
 
     /// <summary>
@@ -129,13 +131,14 @@ public sealed class ManagedSessionTests
     }
 
     /// <summary>
-    /// The order the #20 repair turns on. The requested model is already confirmed open by
-    /// the time this method is reached, so the Windows window suppression is retired FIRST
-    /// and the CSI transition follows. Reversed, the guard would still be sweeping when the
-    /// engineer's window appeared and would take it straight back down.
+    /// The reveal order, every step of which is load bearing. The requested model is
+    /// already confirmed open by the time this method is reached; suppression is retired
+    /// FIRST (which is also what puts our own suppressed windows back), the CSI hint is
+    /// given its chance, and Windows has the last word. Retiring after the transition would
+    /// leave the guard free to take the engineer's window straight back down.
     /// </summary>
     [Fact]
-    public void AnExplicitRevealRetiresTheWindowGuardBeforeTheCsiTransition()
+    public void AnExplicitRevealRetiresSuppressionThenAsksCsiThenConfirmsFromWindows()
     {
         var fixture = VisibilityFixture.Create();
         fixture.Session.GetOrStartOwned();
@@ -143,19 +146,62 @@ public sealed class ManagedSessionTests
 
         fixture.Session.RevealForExplicitUserRequest();
 
-        Assert.Equal(["window-guard-release", "ensure-visible"], fixture.Events);
+        Assert.Equal(
+            ["window-guard-release", "ensure-visible", "confirm-windows-revealed"],
+            fixture.Events);
         Assert.Equal(1, fixture.Managed.WindowGuardReleaseCalls);
     }
 
     /// <summary>
-    /// A reveal that CSI refuses still leaves the guard retired. Re-arming after a failed
-    /// transition would be the one path back to hiding a window the user asked for.
+    /// The trap the ruling called out explicitly. With <c>cOAPI.Visible()</c> stuck true,
+    /// the CSI policy reads "already visible" and issues no <c>Unhide</c> at all — so a
+    /// reveal that accepted CSI's word would report success with nothing on screen.
+    /// </summary>
+    [Fact]
+    public void ARevealCannotSucceedFromCsiAloneWhenNoOwnedWindowIsVisible()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.IsVisible = true;            // CSI already thinks it is visible
+        fixture.Managed.WindowsRevealConfirmed = false;
+        fixture.Session.GetOrStartOwned();
+
+        var revealed = fixture.Session.RevealForExplicitUserRequest();
+
+        // CSI was asked, agreed, and changed nothing — and that is not a reveal.
+        Assert.False(revealed.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.RevealNotConfirmed,
+            revealed.Error!,
+            StringComparison.Ordinal);
+        Assert.Contains("csiConfirmed=True", revealed.Error!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the mirror: CSI refusing the transition does not fail a reveal that Windows can
+    /// see. The restore of our own suppressed handles is what reaches the screen.
+    /// </summary>
+    [Fact]
+    public void ARevealSucceedsOnWindowsEvidenceEvenWhenCsiRefuses()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.RevealSucceeds = false;
+        fixture.Session.GetOrStartOwned();
+
+        var revealed = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.True(revealed.Success);
+        Assert.Equal(1, fixture.Managed.RevealConfirmations);
+    }
+
+    /// <summary>
+    /// A reveal that fails still leaves the guard retired. Re-arming after a failed reveal
+    /// would be the one path back to hiding a window the user asked for.
     /// </summary>
     [Fact]
     public void AFailedRevealStillLeavesTheWindowGuardRetired()
     {
         var fixture = VisibilityFixture.Create();
-        fixture.Managed.RevealSucceeds = false;
+        fixture.Managed.WindowsRevealConfirmed = false;
         fixture.Session.GetOrStartOwned();
 
         var revealed = fixture.Session.RevealForExplicitUserRequest();
@@ -182,79 +228,88 @@ public sealed class ManagedSessionTests
         fixture.Session.GetOrStartOwned();
 
         Assert.True(fixture.Managed.IsVisible);
-        Assert.Equal(1, fixture.Managed.HiddenCalls);
         Assert.Equal(1, fixture.Managed.RevealCalls);
 
-        // And the suppression is never re-armed: the guard is released exactly once, by
-        // the reveal, and no amount of later background reuse touches it again.
+        // Suppression was proven once, at creation, and never re-proven or re-armed: the
+        // guard is released exactly once, by the reveal, and no amount of later background
+        // reuse touches it again.
+        Assert.Equal(1, fixture.Managed.SuppressionConfirmations);
         Assert.Equal(1, fixture.Managed.WindowGuardReleaseCalls);
         Assert.Equal(0, fixture.Managed.WindowGuardDisposeCalls);
     }
 
-    [Fact]
-    public void ARevealThatCannotBeConfirmedIsReportedAsAFailure()
-    {
-        var fixture = VisibilityFixture.Create();
-        fixture.Managed.RevealSucceeds = false;
-        fixture.Session.GetOrStartOwned();
-
-        var revealed = fixture.Session.RevealForExplicitUserRequest();
-
-        Assert.False(revealed.Success);
-        Assert.NotNull(revealed.Error);
-        Assert.Contains("cOAPI.Unhide", revealed.Error, StringComparison.Ordinal);
-    }
-
     /// <summary>
-    /// The policy the #20 certification forced. Hiding used to be best effort: a session
-    /// that could not be confirmed hidden was handed out anyway, on the reasoning that
-    /// failing over a window costs the engineer more than the window does. The supervised
-    /// run measured what that actually costs — a materially visible ETABS for 5.19 s of a
-    /// background command — so an unproven hidden state now ends the session, and the
-    /// exact owned process is cleaned up rather than left running.
+    /// The policy the #20 certification forced, now resting on the right oracle. An
+    /// unproven WINDOWS state ends the session and cleans up the exact owned process;
+    /// warning and continuing is what the earlier RC did and what #20 measured a visible
+    /// window through.
     /// </summary>
     [Fact]
-    public void AHideThatCannotBeConfirmedFailsSessionCreationAndCleansUp()
+    public void AnUnprovenWindowsStateFailsSessionCreationAndCleansUp()
     {
         var fixture = VisibilityFixture.Create(waitResults: [true]);
-        fixture.Managed.HideSucceeds = false;
+        fixture.Managed.WindowsSuppressionConfirmed = false;
 
         var error = Assert.Throws<EtabsLaunchException>(() => fixture.Session.GetOrStartOwned());
         var repeated = Assert.Throws<EtabsLaunchException>(() => fixture.Session.GetOrStartOwned());
 
         Assert.Equal(EtabsLaunchErrorCodes.HiddenStateNotEstablished, error.Code);
         Assert.Contains(
-            EtabsApiErrorCodes.VisibilityNotConfirmed,
+            ManagedEtabsWindowErrorCodes.SuppressionNotConfirmed,
             error.Message,
             StringComparison.Ordinal);
+        Assert.Contains("0x2A4", error.Message, StringComparison.Ordinal);
         Assert.Contains("processExitConfirmed=True", error.Message, StringComparison.Ordinal);
         Assert.Equal(error.Message, repeated.Message);
         Assert.False(fixture.Session.IsStarted);
 
-        // The exact owned process is exited, not abandoned with an unproven window.
-        Assert.Equal(1, fixture.Managed.HiddenCalls);
+        // The exact owned process is exited, not abandoned with a window on screen.
+        Assert.Equal(1, fixture.Managed.SuppressionConfirmations);
         Assert.Equal(1, fixture.Managed.ExitCount);
         Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Equal(1, fixture.Managed.WindowGuardDisposeCalls);
     }
 
     /// <summary>
+    /// The exact #20 failure, inverted into the behaviour that was asked for. CSI can go on
+    /// reporting <c>Visible=true</c> forever; if the exact-owned Windows census says nothing
+    /// of ours is on screen, background readiness SUCCEEDS. Gating on CSI here is what
+    /// returned <c>snapshot-export success=false</c> against a session that was hidden.
+    /// </summary>
+    [Fact]
+    public void BackgroundReadinessSucceedsWhileCsiKeepsReportingVisible()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.HideSucceeds = false;        // cOAPI.Visible() never clears
+        fixture.Managed.WindowsSuppressionConfirmed = true;
+
+        var owned = fixture.Session.GetOrStartOwned();
+
+        Assert.Same(fixture.Managed, owned);
+        Assert.True(fixture.Session.IsStarted);
+        Assert.Contains(
+            "suppression confirmed",
+            fixture.Diagnostics.ToString(),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// The false-success line the #20 run caught: "✓ ETABS started hidden (PID …)" printed
     /// immediately after two "could not be confirmed hidden" warnings. It is now
     /// unreachable — the same failure path that tears the session down is the only exit
-    /// from an unconfirmed hide, so no run can report a hidden state nothing observed.
+    /// from an unproven Windows state, so no run can report a hidden state nothing observed.
     /// </summary>
     [Fact]
-    public void NoStartedHiddenSuccessLineIsEmittedWhenVisibilityIsUnconfirmed()
+    public void NoStartedHiddenSuccessLineIsEmittedWhenTheWindowsStateIsUnproven()
     {
         var fixture = VisibilityFixture.Create(waitResults: [true]);
-        fixture.Managed.HideSucceeds = false;
+        fixture.Managed.WindowsSuppressionConfirmed = false;
 
         Assert.Throws<EtabsLaunchException>(() => fixture.Session.GetOrStartOwned());
 
         var written = fixture.Diagnostics.ToString();
         Assert.DoesNotContain("started hidden", written, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("hidden before use", written, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("suppression confirmed", written, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>The other side of it: a confirmed hide still reports the success it proved.</summary>
@@ -1196,7 +1251,7 @@ public sealed class ManagedSessionTests
             ReadinessCount++;
         }
 
-        public bool IsVisible { get; private set; } = true;
+        public bool IsVisible { get; set; } = true;
         public int HiddenCalls { get; private set; }
         public int RevealCalls { get; private set; }
         public bool HideSucceeds { get; set; } = true;
@@ -1240,6 +1295,44 @@ public sealed class ManagedSessionTests
 
         public int WindowGuardReleaseCalls { get; private set; }
         public int WindowGuardDisposeCalls { get; private set; }
+        public int SuppressionConfirmations { get; private set; }
+        public int RevealConfirmations { get; private set; }
+
+        /// <summary>Whether the exact-owned Windows census agrees that nothing is on screen.</summary>
+        public bool WindowsSuppressionConfirmed { get; set; } = true;
+
+        /// <summary>Whether an owned top-level window is Windows-visible after a reveal.</summary>
+        public bool WindowsRevealConfirmed { get; set; } = true;
+
+        public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressed()
+        {
+            _events.Add("confirm-windows-suppressed");
+            SuppressionConfirmations++;
+            return WindowsSuppressionConfirmed
+                ? new(true, 1, TimeSpan.Zero, [], null)
+                : new(
+                    false,
+                    3,
+                    TimeSpan.FromSeconds(5),
+                    [(nint)0x2A4],
+                    $"{ManagedEtabsWindowErrorCodes.SuppressionNotConfirmed}; " +
+                    $"ownedPid={Identity.Pid}; handles=[0x2A4]");
+        }
+
+        public ManagedEtabsWindowConfirmation ConfirmWindowsRevealed()
+        {
+            _events.Add("confirm-windows-revealed");
+            RevealConfirmations++;
+            return WindowsRevealConfirmed
+                ? new(true, 1, TimeSpan.Zero, [(nint)0x2A4], null)
+                : new(
+                    false,
+                    3,
+                    TimeSpan.FromSeconds(5),
+                    [],
+                    $"{ManagedEtabsWindowErrorCodes.RevealNotConfirmed}; " +
+                    $"ownedPid={Identity.Pid}");
+        }
 
         public void ReleaseWindowGuardForExplicitUserAction()
         {

@@ -121,11 +121,62 @@ public sealed class EtabsVisibilityWiringTests
     /// </summary>
     private static readonly string[] HideCallers =
     [
-        "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
-            ".HideBeforeAnythingElseTouchesIt",
-        $"{typeof(EtabsSession).FullName}.ConfirmHiddenForBackgroundWork",
+        // ONE site, and it is telemetry: #20 proved cOAPI.Visible() never clears on ETABS
+        // 23.3, so the CSI hide is recorded and the Windows census decides.
+        "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher.AskCsiToHide",
         $"{typeof(ManagedEtabsApplication).FullName}." +
             nameof(ManagedEtabsApplication.EnsureHiddenForBackgroundWork)
+    ];
+
+    /// <summary>
+    /// The authoritative background-readiness gate, at every link of the chain. This is the
+    /// seam that REPLACED cOAPI.Visible() as the acceptance oracle, so it carries the same
+    /// whole-assembly rules the CSI seams do.
+    /// </summary>
+    private static readonly string[] SuppressionGateSeams =
+    [
+        $"{typeof(IManagedEtabsWindowGuard).FullName}." +
+            nameof(IManagedEtabsWindowGuard.ConfirmSuppressed),
+        $"{typeof(ManagedEtabsWindowGuard).FullName}." +
+            nameof(ManagedEtabsWindowGuard.ConfirmSuppressed),
+        $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.ConfirmWindowsSuppressed),
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.ConfirmWindowsSuppressed)
+    ];
+
+    /// <summary>The authoritative explicit-reveal gate, likewise.</summary>
+    private static readonly string[] RevealGateSeams =
+    [
+        $"{typeof(IManagedEtabsWindowGuard).FullName}." +
+            nameof(IManagedEtabsWindowGuard.ConfirmRevealed),
+        $"{typeof(ManagedEtabsWindowGuard).FullName}." +
+            nameof(ManagedEtabsWindowGuard.ConfirmRevealed),
+        $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.ConfirmWindowsRevealed),
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.ConfirmWindowsRevealed)
+    ];
+
+    /// <summary>
+    /// Both proofs of background readiness — after ApplicationStart, and again after
+    /// initialization — plus the chain they delegate through. Nothing on a command path.
+    /// </summary>
+    private static readonly string[] SuppressionGateCallers =
+    [
+        "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+            ".RequireWindowsSuppressed",
+        $"{typeof(EtabsSession).FullName}.ConfirmHiddenForBackgroundWork",
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.ConfirmWindowsSuppressed)
+    ];
+
+    /// <summary>The reveal proof, and only the explicit reveal may reach it.</summary>
+    private static readonly string[] RevealGateCallers =
+    [
+        $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}",
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.ConfirmWindowsRevealed)
     ];
 
     /// <summary>
@@ -236,20 +287,21 @@ public sealed class EtabsVisibilityWiringTests
     }
 
     /// <summary>
-    /// The session re-asserts hidden once the blank model exists. <c>InitializeNewModel</c>
-    /// is what makes the window say <c>(Untitled)</c>, and the supervised RC1 timeline shows
-    /// that title arriving 6 s after the window did — so a single hide at
-    /// <c>ApplicationStart</c> is not on its own proof that nothing surfaces later.
+    /// The session re-proves suppression once the blank model exists.
+    /// <c>InitializeNewModel</c> is what makes the window say <c>(Untitled)</c>, and the
+    /// supervised timelines show ETABS building UI long after <c>ApplicationStart</c>
+    /// returns — so one proof at startup is not on its own evidence that nothing surfaces
+    /// later.
     /// </summary>
     [Fact]
-    public void TheSessionReAssertsHiddenBeforeHandingTheApplicationOut()
+    public void TheSessionReProvesSuppressionBeforeHandingTheApplicationOut()
     {
         Assert.True(
             ReachesAny(
                 $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.GetOrStartOwned)}",
-                HideSeams),
-            "EtabsSession no longer confirms the managed application hidden before handing it " +
-            "to a command.");
+                SuppressionGateSeams),
+            "EtabsSession no longer proves the managed application's windows suppressed " +
+            "before handing it to a command.");
     }
 
     /// <summary>
@@ -267,20 +319,24 @@ public sealed class EtabsVisibilityWiringTests
     [Theory]
     [InlineData(
         "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
-        ".HideBeforeAnythingElseTouchesIt")]
+        ".RequireWindowsSuppressed")]
     [InlineData(
         "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.EtabsSession" +
         ".ConfirmHiddenForBackgroundWork")]
-    public void EachHideSiteReportsWhetherItCaughtAWindow(string hideSite)
+    public void EachSuppressionProofReportsWhatItObserved(string site)
     {
-        var calls = Calls(hideSite);
+        var calls = Calls(site);
 
         Assert.Contains(
-            $"{typeof(ManagedEtabsVisibilityOutcome).FullName}." +
-            $"get_{nameof(ManagedEtabsVisibilityOutcome.Changed)}",
+            $"{typeof(ManagedEtabsWindowConfirmation).FullName}." +
+            $"get_{nameof(ManagedEtabsWindowConfirmation.Observations)}",
             calls,
             StringComparer.Ordinal);
-        Assert.Contains("System.IO.TextWriter.WriteLine", calls, StringComparer.Ordinal);
+        Assert.Contains(
+            $"{typeof(ManagedEtabsWindowConfirmation).FullName}." +
+            $"get_{nameof(ManagedEtabsWindowConfirmation.Confirmed)}",
+            calls,
+            StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -663,6 +719,138 @@ public sealed class EtabsVisibilityWiringTests
         Assert.Contains(
             $"{typeof(IOwnedEtabsProcess).FullName}.get_{nameof(IOwnedEtabsProcess.HasExited)}",
             calls,
+            StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// The ruling from #20, stated over the compiled assembly: the acceptance gate for
+    /// background readiness is the exact-owned Windows census, and it is reached from both
+    /// proof sites and from nowhere else.
+    ///
+    /// <para>Deleting either proof — the one after <c>ApplicationStart</c> or the one after
+    /// initialization — fails here, and so does a command handler reaching for one.</para>
+    /// </summary>
+    [Fact]
+    public void OnlyTheTwoCreationProofsGateOnTheOwnedWindowCensus()
+    {
+        Assert.Equal([], OffendersAgainst(SuppressionGateSeams, SuppressionGateCallers));
+        Assert.All(
+            SuppressionGateCallers,
+            caller => Assert.Contains(
+                Calls(caller),
+                call => SuppressionGateSeams.Contains(call, StringComparer.Ordinal)));
+        Assert.True(
+            ReachesAny(
+                "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher.Launch",
+                SuppressionGateSeams),
+            "ManagedEtabsLauncher.Launch no longer proves the application it started is " +
+            "suppressed. #20 measured a real window through exactly this interval.");
+    }
+
+    /// <summary>
+    /// The same for the reveal gate. Only the explicit open may ask Windows whether ETABS
+    /// is on screen, and it must — reporting a reveal nobody could see is the failure this
+    /// replaced.
+    /// </summary>
+    [Fact]
+    public void OnlyTheExplicitRevealGatesOnAnOwnedWindowActuallyBeingVisible()
+    {
+        Assert.Equal([], OffendersAgainst(RevealGateSeams, RevealGateCallers));
+        Assert.All(
+            RevealGateCallers,
+            caller => Assert.Contains(
+                Calls(caller),
+                call => RevealGateSeams.Contains(call, StringComparer.Ordinal)));
+    }
+
+    /// <summary>
+    /// The reveal's full order, read off the IL. Retire suppression (which restores our own
+    /// handles), then ask CSI, then let Windows decide.
+    ///
+    /// <para>Every pair here is load bearing. Retiring after the CSI call would leave the
+    /// guard sweeping while the engineer's window appeared. Accepting CSI's answer instead
+    /// of Windows' is the trap the ruling named: with <c>Visible()</c> stuck true the CSI
+    /// policy issues no <c>Unhide</c> at all and would report success over an empty
+    /// screen.</para>
+    /// </summary>
+    [Fact]
+    public void TheExplicitRevealRetiresRestoresAsksCsiThenLetsWindowsDecide()
+    {
+        var reveal =
+            $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}";
+
+        var release = IndexOfCall(
+            reveal,
+            $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.ReleaseWindowGuardForExplicitUserAction));
+        var csi = IndexOfCall(
+            reveal,
+            $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.EnsureVisibleForExplicitUserAction));
+        var windows = IndexOfCall(
+            reveal,
+            $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.ConfirmWindowsRevealed));
+
+        Assert.True(release < csi, "Suppression must be retired before the CSI transition.");
+        Assert.True(
+            csi < windows,
+            "Windows must have the last word on a reveal, not CSI. cOAPI.Visible() stays " +
+            "true on ETABS 23.3 whatever the real windows are doing.");
+    }
+
+    /// <summary>
+    /// The suppression MECHANISM is wired, not just the policy. #20 measured the polling
+    /// guard leaving ~234 ms and ~462 ms flickers; a sampler can only promise "gone by the
+    /// next tick", so the guard subscribes to an exact-process window event and keeps the
+    /// sweep as a backstop.
+    ///
+    /// <para>Deleting the subscription from the guard's constructor, or the concrete
+    /// monitor from the production factory, fails here.</para>
+    /// </summary>
+    [Fact]
+    public void TheGuardSubscribesToOwnedWindowEventsRatherThanOnlySampling()
+    {
+        Assert.Contains(
+            $"{typeof(IOwnedWindowSurfaceMonitor).FullName}." +
+            nameof(IOwnedWindowSurfaceMonitor.Start),
+            Calls($"{typeof(ManagedEtabsWindowGuard).FullName}..ctor"),
+            StringComparer.Ordinal);
+
+        Assert.Contains(
+            "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session" +
+            ".Win32OwnedWindowSurfaceMonitor..ctor",
+            Calls($"{typeof(WindowsManagedEtabsWindowGuardFactory).FullName}." +
+                nameof(WindowsManagedEtabsWindowGuardFactory.Activate)),
+            StringComparer.Ordinal);
+
+        // And the subscription is torn down with the guard, on both termination routes.
+        Assert.Contains(
+            "System.IDisposable.Dispose",
+            Calls($"{typeof(ManagedEtabsWindowGuard).FullName}.Terminate"),
+            StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// The hook is installed for ONE process, and that process id comes from the guard's
+    /// proven-owned identity rather than from anything a caller could name. A desktop-wide
+    /// subscription filtered afterwards would be a different, much weaker guarantee.
+    /// </summary>
+    [Fact]
+    public void TheOwnedWindowSubscriptionIsScopedToTheProvenOwnedProcess()
+    {
+        var start = typeof(IOwnedWindowSurfaceMonitor)
+            .GetMethod(nameof(IOwnedWindowSurfaceMonitor.Start))!;
+
+        Assert.Equal("processId", start.GetParameters()[0].Name);
+        Assert.Contains(
+            "System.Diagnostics.Stopwatch.GetTimestamp",
+            Calls($"{typeof(SystemManagedEtabsClock).FullName}." +
+                $"get_{nameof(SystemManagedEtabsClock.Timestamp)}"),
+            StringComparer.Ordinal);
+        Assert.Contains(
+            $"{typeof(ManagedProcessIdentity).FullName}.get_{nameof(ManagedProcessIdentity.Pid)}",
+            Calls($"{typeof(ManagedEtabsWindowGuard).FullName}..ctor"),
             StringComparer.Ordinal);
     }
 

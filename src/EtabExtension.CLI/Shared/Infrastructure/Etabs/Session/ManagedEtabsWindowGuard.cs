@@ -363,7 +363,9 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
 
             if (!wantVisible)
             {
-                SweepOnce();
+                // Best-effort, like every other pass: a window station that fails here is
+                // reported by the observation below rather than thrown at the caller.
+                SafeSweep();
             }
 
             List<nint> visible;

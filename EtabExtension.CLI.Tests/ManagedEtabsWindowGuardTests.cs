@@ -9,16 +9,18 @@ using Xunit;
 namespace EtabExtension.CLI.Tests;
 
 /// <summary>
-/// The Windows suppression layer the #20 supervised certification proved was missing.
+/// The Windows suppression layer, and — after #20 — the product's visibility AUTHORITY.
 ///
-/// <para>The candidate hid ETABS through CSI alone and was measured showing a real window
-/// for 5.19 s of a background run, inside <c>ApplicationStart</c>, before <c>open-model</c>
-/// was ever called. A convergence wait cannot close that: it can only measure the window
-/// it waits through. This guard holds the window down while CSI catches up.</para>
+/// <para>The certification settled two things with evidence. The exact-owned guard works:
+/// sustained exposure fell from 5.19 s to two flickers of ~234 ms and ~462 ms. And
+/// <c>cOAPI.Visible()</c> is not an oracle: it held true for 94 reads across 10.014 s
+/// after a successful <c>Hide()</c>, while those same windows were being suppressed
+/// throughout. So background readiness and explicit reveal are both decided here, from the
+/// exact-owned HWND census, and CSI is telemetry.</para>
 ///
-/// <para>Its entire risk is targeting, so that is what these tests are mostly about: a
-/// guard that could reach a window it does not own would be a far worse defect than the one
-/// it fixes.</para>
+/// <para>Its entire risk is targeting, so much of this suite is still about that: a guard
+/// that could reach a window it does not own would be a far worse defect than the one it
+/// fixes.</para>
 /// </summary>
 public sealed class ManagedEtabsWindowGuardTests
 {
@@ -29,13 +31,15 @@ public sealed class ManagedEtabsWindowGuardTests
 
     private const int ForeignPid = 4243;
 
+    // ── Targeting ────────────────────────────────────────────────────────────
+
     [Fact]
     public void ASweepHidesEveryVisibleWindowOfTheExactOwnedProcess()
     {
         var windows = new FakeWindows(
             new TopLevelWindow(10, Owned.Pid, IsVisible: true),
             new TopLevelWindow(11, Owned.Pid, IsVisible: true));
-        var guard = Guard(windows, out _);
+        var guard = Guard(windows, out _, out _);
 
         guard.SweepOnce();
 
@@ -56,7 +60,7 @@ public sealed class ManagedEtabsWindowGuardTests
             new TopLevelWindow(20, ForeignPid, IsVisible: true),
             new TopLevelWindow(21, Owned.Pid, IsVisible: true),
             new TopLevelWindow(22, ForeignPid, IsVisible: true));
-        var guard = Guard(windows, out _);
+        var guard = Guard(windows, out _, out _);
 
         guard.SweepOnce();
         guard.ReleaseForExplicitUserAction();
@@ -68,6 +72,25 @@ public sealed class ManagedEtabsWindowGuardTests
     }
 
     /// <summary>
+    /// A foreign window is also never the reason a confirmation succeeds or fails. The
+    /// census is exact-owned in both directions: another process's visible window must not
+    /// block background readiness, and must not stand in for a revealed ETABS.
+    /// </summary>
+    [Fact]
+    public void AForeignVisibleWindowDecidesNeitherConfirmation()
+    {
+        var windows = new FakeWindows(new TopLevelWindow(25, ForeignPid, IsVisible: true));
+        var guard = Guard(windows, out _, out _);
+
+        var suppressed = guard.ConfirmSuppressed();
+        var revealed = guard.ConfirmRevealed();
+
+        Assert.True(suppressed.Confirmed);
+        Assert.False(revealed.Confirmed);
+        Assert.Empty(windows.Touched);
+    }
+
+    /// <summary>
     /// A pid is only provably ours while the authoritative handle keeps Windows from
     /// recycling it. Once the process is gone the pid belongs to whoever gets it next, so
     /// the guard stops for good rather than acting on it.
@@ -76,7 +99,7 @@ public sealed class ManagedEtabsWindowGuardTests
     public void AnExitedOwnedProcessStopsTheGuardInsteadOfActingOnItsPid()
     {
         var windows = new FakeWindows(new TopLevelWindow(30, Owned.Pid, IsVisible: true));
-        var guard = Guard(windows, out var owned);
+        var guard = Guard(windows, out var owned, out _);
         owned.Exit();
 
         guard.SweepOnce();
@@ -84,6 +107,25 @@ public sealed class ManagedEtabsWindowGuardTests
 
         Assert.Empty(windows.Touched);
         Assert.False(guard.IsActive);
+    }
+
+    /// <summary>And a dead process is never confirmed either way — it is reported as gone.</summary>
+    [Fact]
+    public void AnExitedOwnedProcessIsReportedGoneRatherThanConfirmed()
+    {
+        var windows = new FakeWindows();
+        var guard = Guard(windows, out var owned, out _);
+        owned.Exit();
+
+        var suppressed = guard.ConfirmSuppressed();
+        var revealed = guard.ConfirmRevealed();
+
+        Assert.False(suppressed.Confirmed);
+        Assert.False(revealed.Confirmed);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.OwnedProcessGone,
+            suppressed.Diagnostic!,
+            StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -94,7 +136,7 @@ public sealed class ManagedEtabsWindowGuardTests
     public void AlreadyHiddenWindowsOfTheOwnedProcessAreLeftAlone()
     {
         var windows = new FakeWindows(new TopLevelWindow(40, Owned.Pid, IsVisible: false));
-        var guard = Guard(windows, out _);
+        var guard = Guard(windows, out _, out _);
 
         guard.SweepOnce();
 
@@ -102,45 +144,243 @@ public sealed class ManagedEtabsWindowGuardTests
         Assert.Empty(guard.Suppressed);
     }
 
+    // ── Windows-authoritative confirmation ───────────────────────────────────
+
+    /// <summary>
+    /// The ruling, stated as a test. On ETABS 23.3 <c>cOAPI.Visible()</c> stays true
+    /// forever; this layer never consults it, and confirms suppression from what Windows
+    /// actually reports about the owned process's windows.
+    /// </summary>
     [Fact]
-    public void RepeatedSweepsRecordEachSuppressedWindowOnce()
+    public void SuppressionIsConfirmedFromTheOwnedCensusWithNoReferenceToCsi()
     {
-        var windows = new FakeWindows(new TopLevelWindow(50, Owned.Pid, IsVisible: true))
-        {
-            StaysVisible = true
-        };
-        var guard = Guard(windows, out _);
+        var windows = new FakeWindows(new TopLevelWindow(50, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _, out _);
 
-        guard.SweepOnce();
-        guard.SweepOnce();
-        guard.SweepOnce();
+        var confirmation = guard.ConfirmSuppressed();
 
-        Assert.Equal([50, 50, 50], windows.Hidden);
-        Assert.Equal([(nint)50], guard.Suppressed);
-
-        guard.ReleaseForExplicitUserAction();
-        Assert.Equal([50], windows.Shown);
+        Assert.True(confirmation.Confirmed);
+        Assert.Empty(confirmation.ObservedWindows);
+        Assert.Null(confirmation.Diagnostic);
+        Assert.Equal([50], windows.Hidden);
     }
 
     /// <summary>
-    /// The explicit-reveal half of the latch. The windows this guard hid go back, because
-    /// <c>cOAPI.Visible()</c> may be derived from the real window state — in which case CSI
-    /// would read its own application as already visible and refuse the <c>Unhide</c>,
-    /// leaving the engineer with nothing on screen.
+    /// <c>ShowWindow</c> against another process's window is not synchronous for the
+    /// caller, so a single read after a hide proves nothing. A window that takes a few
+    /// observations to go down is confirmed, not failed.
+    /// </summary>
+    [Fact]
+    public void AWindowThatTakesSeveralObservationsToGoDownIsStillConfirmed()
+    {
+        var windows = new FakeWindows(new TopLevelWindow(51, Owned.Pid, IsVisible: true))
+        {
+            HidesAfterRequests = 4
+        };
+        var guard = Guard(windows, out _, out var clock);
+
+        var confirmation = guard.ConfirmSuppressed();
+
+        Assert.True(confirmation.Confirmed);
+        Assert.Equal(4, confirmation.Observations);
+        Assert.Equal(TimeSpan.FromMilliseconds(150), clock.Elapsed);
+    }
+
+    /// <summary>
+    /// And a window that will not go down fails the gate explicitly, naming the exact
+    /// offending handle. This is the background-readiness refusal — it now rests on real
+    /// Windows state rather than on a CSI flag that never clears.
+    /// </summary>
+    [Fact]
+    public void AnOwnedWindowThatStaysVisibleFailsSuppressionAtTheDeadline()
+    {
+        var windows = new FakeWindows(new TopLevelWindow(0x2A4, Owned.Pid, IsVisible: true))
+        {
+            StaysVisible = true
+        };
+        var guard = Guard(windows, out _, out var clock);
+
+        var confirmation = guard.ConfirmSuppressed();
+
+        Assert.False(confirmation.Confirmed);
+        Assert.Equal([(nint)0x2A4], confirmation.ObservedWindows);
+        Assert.Equal(TimeSpan.FromSeconds(5), clock.Elapsed);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.SuppressionNotConfirmed,
+            confirmation.Diagnostic!,
+            StringComparison.Ordinal);
+        Assert.Contains("0x2A4", confirmation.Diagnostic!, StringComparison.Ordinal);
+        Assert.Contains($"ownedPid={Owned.Pid}", confirmation.Diagnostic!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RevealIsConfirmedOnlyWhenAnOwnedWindowIsActuallyVisible()
+    {
+        var windows = new FakeWindows(new TopLevelWindow(60, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _, out _);
+
+        var confirmation = guard.ConfirmRevealed();
+
+        Assert.True(confirmation.Confirmed);
+        Assert.Equal([(nint)60], confirmation.ObservedWindows);
+
+        // Confirming a reveal never hides anything — it is pure observation.
+        Assert.Empty(windows.Touched);
+    }
+
+    [Fact]
+    public void RevealFailsWhenNoOwnedWindowEverBecomesVisible()
+    {
+        var windows = new FakeWindows(new TopLevelWindow(61, Owned.Pid, IsVisible: false));
+        var guard = Guard(windows, out _, out var clock);
+
+        var confirmation = guard.ConfirmRevealed();
+
+        Assert.False(confirmation.Confirmed);
+        Assert.Equal(TimeSpan.FromSeconds(5), clock.Elapsed);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.RevealNotConfirmed,
+            confirmation.Diagnostic!,
+            StringComparison.Ordinal);
+    }
+
+    // ── Event-driven suppression ─────────────────────────────────────────────
+
+    /// <summary>
+    /// The mechanism, and the reason the #20 flickers are not a tuning problem.
+    ///
+    /// <para>A sampler can only promise "gone by the next tick". This guard is woken BY the
+    /// window surfacing, so the window is taken down with no intervening tick at all — the
+    /// residual is scheduler latency, not a sampling period.</para>
+    /// </summary>
+    [Fact]
+    public void AWindowSurfacingIsSuppressedOnTheEventWithNoInterveningBackstopTick()
+    {
+        var windows = new FakeWindows();
+        var guard = Guard(windows, out _, out _, out var monitor);
+
+        // The backstop has just run; nothing is on screen yet.
+        monitor.RaiseBackstopTick();
+        Assert.Empty(windows.Hidden);
+
+        // ETABS surfaces its frame midway between ticks.
+        windows.Surface(300, Owned.Pid);
+        monitor.RaiseSurfaced();
+
+        Assert.Equal([300], windows.Hidden);
+        Assert.False(windows.IsVisible(300));
+        Assert.Equal(1, guard.EventPasses);
+        Assert.Equal(1, guard.BackstopPasses);
+    }
+
+    /// <summary>
+    /// The same scenario with the event removed — the flicker #20 measured, reproduced
+    /// offline. The window is on screen for the whole gap between ticks, and no shorter
+    /// period removes that; it only shortens the exposure.
+    /// </summary>
+    [Fact]
+    public void WithoutTheEventTheWindowStaysOnScreenUntilTheNextBackstopTick()
+    {
+        var windows = new FakeWindows();
+        var guard = Guard(windows, out _, out _, out var monitor);
+
+        monitor.RaiseBackstopTick();
+        windows.Surface(301, Owned.Pid);
+
+        // This interval is the flicker: real, visible, and bounded only by the tick period.
+        Assert.True(windows.IsVisible(301));
+        Assert.Equal(0, guard.EventPasses);
+
+        monitor.RaiseBackstopTick();
+
+        Assert.False(windows.IsVisible(301));
+        Assert.Equal([301], windows.Hidden);
+    }
+
+    /// <summary>
+    /// The subscription is process-scoped, and scoped to the PROVEN-owned pid. It is armed
+    /// from the constructor, so the caller's next blocking call — <c>ApplicationStart</c>,
+    /// where #20 measured the window — is already covered.
+    /// </summary>
+    [Fact]
+    public void TheSubscriptionIsArmedForTheExactOwnedPidBeforeTheGuardIsUsable()
+    {
+        var monitor = new FakeMonitor();
+        var owned = new FakeOwnedProcess(Owned);
+
+        var guard = new ManagedEtabsWindowGuard(
+            owned,
+            new FakeWindows(),
+            Policy(new VirtualClock()),
+            monitor);
+
+        Assert.Equal(1, monitor.StartCalls);
+        Assert.Equal(Owned.Pid, monitor.ProcessId);
+        Assert.True(guard.Subscribed);
+    }
+
+    /// <summary>
+    /// A modal or secondary owned top-level window is covered by exactly the same rule as
+    /// the main frame — there is no "main window" concept anywhere in the targeting, only
+    /// ownership.
+    /// </summary>
+    [Fact]
+    public void SecondaryAndModalOwnedTopLevelWindowsAreCoveredToo()
+    {
+        var windows = new FakeWindows(new TopLevelWindow(310, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _, out _, out var monitor);
+        monitor.RaiseSurfaced();
+
+        // A modal dialog appears later, on top of the already-suppressed frame.
+        windows.Surface(311, Owned.Pid);
+        monitor.RaiseSurfaced();
+
+        Assert.Equal([310, 311], windows.Hidden);
+        Assert.True(guard.ConfirmSuppressed().Confirmed);
+    }
+
+    /// <summary>Delivery stops with the guard: no hook or thread outlives the session.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TerminatingTheGuardDisposesTheSubscription(bool forUser)
+    {
+        var guard = Guard(new FakeWindows(), out _, out _, out var monitor);
+
+        if (forUser)
+        {
+            guard.ReleaseForExplicitUserAction();
+        }
+        else
+        {
+            guard.Dispose();
+        }
+
+        Assert.Equal(1, monitor.DisposeCalls);
+        Assert.False(guard.Subscribed);
+    }
+
+    // ── The latch ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The explicit-reveal half of the latch, and now load bearing rather than defensive:
+    /// with <c>cOAPI.Visible()</c> stuck true, CSI reads "already visible" and issues no
+    /// <c>Unhide</c>, so putting our own windows back is what reaches the screen.
     /// </summary>
     [Fact]
     public void ReleasingForAnExplicitUserActionRestoresExactlyWhatWasSuppressed()
     {
         var windows = new FakeWindows(
-            new TopLevelWindow(60, Owned.Pid, IsVisible: true),
-            new TopLevelWindow(61, ForeignPid, IsVisible: true));
-        var guard = Guard(windows, out _);
+            new TopLevelWindow(70, Owned.Pid, IsVisible: true),
+            new TopLevelWindow(71, ForeignPid, IsVisible: true));
+        var guard = Guard(windows, out _, out _);
         guard.SweepOnce();
 
         guard.ReleaseForExplicitUserAction();
 
-        Assert.Equal([60], windows.Shown);
+        Assert.Equal([70], windows.Shown);
         Assert.False(guard.IsActive);
+        Assert.True(guard.ConfirmRevealed().Confirmed);
     }
 
     /// <summary>
@@ -149,52 +389,40 @@ public sealed class ManagedEtabsWindowGuardTests
     /// protect that. It keeps Windows from recycling the pid; it says nothing about a handle
     /// value, which Windows may hand to a different window in a different process the moment
     /// ETABS destroys the one we hid.
-    ///
-    /// <para>So a reveal that showed the saved list blind would <c>ShowWindow</c> a
-    /// stranger's window — a worse defect than the one this guard exists to fix. Ownership
-    /// is therefore re-proven against a fresh census at restore time.</para>
     /// </summary>
     [Fact]
     public void ASuppressedHandleThatNowBelongsToAnotherProcessIsNeverShown()
     {
-        var windows = new FakeWindows(new TopLevelWindow(60, Owned.Pid, IsVisible: true));
-        var guard = Guard(windows, out _);
+        var windows = new FakeWindows(new TopLevelWindow(80, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _, out _);
         guard.SweepOnce();
-        Assert.Equal([(nint)60], guard.Suppressed);
+        Assert.Equal([(nint)80], guard.Suppressed);
 
-        // ETABS destroyed that window between the sweep and the reveal, and Windows handed
-        // the handle value to somebody else.
-        windows.Reassign(60, ForeignPid);
+        windows.Reassign(80, ForeignPid);
 
         guard.ReleaseForExplicitUserAction();
 
         Assert.Empty(windows.Shown);
-        Assert.DoesNotContain((nint)60, windows.Touched.Skip(windows.Hidden.Count));
     }
 
-    /// <summary>A handle that simply no longer exists is skipped rather than shown.</summary>
     [Fact]
     public void ASuppressedHandleThatNoLongerExistsIsNeverShown()
     {
-        var windows = new FakeWindows(new TopLevelWindow(61, Owned.Pid, IsVisible: true));
-        var guard = Guard(windows, out _);
+        var windows = new FakeWindows(new TopLevelWindow(81, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _, out _);
         guard.SweepOnce();
 
-        windows.Destroy(61);
+        windows.Destroy(81);
         guard.ReleaseForExplicitUserAction();
 
         Assert.Empty(windows.Shown);
     }
 
-    /// <summary>
-    /// And once the owned process is gone its pid is no longer provably ours, so a reveal
-    /// restores nothing at all rather than reasoning about handles that outlived it.
-    /// </summary>
     [Fact]
     public void AnExitedOwnedProcessRestoresNothingOnReveal()
     {
-        var windows = new FakeWindows(new TopLevelWindow(62, Owned.Pid, IsVisible: true));
-        var guard = Guard(windows, out var owned);
+        var windows = new FakeWindows(new TopLevelWindow(82, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out var owned, out _);
         guard.SweepOnce();
         owned.Exit();
 
@@ -207,8 +435,8 @@ public sealed class ManagedEtabsWindowGuardTests
     [Fact]
     public void DisposingRestoresNothing()
     {
-        var windows = new FakeWindows(new TopLevelWindow(70, Owned.Pid, IsVisible: true));
-        var guard = Guard(windows, out _);
+        var windows = new FakeWindows(new TopLevelWindow(90, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _, out _);
         guard.SweepOnce();
 
         guard.Dispose();
@@ -225,29 +453,26 @@ public sealed class ManagedEtabsWindowGuardTests
     [Fact]
     public void SuppressionNeverResumesAfterAnExplicitRelease()
     {
-        var windows = new FakeWindows(new TopLevelWindow(80, Owned.Pid, IsVisible: true))
+        var windows = new FakeWindows(new TopLevelWindow(100, Owned.Pid, IsVisible: true))
         {
             StaysVisible = true
         };
-        var guard = Guard(windows, out _);
+        var guard = Guard(windows, out _, out _, out var monitor);
         guard.ReleaseForExplicitUserAction();
 
         guard.SweepOnce();
-        guard.SweepOnce();
+        monitor.RaiseSurfaced();
+        monitor.RaiseBackstopTick();
 
         Assert.Empty(windows.Hidden);
         Assert.False(guard.IsActive);
     }
 
-    /// <summary>
-    /// Terminating twice — reveal then shutdown, or two shutdown routes — is idempotent.
-    /// A second restore would put a window back that the first teardown already resolved.
-    /// </summary>
     [Fact]
     public void TerminatingTwiceRestoresOnceAndReArmsNothing()
     {
-        var windows = new FakeWindows(new TopLevelWindow(90, Owned.Pid, IsVisible: true));
-        var guard = Guard(windows, out _);
+        var windows = new FakeWindows(new TopLevelWindow(110, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _, out _, out var monitor);
         guard.SweepOnce();
 
         guard.ReleaseForExplicitUserAction();
@@ -255,16 +480,17 @@ public sealed class ManagedEtabsWindowGuardTests
         guard.ReleaseForExplicitUserAction();
         guard.SweepOnce();
 
-        Assert.Equal([90], windows.Shown);
-        Assert.Equal([90], windows.Hidden);
+        Assert.Equal([110], windows.Shown);
+        Assert.Equal([110], windows.Hidden);
+        Assert.Equal(1, monitor.DisposeCalls);
         Assert.False(guard.IsActive);
     }
 
     [Fact]
     public void DisposingAfterAShutdownStillRestoresNothing()
     {
-        var windows = new FakeWindows(new TopLevelWindow(100, Owned.Pid, IsVisible: true));
-        var guard = Guard(windows, out _);
+        var windows = new FakeWindows(new TopLevelWindow(120, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _, out _);
         guard.SweepOnce();
 
         guard.Dispose();
@@ -274,61 +500,27 @@ public sealed class ManagedEtabsWindowGuardTests
     }
 
     /// <summary>
-    /// The production shape, with its own thread: suppression really does keep happening
-    /// while the caller is blocked in <c>ApplicationStart</c>, and it really does stop on
-    /// disposal rather than outliving the session.
+    /// A window station that misbehaves must not take the daemon down with it, and must not
+    /// be reported as a confirmed state either.
     /// </summary>
     [Fact]
-    public void TheRunningGuardKeepsSweepingUntilItIsDisposed()
+    public void ASweepFailureIsRecordedAndReportedRatherThanThrownOrIgnored()
     {
-        var windows = new FakeWindows(new TopLevelWindow(110, Owned.Pid, IsVisible: true))
-        {
-            StaysVisible = true
-        };
-        var owned = new FakeOwnedProcess(Owned);
-        using var guard = new ManagedEtabsWindowGuard(
-            owned,
-            windows,
-            TimeSpan.FromMilliseconds(5),
-            startPump: true);
-
-        Assert.True(
-            SpinUntil(() => guard.Sweeps >= 3, TimeSpan.FromSeconds(5)),
-            $"the guard thread swept {guard.Sweeps} times");
-        Assert.Contains((nint)110, guard.Suppressed);
-
-        guard.Dispose();
-        var afterDispose = guard.Sweeps;
-        Assert.False(
-            SpinUntil(() => guard.Sweeps > afterDispose, TimeSpan.FromMilliseconds(200)),
-            "the guard thread kept sweeping after disposal");
-        Assert.False(guard.IsActive);
-        Assert.Null(guard.LastSweepError);
-    }
-
-    /// <summary>
-    /// A window station that misbehaves must not take the daemon down with it. The CSI hide
-    /// remains the authoritative transition; this layer is defence in depth.
-    /// </summary>
-    [Fact]
-    public void ASweepFailureIsRecordedRatherThanThrownOutOfTheGuardThread()
-    {
-        var windows = new FakeWindows(new TopLevelWindow(120, Owned.Pid, IsVisible: true))
+        var windows = new FakeWindows(new TopLevelWindow(130, Owned.Pid, IsVisible: true))
         {
             EnumerateException = new InvalidOperationException("window station went away")
         };
-        var owned = new FakeOwnedProcess(Owned);
-        using var guard = new ManagedEtabsWindowGuard(
-            owned,
-            windows,
-            TimeSpan.FromMilliseconds(5),
-            startPump: true);
+        var guard = Guard(windows, out _, out _, out var monitor);
 
-        Assert.True(
-            SpinUntil(() => guard.LastSweepError is not null, TimeSpan.FromSeconds(5)),
-            "the guard thread never recorded the sweep failure");
+        monitor.RaiseSurfaced();
+        var confirmation = guard.ConfirmSuppressed();
+
         Assert.IsType<InvalidOperationException>(guard.LastSweepError);
+        Assert.False(confirmation.Confirmed);
+        Assert.Contains("Enumerate", confirmation.Diagnostic!, StringComparison.Ordinal);
     }
+
+    // ── Contract shape ───────────────────────────────────────────────────────
 
     /// <summary>
     /// The structural half of "never operates on an unproven or global ETABS pid": there is
@@ -368,7 +560,14 @@ public sealed class ManagedEtabsWindowGuardTests
             .ToArray();
 
         Assert.Equal(
-            ["Dispose", "Identity", "IsActive", "ReleaseForExplicitUserAction"],
+            [
+                "ConfirmRevealed",
+                "ConfirmSuppressed",
+                "Dispose",
+                "Identity",
+                "IsActive",
+                "ReleaseForExplicitUserAction"
+            ],
             members);
     }
 
@@ -376,22 +575,95 @@ public sealed class ManagedEtabsWindowGuardTests
     [Fact]
     public void TheGuardReportsTheIdentityOfTheHandleItWasGiven()
     {
-        var guard = Guard(new FakeWindows(), out var owned);
+        var guard = Guard(new FakeWindows(), out var owned, out _);
 
         Assert.Equal(owned.Identity, guard.Identity);
         Assert.Equal(Owned, guard.Identity);
     }
 
+    // ── The real Win32 subscription ──────────────────────────────────────────
+
+    /// <summary>
+    /// The production mechanism, exercised for real: the hook installs, the message-pumping
+    /// thread runs, the backstop ticks, and disposal tears both down deterministically.
+    ///
+    /// <para>Subscribed to THIS process, with a callback that only counts. Nothing is
+    /// enumerated and no window is touched, so the test host's own windows cannot be
+    /// affected — the point is that the subscription and its pump are real, not that they
+    /// suppress anything here.</para>
+    /// </summary>
+    [Fact]
+    public void TheWin32SubscriptionInstallsPumpsAndTearsDownDeterministically()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "Windows-only subscription.");
+
+        var ticks = 0;
+        var surfaced = 0;
+        var monitor = new Win32OwnedWindowSurfaceMonitor(TimeSpan.FromMilliseconds(10));
+        try
+        {
+            monitor.Start(
+                Environment.ProcessId,
+                () => Interlocked.Increment(ref surfaced),
+                () => Interlocked.Increment(ref ticks));
+
+            Assert.True(monitor.Subscribed, "SetWinEventHook did not install.");
+            Assert.True(
+                SpinUntil(() => Volatile.Read(ref ticks) >= 3, TimeSpan.FromSeconds(10)),
+                $"the pump thread ticked {Volatile.Read(ref ticks)} times");
+        }
+        finally
+        {
+            monitor.Dispose();
+        }
+
+        Assert.False(monitor.Subscribed);
+        var afterDispose = Volatile.Read(ref ticks);
+        Assert.False(
+            SpinUntil(
+                () => Volatile.Read(ref ticks) > afterDispose,
+                TimeSpan.FromMilliseconds(300)),
+            "the pump kept ticking after disposal");
+
+        // Disposal is idempotent, because reveal-then-shutdown reaches it twice.
+        monitor.Dispose();
+    }
+
+    [Fact]
+    public void TheWin32SubscriptionRefusesToBeStartedTwice()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "Windows-only subscription.");
+
+        using var monitor = new Win32OwnedWindowSurfaceMonitor(TimeSpan.FromMilliseconds(50));
+        monitor.Start(Environment.ProcessId, () => { }, () => { });
+
+        Assert.Throws<InvalidOperationException>(
+            () => monitor.Start(Environment.ProcessId, () => { }, () => { }));
+    }
+
+    // ── Fixtures ─────────────────────────────────────────────────────────────
+
+    private static ManagedEtabsWindowPolicy Policy(VirtualClock clock) => new(
+        TimeSpan.FromSeconds(5),
+        TimeSpan.FromMilliseconds(50),
+        TimeSpan.FromMilliseconds(100),
+        clock);
+
     private static ManagedEtabsWindowGuard Guard(
         FakeWindows windows,
-        out FakeOwnedProcess owned)
+        out FakeOwnedProcess owned,
+        out VirtualClock clock) => Guard(windows, out owned, out clock, out _);
+
+    private static ManagedEtabsWindowGuard Guard(
+        FakeWindows windows,
+        out FakeOwnedProcess owned,
+        out VirtualClock clock,
+        out FakeMonitor monitor)
     {
         owned = new FakeOwnedProcess(Owned);
-        return new ManagedEtabsWindowGuard(
-            owned,
-            windows,
-            ManagedEtabsWindowGuard.DefaultSweepInterval,
-            startPump: false);
+        clock = new VirtualClock();
+        monitor = new FakeMonitor();
+        return new ManagedEtabsWindowGuard(owned, windows, Policy(clock), monitor);
     }
 
     private static bool SpinUntil(Func<bool> condition, TimeSpan timeout)
@@ -410,6 +682,49 @@ public sealed class ManagedEtabsWindowGuardTests
         return condition();
     }
 
+    private sealed class VirtualClock : IManagedEtabsClock
+    {
+        public TimeSpan Elapsed { get; private set; }
+
+        public long Timestamp => Elapsed.Ticks;
+
+        public TimeSpan ElapsedSince(long timestamp) =>
+            TimeSpan.FromTicks(Elapsed.Ticks - timestamp);
+
+        public void Wait(TimeSpan interval) => Elapsed += interval;
+    }
+
+    /// <summary>Delivery the test drives by hand, so event and backstop are separable.</summary>
+    private sealed class FakeMonitor : IOwnedWindowSurfaceMonitor
+    {
+        private Action? _surfaced;
+        private Action? _tick;
+
+        public int StartCalls { get; private set; }
+        public int DisposeCalls { get; private set; }
+        public int? ProcessId { get; private set; }
+        public bool Subscribed { get; private set; }
+
+        public void Start(int processId, Action onSurfaced, Action onBackstopTick)
+        {
+            StartCalls++;
+            ProcessId = processId;
+            _surfaced = onSurfaced;
+            _tick = onBackstopTick;
+            Subscribed = true;
+        }
+
+        public void RaiseSurfaced() => _surfaced?.Invoke();
+
+        public void RaiseBackstopTick() => _tick?.Invoke();
+
+        public void Dispose()
+        {
+            DisposeCalls++;
+            Subscribed = false;
+        }
+    }
+
     private sealed class FakeOwnedProcess(ManagedProcessIdentity identity) : IOwnedEtabsProcess
     {
         public ManagedProcessIdentity Identity { get; } = identity;
@@ -425,12 +740,20 @@ public sealed class ManagedEtabsWindowGuardTests
     private sealed class FakeWindows : ITopLevelWindows
     {
         private readonly List<TopLevelWindow> _windows;
+        private readonly Dictionary<nint, int> _hideRequests = [];
         private readonly object _gate = new();
 
         public FakeWindows(params TopLevelWindow[] windows) => _windows = [.. windows];
 
-        /// <summary>A window that refuses to go down, so repeated sweeps stay expressible.</summary>
+        /// <summary>A window that refuses to go down, so a failed confirmation is expressible.</summary>
         public bool StaysVisible { get; init; }
+
+        /// <summary>
+        /// How many hide requests a window absorbs before it actually goes down. ShowWindow
+        /// against another process is not synchronous, so this is the normal case, not an
+        /// exotic one.
+        /// </summary>
+        public int HidesAfterRequests { get; init; } = 1;
 
         public Exception? EnumerateException { get; init; }
 
@@ -458,7 +781,13 @@ public sealed class ManagedEtabsWindowGuardTests
             lock (_gate)
             {
                 Hidden.Add(handle);
-                if (!StaysVisible)
+                if (StaysVisible)
+                {
+                    return;
+                }
+
+                _hideRequests[handle] = _hideRequests.GetValueOrDefault(handle) + 1;
+                if (_hideRequests[handle] >= HidesAfterRequests)
                 {
                     Replace(handle, visible: false);
                 }
@@ -471,6 +800,23 @@ public sealed class ManagedEtabsWindowGuardTests
             {
                 Shown.Add(handle);
                 Replace(handle, visible: true);
+            }
+        }
+
+        public bool IsVisible(nint handle)
+        {
+            lock (_gate)
+            {
+                return _windows.Any(window => window.Handle == handle && window.IsVisible);
+            }
+        }
+
+        /// <summary>A new top-level window of a process appears on screen.</summary>
+        public void Surface(nint handle, int processId)
+        {
+            lock (_gate)
+            {
+                _windows.Add(new(handle, processId, IsVisible: true));
             }
         }
 

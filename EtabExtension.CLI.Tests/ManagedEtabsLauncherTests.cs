@@ -49,11 +49,14 @@ public sealed class ManagedEtabsLauncherTests
                 "window-guard-activate",
                 // And only then the blocking start, with suppression already holding.
                 "application-start",
-                // Hidden before anything else touches the started application: the window
-                // must never reach the screen for a session created to do background work.
+                // CSI is asked to hide, once, and its answer is recorded — #20 proved
+                // cOAPI.Visible() never clears on ETABS 23.3, so it decides nothing.
                 "visible",
                 "hide",
                 "visible",
+                // THIS is the gate: the exact-owned Windows census must report no visible
+                // owned top-level window before startup goes any further.
+                "window-guard-confirm-suppressed",
                 "sap-model",
                 "version-probe",
                 "oapi-version"
@@ -441,24 +444,21 @@ public sealed class ManagedEtabsLauncherTests
     }
 
     /// <summary>
-    /// A visibility problem IS a startup refusal now. It used to be loud-and-continue, on
-    /// the reasoning that failing Commit over a window costs more than the window; the
-    /// supervised #20 certification measured that cost — a real ETABS window on screen for
-    /// 5.19 s of a background run — and rejected the candidate for it.
+    /// The ruling #20 forced, stated as a test. <c>cOAPI.Visible()</c> stayed true for 94
+    /// reads across 10.014 s on the certified candidate while the exact-owned windows were
+    /// suppressed the whole time — so the candidate refused a session that was, in fact,
+    /// hidden, and <c>snapshot-export</c> came back <c>success=false</c>.
     ///
-    /// <para>Each row carries the code it must produce. Asserting only that the message
-    /// says "hidden" would pass on the static prefix alone: deleting the CSI diagnostic —
-    /// the only part naming the call that disagreed — would go unnoticed, and the two rows
-    /// would be indistinguishable.</para>
+    /// <para>CSI never clearing must now cost the launch nothing, provided Windows confirms
+    /// suppression. Both rows are CSI disagreeing: one refusing the call, one accepting it
+    /// and never changing the flag.</para>
     /// </summary>
     [Theory]
-    [InlineData(true, false, EtabsApiErrorCodes.ApiCallFailed, "returnCode=1")]
-    [InlineData(false, true, EtabsApiErrorCodes.VisibilityNotConfirmed, "observed=visible")]
-    public void AHideThatCannotBeConfirmedFailsTheLaunchAndStopsTheOwnedProcess(
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public void ACsiHideThatNeverAgreesDoesNotFailALaunchWindowsConfirms(
         bool nonZeroReturn,
-        bool ignoreHide,
-        string expectedCode,
-        string expectedDetail)
+        bool ignoreHide)
     {
         var api = new FakeRawApi
         {
@@ -466,107 +466,93 @@ public sealed class ManagedEtabsLauncherTests
             IgnoreHide = ignoreHide
         };
         var processes = new FakeProcesses { AfterStart = [Identity] };
+        var diagnostics = new StringWriter();
+        var launcher = Build(api, processes, out _, diagnostics: diagnostics);
+
+        var managed = launcher.Launch();
+
+        Assert.Equal(Identity, managed.Identity);
+
+        // Exactly one Hide, and its disagreement is recorded rather than acted on.
+        Assert.Equal(1, api.HideCalls);
+        Assert.Contains(
+            "Windows window state is the authority",
+            diagnostics.ToString(),
+            StringComparison.Ordinal);
+        Assert.Equal(1, processes.Guards.Activated[0].SuppressionConfirmations);
+    }
+
+    /// <summary>
+    /// The gate that replaced it. An owned top-level window Windows still reports visible
+    /// fails the launch, names the offending handle, and stops the exact owned process.
+    /// </summary>
+    [Fact]
+    public void AnOwnedWindowStillOnScreenFailsTheLaunchAndStopsTheOwnedProcess()
+    {
+        var api = new FakeRawApi();
+        var processes = new FakeProcesses { AfterStart = [Identity] };
+        processes.Guards.StillVisible = [0x2A4];
         var launcher = Build(api, processes, out _);
 
         var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
 
         Assert.Equal(EtabsLaunchErrorCodes.HiddenStateNotEstablished, error.Code);
-        Assert.Contains(expectedCode, error.Message, StringComparison.Ordinal);
         Assert.Contains(
-            $"operation={ManagedEtabsVisibility.HideOperation}",
+            ManagedEtabsWindowErrorCodes.SuppressionNotConfirmed,
             error.Message,
             StringComparison.Ordinal);
-        Assert.Contains(expectedDetail, error.Message, StringComparison.Ordinal);
-
-        // Exactly one Hide, whatever happened: convergence observes, it never re-issues.
-        Assert.Equal(1, api.HideCalls);
+        Assert.Contains("stage=after cOAPI.ApplicationStart", error.Message, StringComparison.Ordinal);
 
         // The exact owned process is stopped, and suppression is retired, not leaked.
         Assert.Equal(1, processes.OpenedHandle!.KillCount);
         Assert.True(processes.Guards.Activated[0].Disposed);
         Assert.NotNull(error.Cleanup);
         Assert.True(error.Cleanup!.Success);
+
+        // Nothing downstream of the gate ran.
+        Assert.Equal(0, api.WrapCount);
     }
 
     /// <summary>
-    /// The #20 measurement, stated as a test. <c>Hide()</c> returned success and the very
-    /// next <c>Visible()</c> read still said visible — a deferred CSI transition, not a
-    /// failed one. The candidate declared failure on that first read; convergence waits it
-    /// out, and confirms from what it finally observed.
+    /// The CSI hint keeps its bounded budget rather than the old ten-second one. Spending
+    /// ten seconds waiting for a flag #20 proved never changes would add ten seconds to
+    /// every session start and alter no decision.
     /// </summary>
     [Fact]
-    public void ADeferredHideConvergesInsteadOfBeingDeclaredAFailure()
-    {
-        var api = new FakeRawApi { VisibleReadsBeforeHideLands = 12 };
-        var processes = new FakeProcesses { AfterStart = [Identity] };
-        var clock = new FakeClock();
-        var launcher = Build(api, processes, out _, clock);
-
-        var managed = launcher.Launch();
-
-        Assert.Equal(Identity, managed.Identity);
-        Assert.False(api.IsVisible);
-
-        // One transition, many observations. Re-issuing Hide while the first was landing
-        // is what Cardex says would manufacture an error out of a slow success.
-        Assert.Equal(1, api.HideCalls);
-        Assert.True(api.VisibleCalls > 2, $"expected repeated reads, saw {api.VisibleCalls}");
-        Assert.All(clock.Waits, wait => Assert.Equal(
-            ManagedEtabsVisibilityPolicy.Default.PollInterval,
-            wait));
-    }
-
-    /// <summary>
-    /// And the ceiling holds: a hide that never lands is still a refusal, not an unbounded
-    /// wait. The launch fails with the CSI evidence and the owned process is stopped.
-    /// </summary>
-    [Fact]
-    public void AHideThatNeverConvergesFailsAtTheDeadlineRatherThanWaitingForever()
+    public void TheCsiHintIsGivenTheTelemetryBudgetAndNotTheOldTenSeconds()
     {
         var api = new FakeRawApi { IgnoreHide = true };
         var processes = new FakeProcesses { AfterStart = [Identity] };
         var clock = new FakeClock();
-        var launcher = Build(api, processes, out _, clock);
 
-        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+        _ = Build(api, processes, out _, clock).Launch();
 
-        Assert.Equal(EtabsLaunchErrorCodes.HiddenStateNotEstablished, error.Code);
-        Assert.Equal(1, api.HideCalls);
-        Assert.Equal(
-            ManagedEtabsVisibilityPolicy.Default.ConvergenceDeadline,
-            clock.Elapsed);
+        Assert.Equal(ManagedEtabsVisibilityPolicy.Telemetry.ConvergenceDeadline, clock.Elapsed);
+        Assert.All(clock.Waits, wait => Assert.Equal(
+            ManagedEtabsVisibilityPolicy.Telemetry.PollInterval,
+            wait));
     }
 
     /// <summary>
-    /// Whether the startup hide CAUGHT a window is the fact the supervised live gate needs
-    /// and cannot reconstruct afterwards, so it is reported either way. "Already hidden"
-    /// means ETABS had not built its UI yet and any window will be caught later by the
-    /// session's second hide — a materially different outcome from this hide taking a
-    /// visible window down.
+    /// The launch says, on stderr, that background UI suppression was CONFIRMED and what
+    /// that rests on. This is the line the supervised gate reads, and it must describe the
+    /// Windows census rather than what CSI was asked for.
     /// </summary>
-    [Theory]
-    [InlineData(true, "a window was already visible")]
-    [InlineData(false, "no window had appeared yet")]
-    public void LaunchReportsWhetherTheStartupHideCaughtAWindow(
-        bool visibleAfterStart,
-        string expectedPhrase)
+    [Fact]
+    public void LaunchReportsThatWindowsConfirmedTheSuppression()
     {
-        var api = new FakeRawApi { VisibleAfterStart = visibleAfterStart };
+        var api = new FakeRawApi();
+        var processes = new FakeProcesses { AfterStart = [Identity] };
         var diagnostics = new StringWriter();
-        var launcher = new ManagedEtabsLauncher(
-            new FakeProcesses { AfterStart = [Identity] },
-            new FakeResolver(Identity.ExecutablePath),
-            new FakeApiFactory(api, []),
-            new FakeVersionProbe(),
-            diagnostics);
 
-        launcher.Launch();
+        _ = Build(api, processes, out _, diagnostics: diagnostics).Launch();
 
-        Assert.Contains(expectedPhrase, diagnostics.ToString(), StringComparison.Ordinal);
-        Assert.False(api.IsVisible);
-        // Cardex: Hide on an already-hidden application returns an error, so the second row
-        // must not have called it at all.
-        Assert.Equal(visibleAfterStart ? 1 : 0, api.HideCalls);
+        var text = diagnostics.ToString();
+        Assert.Contains(
+            "background UI suppression confirmed after cOAPI.ApplicationStart",
+            text,
+            StringComparison.Ordinal);
+        Assert.Contains("observations=", text, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -753,7 +739,8 @@ public sealed class ManagedEtabsLauncherTests
         FakeRawApi api,
         FakeProcesses processes,
         out List<string> events,
-        FakeClock? clock = null)
+        FakeClock? clock = null,
+        TextWriter? diagnostics = null)
     {
         var recorded = new List<string>();
         events = recorded;
@@ -765,7 +752,7 @@ public sealed class ManagedEtabsLauncherTests
             new FakeResolver(Identity.ExecutablePath),
             new FakeApiFactory(api, recorded),
             new FakeVersionProbe(recorded),
-            TextWriter.Null,
+            diagnostics ?? TextWriter.Null,
             processes.Guards,
             clock ?? new FakeClock());
     }
@@ -800,22 +787,51 @@ public sealed class ManagedEtabsLauncherTests
 
         public List<FakeWindowGuard> Activated { get; } = [];
 
+        /// <summary>Windows the guard will keep reporting visible on every session it arms.</summary>
+        public nint[] StillVisible { get; set; } = [];
+
         public IManagedEtabsWindowGuard Activate(IOwnedEtabsProcess ownedProcess)
         {
             Events.Add("window-guard-activate");
-            var guard = new FakeWindowGuard(ownedProcess);
+            var guard = new FakeWindowGuard(ownedProcess, Events) { StillVisible = StillVisible };
             Activated.Add(guard);
             return guard;
         }
     }
 
-    private sealed class FakeWindowGuard(IOwnedEtabsProcess owned) : IManagedEtabsWindowGuard
+    private sealed class FakeWindowGuard(IOwnedEtabsProcess owned, List<string> events)
+        : IManagedEtabsWindowGuard
     {
         public IOwnedEtabsProcess Owned { get; } = owned;
         public ManagedProcessIdentity Identity => Owned.Identity;
         public bool IsActive => !Disposed && !ReleasedForUser;
         public bool Disposed { get; private set; }
         public bool ReleasedForUser { get; private set; }
+        public int SuppressionConfirmations { get; private set; }
+
+        /// <summary>Windows the census keeps reporting visible, i.e. suppression failing.</summary>
+        public nint[] StillVisible { get; set; } = [];
+
+        public ManagedEtabsWindowConfirmation ConfirmSuppressed()
+        {
+            events.Add("window-guard-confirm-suppressed");
+            SuppressionConfirmations++;
+            return StillVisible.Length == 0
+                ? new(true, 1, TimeSpan.Zero, [], null)
+                : new(
+                    false,
+                    3,
+                    TimeSpan.FromSeconds(5),
+                    StillVisible,
+                    $"{ManagedEtabsWindowErrorCodes.SuppressionNotConfirmed}; " +
+                    $"ownedPid={Identity.Pid}; visibleOwnedWindows={StillVisible.Length}");
+        }
+
+        public ManagedEtabsWindowConfirmation ConfirmRevealed()
+        {
+            events.Add("window-guard-confirm-revealed");
+            return new(true, 1, TimeSpan.Zero, [(nint)1], null);
+        }
 
         public void ReleaseForExplicitUserAction() => ReleasedForUser = true;
 
