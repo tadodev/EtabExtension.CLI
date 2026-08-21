@@ -756,7 +756,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     /// </summary>
     private ManagedProcessIdentity CensusExactlyOneOwnedProcess()
     {
-        var started = _clock.UtcNow;
+        var started = _clock.Timestamp;
         while (true)
         {
             EtabsProcessObservation observation;
@@ -777,7 +777,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 return observation.Identified[0];
             }
 
-            if (_clock.UtcNow - started >= OwnershipCensusDeadline)
+            if (_clock.ElapsedSince(started) >= OwnershipCensusDeadline)
             {
                 var pids = observation.Identified
                     .Select(identity => identity.Pid)

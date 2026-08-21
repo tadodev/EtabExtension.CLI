@@ -67,8 +67,8 @@ public interface IManagedEtabsWindowGuard : IDisposable
     bool IsActive { get; }
 
     /// <summary>
-    /// Ends suppression because the USER asked to see ETABS, and restores exactly the
-    /// windows this guard hid.
+    /// Ends suppression because the USER asked to see ETABS, and restores the windows this
+    /// guard hid that are still, at that moment, its own.
     ///
     /// <para>The restore is not cosmetic. <c>cOAPI.Visible()</c> may be derived from the
     /// real window state, in which case this guard's suppression is itself what a later
@@ -248,22 +248,65 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
 
         _terminate.Set();
         _ = _pump?.Join(PumpJoinTimeout);
+        RestoreStillOwned(restoreTargets);
+        _terminate.Dispose();
+    }
 
-        foreach (var handle in restoreTargets)
+    /// <summary>
+    /// Shows the saved handles that are STILL top-level windows of the exact owned process.
+    ///
+    /// <para><b>Why ownership is re-proven here.</b> Suppression filters by owning process
+    /// id on every sweep, but what gets saved is a raw <c>HWND</c> value, and the open
+    /// process handle does not protect it. A handle keeps Windows from recycling the
+    /// <i>pid</i> while the process object lives; it says nothing about an <c>HWND</c>
+    /// value, which Windows is free to hand to an entirely different window — in an
+    /// entirely different process — the moment ETABS destroys the one we hid. Restoring
+    /// from the saved list alone would then <c>ShowWindow</c> a stranger's window, which is
+    /// a worse defect than the one this guard exists to fix.</para>
+    ///
+    /// <para>So the list is re-observed against a fresh census: a handle that has
+    /// disappeared, or that now belongs to another process, is skipped rather than shown.
+    /// An exited owned process skips the restore entirely — after exit its pid is no longer
+    /// provably ours and there is nothing of ours left to show.</para>
+    /// </summary>
+    private void RestoreStillOwned(nint[] targets)
+    {
+        if (targets.Length == 0 || _owned.HasExited)
         {
+            return;
+        }
+
+        HashSet<nint> ownedNow;
+        try
+        {
+            ownedNow = [.. _windows.Enumerate()
+                .Where(window => window.ProcessId == _owned.Identity.Pid)
+                .Select(window => window.Handle)];
+        }
+        catch (Exception exception)
+        {
+            // Ownership could not be re-proven, so nothing is touched. The CSI Unhide that
+            // follows is the authoritative transition and does not depend on this.
+            LastSweepError = exception;
+            return;
+        }
+
+        foreach (var handle in targets)
+        {
+            if (!ownedNow.Contains(handle))
+            {
+                continue;
+            }
+
             try
             {
                 _windows.Show(handle);
             }
             catch (Exception exception)
             {
-                // A window that no longer exists is not a failure of the reveal; the CSI
-                // Unhide that follows is the authoritative transition.
                 LastSweepError = exception;
             }
         }
-
-        _terminate.Dispose();
     }
 
     private void Pump()

@@ -1,17 +1,31 @@
 // Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
+using System.Diagnostics;
+
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 /// <summary>
 /// Bounded waiting for state this process can only observe, never make happen.
+///
+/// <para><b>Monotonic, not wall clock.</b> The surface is a timestamp and an elapsed-since,
+/// deliberately not a "now": a deadline computed by subtracting two wall-clock readings is
+/// not a bound at all. An NTP correction or a manual clock change backwards silently
+/// extends it — potentially without limit — and one forwards ends it early, which for the
+/// hide convergence would mean declaring an unproven visibility failure the moment the
+/// machine's clock was adjusted. There is no <c>UtcNow</c> here so that no deadline in the
+/// managed session can be written against one by accident.</para>
 ///
 /// <para>Injected rather than called statically so every convergence policy in the
 /// managed session is exercisable at full speed and with no real sleeping.</para>
 /// </summary>
 public interface IManagedEtabsClock
 {
-    DateTimeOffset UtcNow { get; }
+    /// <summary>An opaque monotonic tick, meaningful only to <see cref="ElapsedSince"/>.</summary>
+    long Timestamp { get; }
+
+    /// <summary>How much monotonic time has passed since a <see cref="Timestamp"/> reading.</summary>
+    TimeSpan ElapsedSince(long timestamp);
 
     /// <summary>Yields for one poll interval. Only ever called inside a deadline-bounded loop.</summary>
     void Wait(TimeSpan interval);
@@ -26,7 +40,14 @@ public sealed class SystemManagedEtabsClock : IManagedEtabsClock
     {
     }
 
-    public DateTimeOffset UtcNow => DateTimeOffset.UtcNow;
+    /// <summary>
+    /// <c>Stopwatch</c>, which is backed by the platform's high-resolution performance
+    /// counter and is unaffected by wall-clock changes.
+    /// </summary>
+    public long Timestamp => Stopwatch.GetTimestamp();
+
+    /// <inheritdoc />
+    public TimeSpan ElapsedSince(long timestamp) => Stopwatch.GetElapsedTime(timestamp);
 
     public void Wait(TimeSpan interval) => Thread.Sleep(interval);
 }
@@ -250,7 +271,7 @@ public static class ManagedEtabsVisibility
         // single confirming read, because a non-zero return is most often "already in the
         // requested state" and waiting on a call ETABS refused would only delay the truth.
         var budget = returnCode == 0 ? policy.ConvergenceDeadline : TimeSpan.Zero;
-        var started = policy.Clock.UtcNow;
+        var started = policy.Clock.Timestamp;
         while (true)
         {
             bool observed;
@@ -266,10 +287,10 @@ public static class ManagedEtabsVisibility
                     changed: true,
                     EtabsApiDiagnosticFormatter.Exception(ReadOperation, exception),
                     reads,
-                    policy.Clock.UtcNow - started);
+                    policy.Clock.ElapsedSince(started));
             }
 
-            var waited = policy.Clock.UtcNow - started;
+            var waited = policy.Clock.ElapsedSince(started);
             if (observed == wantVisible)
             {
                 return new(
