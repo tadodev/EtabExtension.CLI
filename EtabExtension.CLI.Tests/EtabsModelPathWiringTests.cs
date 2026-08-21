@@ -82,7 +82,14 @@ internal static class ILCalls
     {
         ArgumentNullException.ThrowIfNull(type);
 
-        using var stream = File.OpenRead(type.Assembly.Location);
+        var location = type.Assembly.Location;
+        if (string.IsNullOrEmpty(location))
+        {
+            throw new InvalidOperationException(
+                $"{type.Assembly.FullName} has no file on disk to read IL from.");
+        }
+
+        using var stream = File.OpenRead(location);
         using var peReader = new PEReader(stream);
         var reader = peReader.GetMetadataReader();
 
