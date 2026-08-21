@@ -40,11 +40,19 @@ public sealed class EtabsModelOpener : IEtabsModelOpener
 /// <summary>
 /// The canonical managed-app model-open primitive.
 ///
-/// <para>Every shared-session command that needs a model loaded goes through here:
-/// <c>open-model</c>, <c>snapshot-export</c>, <c>analyze-and-extract</c> and
-/// <c>read-model-metadata</c>. Validation, return-code handling, bounded COM
-/// diagnostics, current-file handling, and the post-open confirmation therefore
-/// cannot drift between commands.</para>
+/// <para>Four commands open through here today: <c>open-model</c>,
+/// <c>snapshot-export</c>, <c>analyze-and-extract</c> and
+/// <c>read-model-metadata</c>. Among those, validation, return-code handling,
+/// bounded COM diagnostics, current-file handling, and the post-open confirmation
+/// cannot drift.</para>
+///
+/// <para>This is NOT yet every shared-session command. <c>extract-results</c>,
+/// <c>extract-materials</c>, <c>generate-e2k</c> and <c>run-analysis</c> still call
+/// <c>cFile.OpenFile</c> directly and still fail with the weaker, unbounded
+/// <c>"OpenFile failed (ret=N)"</c> that names no CSI operation. That is deliberate:
+/// converting them is broad serve-parity work explicitly deferred past Alpha, not an
+/// oversight. Fold them in here when that work is scheduled — do not grow a second
+/// open boundary for them.</para>
 ///
 /// <para>It deliberately owns no process lifecycle: no ROT/PID attach, no
 /// <c>CreateNew</c>, no <c>ApplicationExit</c>, no <c>Dispose</c>. It operates on an
@@ -54,8 +62,10 @@ public sealed class EtabsModelOpener : IEtabsModelOpener
 /// <para>Cardex (<c>cFile.OpenFile</c>, ETABS v1 API) specifies the argument as
 /// "the full path of a model file" and a zero return as the only success. A zero
 /// return is necessary but not sufficient: it does not prove the requested model is
-/// the one now loaded, so the primitive re-reads <c>cSapModel.GetModelFilename</c>
-/// and fails explicitly when a blank or foreign model is current.</para>
+/// the one now loaded, so the primitive re-reads the current model file through
+/// <c>cSapModel.GetModelFilename</c> — which Cardex documents as returning the full
+/// path when <c>IncludePath</c> is true — and fails explicitly when a blank or
+/// foreign model is current.</para>
 /// </summary>
 public static class EtabsModelOpen
 {
@@ -101,9 +111,22 @@ public static class EtabsModelOpen
         return OpenOnAttachedModel(
             filePath,
             save,
-            // Cardex: cSapModel.GetModelFilepath() returns the model's FOLDER, while
-            // GetModelFilename(IncludePath: true) returns the full file path. Only the
-            // latter can be saved back or compared against the requested model.
+            // Read the current model with GetModelFilename, NOT GetModelFilepath.
+            //
+            // Cardex verifies only the call used here: cSapModel.GetModelFilename
+            // returns the full path when IncludePath is true. It says nothing about
+            // GetModelFilepath beyond "returns the filepath of the current model",
+            // and EtabSharp's own XML doc calls that one the "full filepath" — so the
+            // docs do not distinguish them.
+            //
+            // The distinction is an OBSERVED behavior, not a documented one. The
+            // supervised live run of snapshot-export against
+            // D:\Work\tadoEng\TestModel\sample_v2.EDB (ETABS 23.3.0) had this
+            // primitive wired to GetModelFilepath and failed its own confirmation with
+            // an empty opened= field; the same session's get-status reported
+            // openFilePath as "D:\Work\tadoEng\TestModel\" — the FOLDER, with no
+            // file name. Re-verify empirically before trusting GetModelFilepath as a
+            // file path anywhere.
             () => app.Model.ModelInfo.GetModelFilename(includePath: true),
             currentPath => app.Model.Files.SaveFile(currentPath),
             targetPath => app.Model.Files.OpenFile(targetPath));

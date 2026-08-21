@@ -24,8 +24,10 @@ internal static class EtabsSessionHelpers
     /// <summary>
     /// Opens a model on an already-owned session through the one canonical
     /// <see cref="EtabsModelOpen"/> primitive. This helper owns no OpenFile call of
-    /// its own, so combined-session commands cannot drift from the validated
-    /// <c>open-model</c> boundary.
+    /// its own, so its callers — <c>analyze-and-extract</c> and
+    /// <c>read-model-metadata</c> — cannot drift from the validated
+    /// <c>open-model</c> boundary. Other combined-session commands still open
+    /// directly; see <see cref="EtabsModelOpen"/> for which ones and why.
     /// </summary>
     internal static async Task<Result> OpenFileAsync(ETABSApplication app, string filePath)
     {

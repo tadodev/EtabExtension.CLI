@@ -98,8 +98,11 @@ public class OpenModelService : IOpenModelService
             if (app is null)
                 return Result.Fail<OpenModelData>("ETABS process identity was selected but COM attach failed.");
 
-            // GetModelFilepath() is the model's FOLDER; only GetModelFilename(true)
-            // yields a path that SaveFile can write back to.
+            // GetModelFilename(true) is Cardex-verified to return the full path.
+            // GetModelFilepath() is NOT interchangeable with it: a supervised live run
+            // observed that call answering with the model's folder and no file name,
+            // which cFile.Save cannot write back to. See EtabsModelOpen.OpenOnApp for
+            // the evidence.
             var currentPath = app.Model.ModelInfo.GetModelFilename(includePath: true);
             var hasCurrentFile = !string.IsNullOrEmpty(currentPath);
 
