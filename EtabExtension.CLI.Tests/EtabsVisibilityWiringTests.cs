@@ -1,4 +1,4 @@
-// Copyright (c) Thanh Tu. All rights reserved.
+﻿// Copyright (c) Thanh Tu. All rights reserved.
 // Licensed under the MIT License.
 
 using System.Globalization;
@@ -126,6 +126,52 @@ public sealed class EtabsVisibilityWiringTests
         $"{typeof(EtabsSession).FullName}.ConfirmHiddenForBackgroundWork",
         $"{typeof(ManagedEtabsApplication).FullName}." +
             nameof(ManagedEtabsApplication.EnsureHiddenForBackgroundWork)
+    ];
+
+    /// <summary>
+    /// Arming Windows-level window suppression, at every link of the chain. The #20
+    /// certification proved the CSI hide alone cannot keep a window off the screen during
+    /// startup, so this is now a product-state guard — and, like the reveal, it has exactly
+    /// one legitimate origin.
+    /// </summary>
+    private static readonly string[] GuardArmSeams =
+    [
+        $"{typeof(IManagedEtabsWindowGuardFactory).FullName}." +
+            nameof(IManagedEtabsWindowGuardFactory.Activate),
+        $"{typeof(WindowsManagedEtabsWindowGuardFactory).FullName}." +
+            nameof(WindowsManagedEtabsWindowGuardFactory.Activate)
+    ];
+
+    /// <summary>
+    /// Retiring that suppression FOR THE USER — the reveal latch, which also puts back the
+    /// windows the guard hid. A background command reaching this would silently undo the
+    /// repair for the rest of the session.
+    /// </summary>
+    private static readonly string[] GuardReleaseSeams =
+    [
+        $"{typeof(IManagedEtabsWindowGuard).FullName}." +
+            nameof(IManagedEtabsWindowGuard.ReleaseForExplicitUserAction),
+        $"{typeof(ManagedEtabsWindowGuard).FullName}." +
+            nameof(ManagedEtabsWindowGuard.ReleaseForExplicitUserAction),
+        $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.ReleaseWindowGuardForExplicitUserAction),
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.ReleaseWindowGuardForExplicitUserAction)
+    ];
+
+    /// <summary>The one method allowed to arm suppression, and the chain it delegates through.</summary>
+    private static readonly string[] GuardArmCallers =
+    [
+        "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+            ".ActivateWindowGuard"
+    ];
+
+    /// <summary>The one method allowed to retire it for the user, and its delegation chain.</summary>
+    private static readonly string[] GuardReleaseCallers =
+    [
+        $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}",
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.ReleaseWindowGuardForExplicitUserAction)
     ];
 
     /// <summary>
@@ -340,7 +386,188 @@ public sealed class EtabsVisibilityWiringTests
             scanned.Where(handler => ReachesAny(handler, HideSeams)).ToArray());
     }
 
+    /// <summary>
+    /// The load-bearing wiring assertion for the #20 repair, and the one that must go RED
+    /// if the production activation is deleted.
+    ///
+    /// <para>Reachability alone would not be enough here: a guard armed AFTER
+    /// <c>ApplicationStart</c> returns is a guard that was not up for the 5.19 s the
+    /// supervised run measured a window through. So this reads the launcher's own IL in
+    /// order — ownership, then arming, then the blocking start — and a guard that drifts
+    /// later in the method fails on the ordering rather than on its absence.</para>
+    /// </summary>
+    [Fact]
+    public void TheManagedLaunchArmsWindowSuppressionOverProvenOwnershipBeforeItStartsAnything()
+    {
+        const string launch =
+            "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher.Launch";
+
+        var ownership = IndexOfCall(
+            launch,
+            "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+            ".CensusExactlyOneOwnedProcess");
+        var handle = IndexOfCall(
+            launch,
+            $"{typeof(IProcessInspector).FullName}.{nameof(IProcessInspector.OpenExact)}");
+        var arm = IndexOfCall(
+            launch,
+            "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+            ".ActivateWindowGuard");
+        var start = IndexOfCall(
+            launch,
+            "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+            ".StartApplication");
+
+        Assert.True(
+            ownership < handle,
+            "The ownership census must precede the authoritative handle it is opened from.");
+        Assert.True(
+            handle < arm,
+            "Window suppression may only be armed over a handle whose identity is proven. " +
+            "Arming from anything less is the global-PID failure this repair must not have.");
+        Assert.True(
+            arm < start,
+            "Window suppression must be armed BEFORE ApplicationStart. #20 measured a real " +
+            "ETABS window on screen for 5.19 s inside that call, so a guard armed after it " +
+            "returns is a guard that was down for the entire defect.");
+    }
+
+    /// <summary>
+    /// The other end of the same wire: the explicit reveal retires suppression BEFORE it
+    /// asks CSI to show the application. Reversed, the guard would still be sweeping when
+    /// the engineer's window appeared and would take it straight back down.
+    /// </summary>
+    [Fact]
+    public void TheExplicitRevealRetiresSuppressionBeforeTheCsiTransition()
+    {
+        var reveal =
+            $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}";
+
+        var release = IndexOfCall(
+            reveal,
+            $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.ReleaseWindowGuardForExplicitUserAction));
+        var unhide = IndexOfCall(
+            reveal,
+            $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.EnsureVisibleForExplicitUserAction));
+
+        Assert.True(
+            release < unhide,
+            "The window guard must be retired before the CSI visible transition, not after.");
+    }
+
+    /// <summary>
+    /// Suppression is armed from exactly one place and retired for the user from exactly
+    /// one place. Both lists are checked in both directions, so neither can describe a path
+    /// that no longer exists.
+    /// </summary>
+    [Fact]
+    public void OnlyTheLaunchArmsSuppressionAndOnlyTheExplicitOpenRetiresIt()
+    {
+        Assert.Equal([], OffendersAgainst(GuardArmSeams, GuardArmCallers));
+        Assert.Equal([], OffendersAgainst(GuardReleaseSeams, GuardReleaseCallers));
+        Assert.All(
+            GuardArmCallers,
+            caller => Assert.Contains(
+                Calls(caller),
+                call => GuardArmSeams.Contains(call, StringComparer.Ordinal)));
+        Assert.All(
+            GuardReleaseCallers,
+            caller => Assert.Contains(
+                Calls(caller),
+                call => GuardReleaseSeams.Contains(call, StringComparer.Ordinal)));
+    }
+
+    /// <summary>
+    /// No dispatch handler reaches the window guard on its own — not to arm it, and not to
+    /// retire it. The only route from a command to the guard is
+    /// <see cref="IEtabsSession.RevealForExplicitUserRequest"/>, and
+    /// <see cref="ExactlyOneDispatchHandlerCanEverPutEtabsOnScreenAndNoneCanHideIt"/>
+    /// already pins that seam to the explicit open alone; the second half here closes the
+    /// chain by proving that seam's one implementation is what retires suppression.
+    ///
+    /// <para>A handler that disabled the guard directly would silently undo the #20 repair
+    /// for the rest of the session while every fake-driven test stayed green.</para>
+    /// </summary>
+    [Fact]
+    public void NoDispatchHandlerTouchesTheWindowGuardExceptThroughTheExplicitRevealSeam()
+    {
+        var handlers = ProductionCalls.Keys
+            .Where(name => name.StartsWith(
+                $"{typeof(ServeDispatcher).FullName}.Dispatch",
+                StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.NotEmpty(handlers);
+        Assert.Equal([], handlers.Where(handler => ReachesAny(handler, GuardArmSeams)).ToArray());
+        Assert.Equal([], handlers.Where(handler => ReachesAny(handler, GuardReleaseSeams)).ToArray());
+
+        // The chain's far end: the sole implementation behind the reveal seam is the sole
+        // production method that retires suppression for the user.
+        Assert.Equal(
+            [$"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}"],
+            ProductionCalls
+                .Where(method => method.Value.Any(
+                    call => GuardReleaseSeams.Contains(call, StringComparer.Ordinal)))
+                .Select(method => method.Key)
+                .Where(name => !name.StartsWith(
+                    $"{typeof(ManagedEtabsApplication).FullName}.",
+                    StringComparison.Ordinal))
+                .Order(StringComparer.Ordinal)
+                .ToArray());
+    }
+
+    /// <summary>
+    /// Shutdown disposes the guard, on every route in. <c>ShutdownCore</c> is the single
+    /// funnel both public shutdown entry points reach, so a sweep thread cannot outlive the
+    /// session that armed it.
+    /// </summary>
+    [Fact]
+    public void ShutdownDisposesTheWindowGuardDeterministically()
+    {
+        var dispose = $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.DisposeWindowGuard);
+
+        Assert.Contains(
+            dispose,
+            Calls($"{typeof(ManagedEtabsShutdownMachine).FullName}.ShutdownCore"),
+            StringComparer.Ordinal);
+        Assert.All(
+            new[]
+            {
+                nameof(ManagedEtabsShutdownMachine.Shutdown),
+                nameof(ManagedEtabsShutdownMachine.ShutdownAfterRecoveryRecordWriteFailure)
+            },
+            entry => Assert.True(
+                ReachesAny($"{typeof(ManagedEtabsShutdownMachine).FullName}.{entry}", [dispose]),
+                $"{entry} no longer disposes the managed window guard."));
+
+        // And a failed launch retires it too, before anything is asked to exit. The guard
+        // is the only IDisposable that method touches — the owned process handle is
+        // disposed a level down, in StopOwnedProcess — so this call is that disposal.
+        Assert.Contains(
+            "System.IDisposable.Dispose",
+            Calls("EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+                ".CleanUpFailedStart"),
+            StringComparer.Ordinal);
+    }
+
     private const string OpenDispatch = "DispatchOpenModelAsync";
+
+    /// <summary>
+    /// Where <paramref name="call"/> appears in <paramref name="from"/>'s IL. Order matters
+    /// for the startup guard in a way reachability cannot express: the whole defect is a
+    /// window that was up for five seconds before anything hid it.
+    /// </summary>
+    private static int IndexOfCall(string from, string call)
+    {
+        var calls = Calls(from);
+        var index = calls.ToList().IndexOf(call);
+        Assert.True(index >= 0, $"{from} no longer calls {call}.");
+        return index;
+    }
 
     /// <summary>
     /// Every production method that touches one of <paramref name="seams"/> directly and is
