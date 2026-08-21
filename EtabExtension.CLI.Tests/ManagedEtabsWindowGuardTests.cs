@@ -143,6 +143,66 @@ public sealed class ManagedEtabsWindowGuardTests
         Assert.False(guard.IsActive);
     }
 
+    /// <summary>
+    /// The restore-time ownership recheck. Suppression filters by owning process id, but
+    /// what gets SAVED is a raw <c>HWND</c> value — and the open process handle does not
+    /// protect that. It keeps Windows from recycling the pid; it says nothing about a handle
+    /// value, which Windows may hand to a different window in a different process the moment
+    /// ETABS destroys the one we hid.
+    ///
+    /// <para>So a reveal that showed the saved list blind would <c>ShowWindow</c> a
+    /// stranger's window — a worse defect than the one this guard exists to fix. Ownership
+    /// is therefore re-proven against a fresh census at restore time.</para>
+    /// </summary>
+    [Fact]
+    public void ASuppressedHandleThatNowBelongsToAnotherProcessIsNeverShown()
+    {
+        var windows = new FakeWindows(new TopLevelWindow(60, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _);
+        guard.SweepOnce();
+        Assert.Equal([(nint)60], guard.Suppressed);
+
+        // ETABS destroyed that window between the sweep and the reveal, and Windows handed
+        // the handle value to somebody else.
+        windows.Reassign(60, ForeignPid);
+
+        guard.ReleaseForExplicitUserAction();
+
+        Assert.Empty(windows.Shown);
+        Assert.DoesNotContain((nint)60, windows.Touched.Skip(windows.Hidden.Count));
+    }
+
+    /// <summary>A handle that simply no longer exists is skipped rather than shown.</summary>
+    [Fact]
+    public void ASuppressedHandleThatNoLongerExistsIsNeverShown()
+    {
+        var windows = new FakeWindows(new TopLevelWindow(61, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out _);
+        guard.SweepOnce();
+
+        windows.Destroy(61);
+        guard.ReleaseForExplicitUserAction();
+
+        Assert.Empty(windows.Shown);
+    }
+
+    /// <summary>
+    /// And once the owned process is gone its pid is no longer provably ours, so a reveal
+    /// restores nothing at all rather than reasoning about handles that outlived it.
+    /// </summary>
+    [Fact]
+    public void AnExitedOwnedProcessRestoresNothingOnReveal()
+    {
+        var windows = new FakeWindows(new TopLevelWindow(62, Owned.Pid, IsVisible: true));
+        var guard = Guard(windows, out var owned);
+        guard.SweepOnce();
+        owned.Exit();
+
+        guard.ReleaseForExplicitUserAction();
+
+        Assert.Empty(windows.Shown);
+    }
+
     /// <summary>Shutdown is not a reveal: a process on its way out must not flash a window.</summary>
     [Fact]
     public void DisposingRestoresNothing()
@@ -411,6 +471,30 @@ public sealed class ManagedEtabsWindowGuardTests
             {
                 Shown.Add(handle);
                 Replace(handle, visible: true);
+            }
+        }
+
+        /// <summary>Hands a live handle value to a different process, as Windows may.</summary>
+        public void Reassign(nint handle, int processId)
+        {
+            lock (_gate)
+            {
+                for (var index = 0; index < _windows.Count; index++)
+                {
+                    if (_windows[index].Handle == handle)
+                    {
+                        _windows[index] = _windows[index] with { ProcessId = processId };
+                    }
+                }
+            }
+        }
+
+        /// <summary>Destroys a window, so its handle stops appearing in the census.</summary>
+        public void Destroy(nint handle)
+        {
+            lock (_gate)
+            {
+                _ = _windows.RemoveAll(window => window.Handle == handle);
             }
         }
 

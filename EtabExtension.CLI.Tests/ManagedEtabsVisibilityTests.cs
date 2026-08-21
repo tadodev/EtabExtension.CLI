@@ -242,6 +242,37 @@ public sealed class ManagedEtabsVisibilityTests
         Assert.Equal(1, api.HideCalls);
     }
 
+    /// <summary>
+    /// The bound is monotonic. A machine whose wall clock jumps backwards — an NTP
+    /// correction, a manual change, a VM resume — must not gain extra convergence budget,
+    /// and one that jumps forwards must not lose it.
+    ///
+    /// <para>The clock here reports correct monotonic elapsed time while its own wall-clock
+    /// notion of "now" walks an hour backwards on every single poll. Convergence still ends
+    /// at exactly the deadline, because there is no wall clock left for it to consult:
+    /// <see cref="IManagedEtabsClock"/> deliberately has no <c>UtcNow</c>.
+    /// <see cref="EtabsVisibilityWiringTests"/> holds the other half of this, over the
+    /// production clock's compiled call graph.</para>
+    /// </summary>
+    [Fact]
+    public void AWallClockThatJumpsBackwardsCannotExtendTheConvergenceDeadline()
+    {
+        var clock = new WallClockRewindingClock();
+        var api = new FakeVisibilityApi(visible: true) { IgnoreTransition = true };
+
+        var outcome = ManagedEtabsVisibility.EnsureHidden(
+            api,
+            new(TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100), clock));
+
+        Assert.False(outcome.Confirmed);
+        Assert.Equal(TimeSpan.FromSeconds(10), outcome.Waited);
+        Assert.Equal(100, clock.Waits.Count);
+
+        // The wall clock really did move backwards under the loop, by well beyond the
+        // deadline, and changed nothing.
+        Assert.True(clock.WallClockDrift <= TimeSpan.FromHours(-100));
+    }
+
     [Fact]
     public void AThrowingVisibilityReadIsBoundedAndNeverThrowsOutOfThePolicy()
     {
@@ -293,22 +324,54 @@ public sealed class ManagedEtabsVisibilityTests
         ManagedEtabsVisibilityPolicy.Default.PollInterval,
         new VirtualClock());
 
-    internal sealed class VirtualClock : IManagedEtabsClock
+    /// <summary>
+    /// Monotonic time that advances normally while the machine's wall clock walks backwards
+    /// underneath it — the discontinuity a deadline must be immune to.
+    /// </summary>
+    private sealed class WallClockRewindingClock : IManagedEtabsClock
     {
-        private readonly DateTimeOffset _origin = new(2026, 8, 21, 0, 0, 0, TimeSpan.Zero);
-
-        public VirtualClock() => UtcNow = _origin;
-
-        public DateTimeOffset UtcNow { get; private set; }
+        private TimeSpan _monotonic;
+        private DateTimeOffset _wallClock = new(2026, 8, 21, 0, 0, 0, TimeSpan.Zero);
+        private readonly DateTimeOffset _wallClockOrigin =
+            new(2026, 8, 21, 0, 0, 0, TimeSpan.Zero);
 
         public List<TimeSpan> Waits { get; } = [];
 
-        public TimeSpan Elapsed => UtcNow - _origin;
+        public TimeSpan WallClockDrift => _wallClock - _wallClockOrigin;
+
+        public long Timestamp => _monotonic.Ticks;
+
+        public TimeSpan ElapsedSince(long timestamp) =>
+            TimeSpan.FromTicks(_monotonic.Ticks - timestamp);
 
         public void Wait(TimeSpan interval)
         {
             Waits.Add(interval);
-            UtcNow = UtcNow.Add(interval);
+            _monotonic += interval;
+            _wallClock = _wallClock.AddHours(-1);
+        }
+    }
+
+    internal sealed class VirtualClock : IManagedEtabsClock
+    {
+        /// <summary>
+        /// Virtual MONOTONIC time. Deliberately not a date: the production clock exposes a
+        /// timestamp and an elapsed-since precisely so that no deadline can be computed from
+        /// a wall clock, and a fake that offered a "now" would let one back in.
+        /// </summary>
+        public TimeSpan Elapsed { get; private set; }
+
+        public List<TimeSpan> Waits { get; } = [];
+
+        public long Timestamp => Elapsed.Ticks;
+
+        public TimeSpan ElapsedSince(long timestamp) =>
+            TimeSpan.FromTicks(Elapsed.Ticks - timestamp);
+
+        public void Wait(TimeSpan interval)
+        {
+            Waits.Add(interval);
+            Elapsed += interval;
         }
     }
 

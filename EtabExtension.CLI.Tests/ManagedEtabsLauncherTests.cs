@@ -773,20 +773,24 @@ public sealed class ManagedEtabsLauncherTests
     /// <summary>Virtual time, so every bounded wait in the launcher runs at full speed.</summary>
     private sealed class FakeClock : IManagedEtabsClock
     {
-        private readonly DateTimeOffset _origin = new(2026, 8, 21, 0, 0, 0, TimeSpan.Zero);
-
-        public FakeClock() => UtcNow = _origin;
-
-        public DateTimeOffset UtcNow { get; private set; }
+        /// <summary>
+        /// Virtual MONOTONIC time. Deliberately not a date: the production clock exposes a
+        /// timestamp and an elapsed-since precisely so that no deadline can be computed from
+        /// a wall clock, and a fake that offered a "now" would let one back in.
+        /// </summary>
+        public TimeSpan Elapsed { get; private set; }
 
         public List<TimeSpan> Waits { get; } = [];
 
-        public TimeSpan Elapsed => UtcNow - _origin;
+        public long Timestamp => Elapsed.Ticks;
+
+        public TimeSpan ElapsedSince(long timestamp) =>
+            TimeSpan.FromTicks(Elapsed.Ticks - timestamp);
 
         public void Wait(TimeSpan interval)
         {
             Waits.Add(interval);
-            UtcNow = UtcNow.Add(interval);
+            Elapsed += interval;
         }
     }
 

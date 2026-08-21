@@ -554,6 +554,118 @@ public sealed class EtabsVisibilityWiringTests
             StringComparer.Ordinal);
     }
 
+    /// <summary>Every way this codebase could ask the operating system what time it is.</summary>
+    private static readonly string[] WallClockReads =
+    [
+        "System.DateTime.get_UtcNow",
+        "System.DateTime.get_Now",
+        "System.DateTimeOffset.get_UtcNow",
+        "System.DateTimeOffset.get_Now",
+        "System.TimeProvider.GetUtcNow",
+        "System.TimeProvider.GetLocalNow"
+    ];
+
+    /// <summary>
+    /// Both bounded waits in the managed session — the 10 s hide convergence and the
+    /// ownership census settle — must be measured monotonically.
+    ///
+    /// <para>A deadline computed by subtracting two wall-clock readings is not a bound. An
+    /// NTP correction or a manual clock change backwards extends it, potentially without
+    /// limit; one forwards ends it early, which for the hide convergence means declaring an
+    /// unproven visibility failure — and now a refused session — the moment the machine's
+    /// clock is adjusted.</para>
+    ///
+    /// <para>Stated over the compiled assembly because the wall-clock version is a
+    /// one-character-class edit away and behaves identically on a machine whose clock never
+    /// moves, which is every machine a test runs on. Reverting the clock to
+    /// <c>DateTimeOffset.UtcNow</c> fails here.</para>
+    /// </summary>
+    [Fact]
+    public void BoundedWaitsAreMeasuredMonotonicallyAndNeverAgainstTheWallClock()
+    {
+        var clock = typeof(SystemManagedEtabsClock).FullName;
+
+        Assert.Contains(
+            "System.Diagnostics.Stopwatch.GetTimestamp",
+            Calls($"{clock}.get_{nameof(SystemManagedEtabsClock.Timestamp)}"),
+            StringComparer.Ordinal);
+        Assert.Contains(
+            "System.Diagnostics.Stopwatch.GetElapsedTime",
+            Calls($"{clock}.{nameof(SystemManagedEtabsClock.ElapsedSince)}"),
+            StringComparer.Ordinal);
+
+        // The seam itself offers no "now", so a deadline cannot be written against one.
+        Assert.DoesNotContain(
+            nameof(DateTime.UtcNow),
+            typeof(IManagedEtabsClock).GetMembers().Select(member => member.Name),
+            StringComparer.Ordinal);
+
+        // And neither the clock nor either deadline site reads a wall clock directly.
+        var deadlineSites = ProductionCalls
+            .Where(method => method.Key.StartsWith($"{clock}.", StringComparison.Ordinal)
+                || method.Key == $"{typeof(ManagedEtabsVisibility).FullName}.Ensure"
+                || method.Key ==
+                    "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+                    ".CensusExactlyOneOwnedProcess")
+            .Where(method => method.Value.Any(
+                call => WallClockReads.Contains(call, StringComparer.Ordinal)))
+            .Select(method => method.Key)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal([], deadlineSites);
+    }
+
+    /// <summary>
+    /// And both sites really do consult the monotonic seam, so neither list above can be
+    /// describing a deadline that no longer exists.
+    /// </summary>
+    [Theory]
+    [InlineData("EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsVisibility.Ensure")]
+    [InlineData("EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
+        ".CensusExactlyOneOwnedProcess")]
+    public void EachBoundedWaitMeasuresItselfThroughTheMonotonicSeam(string site)
+    {
+        var calls = Calls(site);
+
+        Assert.Contains(
+            $"{typeof(IManagedEtabsClock).FullName}.get_{nameof(IManagedEtabsClock.Timestamp)}",
+            calls,
+            StringComparer.Ordinal);
+        Assert.Contains(
+            $"{typeof(IManagedEtabsClock).FullName}.{nameof(IManagedEtabsClock.ElapsedSince)}",
+            calls,
+            StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// The reveal's restore re-proves ownership before it shows anything. Suppression
+    /// filters by owning pid, but the saved value is a raw HWND and the process handle does
+    /// not protect it — so the restore path must re-observe the census rather than trust the
+    /// list. Deleting that re-observation fails here as well as behaviourally.
+    /// </summary>
+    [Fact]
+    public void TheRestorePathReObservesOwnershipBeforeShowingAnything()
+    {
+        var restore = $"{typeof(ManagedEtabsWindowGuard).FullName}.RestoreStillOwned";
+        var calls = Calls(restore);
+        var enumerate = calls.ToList().IndexOf(
+            $"{typeof(ITopLevelWindows).FullName}.{nameof(ITopLevelWindows.Enumerate)}");
+        var show = calls.ToList().IndexOf(
+            $"{typeof(ITopLevelWindows).FullName}.{nameof(ITopLevelWindows.Show)}");
+
+        Assert.True(enumerate >= 0, "The restore no longer re-observes the window census.");
+        Assert.True(show >= 0, "The restore no longer shows anything.");
+        Assert.True(
+            enumerate < show,
+            "Ownership must be re-proven BEFORE a saved handle is shown; an HWND value can " +
+            "be reused by another window in another process once ETABS destroys ours.");
+        Assert.Contains(
+            $"{typeof(IOwnedEtabsProcess).FullName}.get_{nameof(IOwnedEtabsProcess.HasExited)}",
+            calls,
+            StringComparer.Ordinal);
+    }
+
     private const string OpenDispatch = "DispatchOpenModelAsync";
 
     /// <summary>
