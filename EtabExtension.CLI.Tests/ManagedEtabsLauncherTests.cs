@@ -8,10 +8,15 @@ namespace EtabExtension.CLI.Tests;
 // The managed startup contract, exercised end to end without ETABS or COM.
 //
 // Sequence under test (Cardex ETABS 23.3): preflight census -> cHelper.CreateObject
-// (which starts the program) -> cOAPI.ApplicationStart() == 0 -> cOAPI.SapModel present
-// -> exact OS census -> authoritative owned handle. Initialization and the EtabSharp wrap
+// (which starts the program) -> exact OS census -> authoritative owned handle -> Windows
+// window guard armed over that exact process -> cOAPI.ApplicationStart() == 0 ->
+// cOAPI.Hide confirmed -> cOAPI.SapModel present. Initialization and the EtabSharp wrap
 // happen afterwards, in EtabsSession, so the record is written between ownership and
 // initialization.
+//
+// Ownership moved ahead of ApplicationStart for one reason: the supervised #20 live
+// certification measured a real ETABS window on screen for 5.19 s INSIDE that call, and a
+// window cannot be suppressed before the process that owns it has been proven to be ours.
 public sealed class ManagedEtabsLauncherTests
 {
     private static readonly ManagedProcessIdentity Identity = new(
@@ -34,6 +39,12 @@ public sealed class ManagedEtabsLauncherTests
             [
                 "census-preflight",
                 "create-object",
+                // Ownership as early as CreateObject allows, because the window guard may
+                // only ever be armed over a process this launcher has proven it owns.
+                "census-ownership",
+                "open-exact",
+                "window-guard-activate",
+                // And only then the blocking start, with suppression already holding.
                 "application-start",
                 // Hidden before anything else touches the started application: the window
                 // must never reach the screen for a session created to do background work.
@@ -41,8 +52,6 @@ public sealed class ManagedEtabsLauncherTests
                 "hide",
                 "visible",
                 "sap-model",
-                "census-ownership",
-                "open-exact",
                 "version-probe",
                 "oapi-version"
             ],
@@ -168,7 +177,9 @@ public sealed class ManagedEtabsLauncherTests
         var processes = new FakeProcesses
         {
             AfterStart = [Identity],
-            ExactTerminationResult = new(ExactProcessTerminationState.ExitUnconfirmed, Identity)
+            // Ownership is proven before the start now, so an unresolved cleanup is
+            // expressed through the authoritative handle rather than a census fallback.
+            OpenExactResult = new FakeOwnedProcess(Identity) { RefusesToExit = true }
         };
         var launcher = Build(api, processes, out _);
 
@@ -238,12 +249,20 @@ public sealed class ManagedEtabsLauncherTests
         Assert.Contains($"returnCode={returnCode}", error.Message, StringComparison.Ordinal);
 
         // Raw exit first, then exact-identity termination of the process it started.
+        // Ownership is now proven BEFORE the start, so the authoritative handle — not a
+        // re-derived census — is what stops the process this attempt started.
         Assert.Equal(1, api.ExitCount);
-        Assert.Equal(1, processes.TerminateExactCalls);
-        Assert.Equal(Identity, processes.TerminateExactExpected);
-        Assert.Equal(TimeSpan.FromSeconds(10), processes.TerminateExactTimeout);
+        Assert.Equal(0, processes.TerminateExactCalls);
+        Assert.Equal(1, processes.OpenedHandle!.KillCount);
+        Assert.True(processes.OpenedHandle.Disposed);
         Assert.Equal(0, api.WrapCount);
-        Assert.DoesNotContain("open-exact", events);
+        Assert.Contains("open-exact", events);
+
+        // And the suppression is retired before anything is asked to exit, so a failed
+        // start cannot put a window on screen on its way out.
+        Assert.True(Assert.Single(processes.Guards.Activated).Disposed);
+        Assert.False(processes.Guards.Activated[0].ReleasedForUser);
+        Assert.False(processes.Guards.Activated[0].IsActive);
     }
 
     [Fact]
@@ -261,11 +280,12 @@ public sealed class ManagedEtabsLauncherTests
 
         Assert.Equal(EtabsLaunchErrorCodes.ApplicationStartFailed, error.Code);
         Assert.Equal(1, api.ExitCount);
-        Assert.Equal(1, processes.TerminateExactCalls);
+        Assert.Equal(1, processes.OpenedHandle!.KillCount);
+        Assert.True(processes.Guards.Activated[0].Disposed);
     }
 
     [Fact]
-    public void MissingSapModelFailsTypedBeforeAnyOwnershipClaim()
+    public void MissingSapModelFailsTypedAndStopsTheProcessItAlreadyOwned()
     {
         var api = new FakeRawApi { HasSapModelValue = false };
         var processes = new FakeProcesses
@@ -278,9 +298,10 @@ public sealed class ManagedEtabsLauncherTests
         var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
 
         Assert.Equal(EtabsLaunchErrorCodes.ApiModelUnavailable, error.Code);
-        Assert.DoesNotContain("open-exact", events);
+        Assert.Contains("open-exact", events);
         Assert.Equal(1, api.ExitCount);
-        Assert.Equal(1, processes.TerminateExactCalls);
+        Assert.Equal(1, processes.OpenedHandle!.KillCount);
+        Assert.True(processes.Guards.Activated[0].Disposed);
     }
 
     [Fact]
@@ -300,6 +321,9 @@ public sealed class ManagedEtabsLauncherTests
         Assert.Equal(["census-preflight"], events);
         Assert.Equal(0, api.StartCount);
         Assert.Equal(0, processes.TerminateExactCalls);
+
+        // Nothing was created, so nothing was owned, so nothing was guarded.
+        Assert.Empty(processes.Guards.Activated);
     }
 
     [Fact]
@@ -355,6 +379,11 @@ public sealed class ManagedEtabsLauncherTests
         Assert.Equal(EtabsLaunchErrorCodes.ProcessIdentityFailed, error.Code);
         Assert.Equal(1, api.ExitCount);
         Assert.Equal(1, processes.TerminateExactCalls);
+
+        // No authoritative handle means no guard: suppression is never armed on a process
+        // whose identity this launcher could not confirm.
+        Assert.Empty(processes.Guards.Activated);
+        Assert.Equal(0, api.StartCount);
     }
 
     [Fact]
@@ -372,7 +401,9 @@ public sealed class ManagedEtabsLauncherTests
             new FakeResolver(Identity.ExecutablePath),
             new FakeApiFactory(api, []),
             new ThrowingVersionProbe(),
-            TextWriter.Null);
+            TextWriter.Null,
+            processes.Guards,
+            new FakeClock());
 
         var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
 
@@ -407,20 +438,20 @@ public sealed class ManagedEtabsLauncherTests
     }
 
     /// <summary>
-    /// A visibility problem must not become a startup refusal. Startup readiness,
-    /// identity and recovery semantics are unchanged by CLI #22 — a session that cannot
-    /// be hidden is loud on stderr and still usable, because failing Commit outright over
-    /// a window would be a worse outcome than the window.
+    /// A visibility problem IS a startup refusal now. It used to be loud-and-continue, on
+    /// the reasoning that failing Commit over a window costs more than the window; the
+    /// supervised #20 certification measured that cost — a real ETABS window on screen for
+    /// 5.19 s of a background run — and rejected the candidate for it.
     ///
-    /// <para>Each row carries the code it must produce. Asserting only that the text says
-    /// "ETABS" and "hidden" would pass on the static prefix alone: deleting the interpolated
-    /// diagnostic — the only part naming the CSI call that disagreed, and the thing the XML
-    /// doc promises — would go unnoticed, and the two rows would be indistinguishable.</para>
+    /// <para>Each row carries the code it must produce. Asserting only that the message
+    /// says "hidden" would pass on the static prefix alone: deleting the CSI diagnostic —
+    /// the only part naming the call that disagreed — would go unnoticed, and the two rows
+    /// would be indistinguishable.</para>
     /// </summary>
     [Theory]
     [InlineData(true, false, EtabsApiErrorCodes.ApiCallFailed, "returnCode=1")]
     [InlineData(false, true, EtabsApiErrorCodes.VisibilityNotConfirmed, "observed=visible")]
-    public void AHideThatCannotBeConfirmedIsLoudButDoesNotFailTheLaunch(
+    public void AHideThatCannotBeConfirmedFailsTheLaunchAndStopsTheOwnedProcess(
         bool nonZeroReturn,
         bool ignoreHide,
         string expectedCode,
@@ -431,26 +462,76 @@ public sealed class ManagedEtabsLauncherTests
             HideReturnCode = nonZeroReturn ? 1 : 0,
             IgnoreHide = ignoreHide
         };
-        var diagnostics = new StringWriter();
-        var launcher = new ManagedEtabsLauncher(
-            new FakeProcesses { AfterStart = [Identity] },
-            new FakeResolver(Identity.ExecutablePath),
-            new FakeApiFactory(api, []),
-            new FakeVersionProbe(),
-            diagnostics);
+        var processes = new FakeProcesses { AfterStart = [Identity] };
+        var launcher = Build(api, processes, out _);
 
-        var managed = launcher.Launch();
-        var text = diagnostics.ToString();
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
 
-        Assert.Equal(Identity, managed.Identity);
-        Assert.Equal(1, api.HideCalls);
-        Assert.Contains("hidden", text, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains(expectedCode, text, StringComparison.Ordinal);
+        Assert.Equal(EtabsLaunchErrorCodes.HiddenStateNotEstablished, error.Code);
+        Assert.Contains(expectedCode, error.Message, StringComparison.Ordinal);
         Assert.Contains(
             $"operation={ManagedEtabsVisibility.HideOperation}",
-            text,
+            error.Message,
             StringComparison.Ordinal);
-        Assert.Contains(expectedDetail, text, StringComparison.Ordinal);
+        Assert.Contains(expectedDetail, error.Message, StringComparison.Ordinal);
+
+        // Exactly one Hide, whatever happened: convergence observes, it never re-issues.
+        Assert.Equal(1, api.HideCalls);
+
+        // The exact owned process is stopped, and suppression is retired, not leaked.
+        Assert.Equal(1, processes.OpenedHandle!.KillCount);
+        Assert.True(processes.Guards.Activated[0].Disposed);
+        Assert.NotNull(error.Cleanup);
+        Assert.True(error.Cleanup!.Success);
+    }
+
+    /// <summary>
+    /// The #20 measurement, stated as a test. <c>Hide()</c> returned success and the very
+    /// next <c>Visible()</c> read still said visible — a deferred CSI transition, not a
+    /// failed one. The candidate declared failure on that first read; convergence waits it
+    /// out, and confirms from what it finally observed.
+    /// </summary>
+    [Fact]
+    public void ADeferredHideConvergesInsteadOfBeingDeclaredAFailure()
+    {
+        var api = new FakeRawApi { VisibleReadsBeforeHideLands = 12 };
+        var processes = new FakeProcesses { AfterStart = [Identity] };
+        var clock = new FakeClock();
+        var launcher = Build(api, processes, out _, clock);
+
+        var managed = launcher.Launch();
+
+        Assert.Equal(Identity, managed.Identity);
+        Assert.False(api.IsVisible);
+
+        // One transition, many observations. Re-issuing Hide while the first was landing
+        // is what Cardex says would manufacture an error out of a slow success.
+        Assert.Equal(1, api.HideCalls);
+        Assert.True(api.VisibleCalls > 2, $"expected repeated reads, saw {api.VisibleCalls}");
+        Assert.All(clock.Waits, wait => Assert.Equal(
+            ManagedEtabsVisibilityPolicy.Default.PollInterval,
+            wait));
+    }
+
+    /// <summary>
+    /// And the ceiling holds: a hide that never lands is still a refusal, not an unbounded
+    /// wait. The launch fails with the CSI evidence and the owned process is stopped.
+    /// </summary>
+    [Fact]
+    public void AHideThatNeverConvergesFailsAtTheDeadlineRatherThanWaitingForever()
+    {
+        var api = new FakeRawApi { IgnoreHide = true };
+        var processes = new FakeProcesses { AfterStart = [Identity] };
+        var clock = new FakeClock();
+        var launcher = Build(api, processes, out _, clock);
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        Assert.Equal(EtabsLaunchErrorCodes.HiddenStateNotEstablished, error.Code);
+        Assert.Equal(1, api.HideCalls);
+        Assert.Equal(
+            ManagedEtabsVisibilityPolicy.Default.ConvergenceDeadline,
+            clock.Elapsed);
     }
 
     /// <summary>
@@ -483,6 +564,90 @@ public sealed class ManagedEtabsLauncherTests
         // Cardex: Hide on an already-hidden application returns an error, so the second row
         // must not have called it at all.
         Assert.Equal(visibleAfterStart ? 1 : 0, api.HideCalls);
+    }
+
+    /// <summary>
+    /// The window guard is armed over the authoritative handle itself, never over a pid,
+    /// and it is armed before the blocking start call the #20 run measured a window
+    /// through. Deleting the activation from <c>Launch</c> fails here.
+    /// </summary>
+    [Fact]
+    public void TheWindowGuardIsArmedOverTheProvenHandleBeforeApplicationStart()
+    {
+        var api = new FakeRawApi();
+        var owned = new FakeOwnedProcess(Identity);
+        var processes = new FakeProcesses { AfterStart = [Identity], OpenExactResult = owned };
+        var launcher = Build(api, processes, out var events);
+
+        launcher.Launch();
+
+        var guard = Assert.Single(processes.Guards.Activated);
+        Assert.Same(owned, guard.Owned);
+        Assert.Equal(Identity, guard.Identity);
+        Assert.True(
+            events.IndexOf("window-guard-activate") < events.IndexOf("application-start"),
+            "Suppression must be armed before the blocking ApplicationStart call.");
+        Assert.True(
+            events.IndexOf("open-exact") < events.IndexOf("window-guard-activate"),
+            "Suppression may only be armed once ownership is authoritative.");
+
+        // Still guarding when the application is handed over: startup, initialization,
+        // API readiness and every background command run under it.
+        Assert.False(guard.Disposed);
+        Assert.False(guard.ReleasedForUser);
+    }
+
+    /// <summary>
+    /// The census moved ahead of <c>ApplicationStart</c>, so it can now meet a process that
+    /// is seconds old and not yet willing to report its main module. That is a transient,
+    /// and it is waited out — never resolved optimistically, and never at the cost of the
+    /// fail-closed rule below.
+    /// </summary>
+    [Fact]
+    public void AProcessThatCannotYetBeIdentifiedIsWaitedOutRatherThanFailedOrGuessed()
+    {
+        var api = new FakeRawApi();
+        var processes = new FakeProcesses
+        {
+            AfterStartObservations =
+            [
+                new([], 1),
+                new([], 1),
+                new([Identity], 0)
+            ]
+        };
+        var clock = new FakeClock();
+        var launcher = Build(api, processes, out _, clock);
+
+        var managed = launcher.Launch();
+
+        Assert.Equal(Identity, managed.Identity);
+        Assert.Equal(
+            [
+                ManagedEtabsLauncher.OwnershipCensusPollInterval,
+                ManagedEtabsLauncher.OwnershipCensusPollInterval
+            ],
+            clock.Waits);
+    }
+
+    /// <summary>
+    /// And the deadline still fails closed on an ambiguity that never resolves: nothing is
+    /// guarded, nothing is wrapped, and no process is claimed.
+    /// </summary>
+    [Fact]
+    public void AnOwnershipCensusThatNeverResolvesFailsClosedAtTheDeadline()
+    {
+        var api = new FakeRawApi();
+        var processes = new FakeProcesses { AfterStart = [Identity], AfterStartUnidentified = 1 };
+        var clock = new FakeClock();
+        var launcher = Build(api, processes, out _, clock);
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        Assert.Equal(EtabsLaunchErrorCodes.ExternalOrAmbiguousInstance, error.Code);
+        Assert.Equal(ManagedEtabsLauncher.OwnershipCensusDeadline, clock.Elapsed);
+        Assert.Empty(processes.Guards.Activated);
+        Assert.Equal(0, api.StartCount);
     }
 
     [Fact]
@@ -560,18 +725,70 @@ public sealed class ManagedEtabsLauncherTests
     private static ManagedEtabsLauncher Build(
         FakeRawApi api,
         FakeProcesses processes,
-        out List<string> events)
+        out List<string> events,
+        FakeClock? clock = null)
     {
         var recorded = new List<string>();
         events = recorded;
         api.Events = recorded;
         processes.Events = recorded;
+        processes.Guards.Events = recorded;
         return new ManagedEtabsLauncher(
             processes,
             new FakeResolver(Identity.ExecutablePath),
             new FakeApiFactory(api, recorded),
             new FakeVersionProbe(recorded),
-            TextWriter.Null);
+            TextWriter.Null,
+            processes.Guards,
+            clock ?? new FakeClock());
+    }
+
+    /// <summary>Virtual time, so every bounded wait in the launcher runs at full speed.</summary>
+    private sealed class FakeClock : IManagedEtabsClock
+    {
+        private readonly DateTimeOffset _origin = new(2026, 8, 21, 0, 0, 0, TimeSpan.Zero);
+
+        public FakeClock() => UtcNow = _origin;
+
+        public DateTimeOffset UtcNow { get; private set; }
+
+        public List<TimeSpan> Waits { get; } = [];
+
+        public TimeSpan Elapsed => UtcNow - _origin;
+
+        public void Wait(TimeSpan interval)
+        {
+            Waits.Add(interval);
+            UtcNow = UtcNow.Add(interval);
+        }
+    }
+
+    private sealed class FakeWindowGuardFactory : IManagedEtabsWindowGuardFactory
+    {
+        public List<string> Events { get; set; } = [];
+
+        public List<FakeWindowGuard> Activated { get; } = [];
+
+        public IManagedEtabsWindowGuard Activate(IOwnedEtabsProcess ownedProcess)
+        {
+            Events.Add("window-guard-activate");
+            var guard = new FakeWindowGuard(ownedProcess);
+            Activated.Add(guard);
+            return guard;
+        }
+    }
+
+    private sealed class FakeWindowGuard(IOwnedEtabsProcess owned) : IManagedEtabsWindowGuard
+    {
+        public IOwnedEtabsProcess Owned { get; } = owned;
+        public ManagedProcessIdentity Identity => Owned.Identity;
+        public bool IsActive => !Disposed && !ReleasedForUser;
+        public bool Disposed { get; private set; }
+        public bool ReleasedForUser { get; private set; }
+
+        public void ReleaseForExplicitUserAction() => ReleasedForUser = true;
+
+        public void Dispose() => Disposed = true;
     }
 
     private sealed class FakeResolver(string path) : IEtabsExecutableResolver
@@ -633,8 +850,16 @@ public sealed class ManagedEtabsLauncherTests
         public Exception? OapiVersionException { get; set; }
         public int HideReturnCode { get; set; }
         public bool IgnoreHide { get; set; }
+
+        /// <summary>
+        /// Reads that still report "visible" after an accepted Hide, reproducing the #20
+        /// measurement: the call is taken, the state follows later.
+        /// </summary>
+        public int VisibleReadsBeforeHideLands { get; set; }
+
         public bool VisibleAfterStart { get; set; } = true;
         public bool IsVisible { get; private set; }
+        public int VisibleCalls { get; private set; }
         public int HideCalls { get; private set; }
         public int UnhideCalls { get; private set; }
         public int StartCount { get; private set; }
@@ -662,14 +887,40 @@ public sealed class ManagedEtabsLauncherTests
         public bool Visible()
         {
             Events.Add("visible");
+            VisibleCalls++;
+            if (_pendingDeferredReads > 0)
+            {
+                _pendingDeferredReads--;
+                if (_pendingDeferredReads == 0)
+                {
+                    IsVisible = false;
+                }
+
+                return true;
+            }
+
             return IsVisible;
         }
+
+        private int _pendingDeferredReads;
 
         public int Hide()
         {
             Events.Add("hide");
             HideCalls++;
-            if (HideReturnCode == 0 && !IgnoreHide) IsVisible = false;
+            if (HideReturnCode != 0 || IgnoreHide)
+            {
+                return HideReturnCode;
+            }
+
+            if (VisibleReadsBeforeHideLands > 0)
+            {
+                // Accepted now, applied later — exactly what the live run observed.
+                _pendingDeferredReads = VisibleReadsBeforeHideLands;
+                return 0;
+            }
+
+            IsVisible = false;
             return HideReturnCode;
         }
 
@@ -737,10 +988,16 @@ public sealed class ManagedEtabsLauncherTests
         public int KillCount { get; private set; }
         public bool Disposed { get; private set; }
 
+        /// <summary>A process that will not die, so unresolved cleanup stays expressible.</summary>
+        public bool RefusesToExit { get; init; }
+
         public void Kill()
         {
             KillCount++;
-            HasExited = true;
+            if (!RefusesToExit)
+            {
+                HasExited = true;
+            }
         }
 
         public bool WaitForExit(TimeSpan timeout) => HasExited;
@@ -751,11 +1008,21 @@ public sealed class ManagedEtabsLauncherTests
     private sealed class FakeProcesses : IProcessInspector
     {
         private bool _preflightObserved;
+        private int _ownershipObservations;
 
         public List<string> Events { get; set; } = [];
         public ManagedProcessIdentity[] Preflight { get; set; } = [];
         public ManagedProcessIdentity[] AfterStart { get; set; } = [];
         public int AfterStartUnidentified { get; set; }
+
+        /// <summary>
+        /// Successive ownership-census answers, when the test needs the census to settle
+        /// rather than resolve on the first look. The last entry repeats.
+        /// </summary>
+        public EtabsProcessObservation[] AfterStartObservations { get; set; } = [];
+
+        public FakeWindowGuardFactory Guards { get; } = new();
+        public FakeOwnedProcess? OpenedHandle { get; private set; }
         public IOwnedEtabsProcess? OpenExactResult { get; set; } = new FakeOwnedProcess(Identity);
         public ExactProcessTerminationResult ExactTerminationResult { get; set; } = new(
             ExactProcessTerminationState.ConfirmedGone,
@@ -774,7 +1041,14 @@ public sealed class ManagedEtabsLauncherTests
             }
 
             Events.Add("census-ownership");
-            return new(AfterStart, AfterStartUnidentified);
+            if (AfterStartObservations.Length == 0)
+            {
+                return new(AfterStart, AfterStartUnidentified);
+            }
+
+            var index = Math.Min(_ownershipObservations, AfterStartObservations.Length - 1);
+            _ownershipObservations++;
+            return AfterStartObservations[index];
         }
 
         public ManagedProcessIdentity? Find(int pid) =>
@@ -783,6 +1057,7 @@ public sealed class ManagedEtabsLauncherTests
         public IOwnedEtabsProcess? OpenExact(ManagedProcessIdentity expected)
         {
             Events.Add("open-exact");
+            OpenedHandle = OpenExactResult as FakeOwnedProcess;
             return OpenExactResult;
         }
 

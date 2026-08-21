@@ -170,11 +170,12 @@ public static class ManagedEtabsVisibility
 
     /// <summary>
     /// Background-work state: ETABS must not appear on screen or in the Windows taskbar.
+    ///
+    /// <para>The convergence policy is always passed explicitly. A convenience overload
+    /// that supplied the default would call this one, and the whole-assembly wiring guard
+    /// reads the call graph — a seam that calls itself is a seam whose callers can no
+    /// longer be enumerated.</para>
     /// </summary>
-    public static ManagedEtabsVisibilityOutcome EnsureHidden(IEtabsVisibilityApi api) =>
-        EnsureHidden(api, ManagedEtabsVisibilityPolicy.Default);
-
-    /// <inheritdoc cref="EnsureHidden(IEtabsVisibilityApi)" />
     public static ManagedEtabsVisibilityOutcome EnsureHidden(
         IEtabsVisibilityApi api,
         ManagedEtabsVisibilityPolicy policy) =>
@@ -185,10 +186,6 @@ public static class ManagedEtabsVisibility
     /// requested model has been confirmed open — an empty window is the symptom, not the
     /// goal.
     /// </summary>
-    public static ManagedEtabsVisibilityOutcome EnsureVisible(IEtabsVisibilityApi api) =>
-        EnsureVisible(api, ManagedEtabsVisibilityPolicy.Default);
-
-    /// <inheritdoc cref="EnsureVisible(IEtabsVisibilityApi)" />
     public static ManagedEtabsVisibilityOutcome EnsureVisible(
         IEtabsVisibilityApi api,
         ManagedEtabsVisibilityPolicy policy) =>

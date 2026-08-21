@@ -1,4 +1,5 @@
-﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
+﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
 using Xunit;
 
@@ -128,6 +129,42 @@ public sealed class ManagedSessionTests
     }
 
     /// <summary>
+    /// The order the #20 repair turns on. The requested model is already confirmed open by
+    /// the time this method is reached, so the Windows window suppression is retired FIRST
+    /// and the CSI transition follows. Reversed, the guard would still be sweeping when the
+    /// engineer's window appeared and would take it straight back down.
+    /// </summary>
+    [Fact]
+    public void AnExplicitRevealRetiresTheWindowGuardBeforeTheCsiTransition()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Events.Clear();
+
+        fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.Equal(["window-guard-release", "ensure-visible"], fixture.Events);
+        Assert.Equal(1, fixture.Managed.WindowGuardReleaseCalls);
+    }
+
+    /// <summary>
+    /// A reveal that CSI refuses still leaves the guard retired. Re-arming after a failed
+    /// transition would be the one path back to hiding a window the user asked for.
+    /// </summary>
+    [Fact]
+    public void AFailedRevealStillLeavesTheWindowGuardRetired()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.RevealSucceeds = false;
+        fixture.Session.GetOrStartOwned();
+
+        var revealed = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.False(revealed.Success);
+        Assert.Equal(1, fixture.Managed.WindowGuardReleaseCalls);
+    }
+
+    /// <summary>
     /// The reuse rule, and the reason the hide lives at creation rather than at the head
     /// of every background command: a background command running against a session the
     /// user explicitly opened must leave it on screen.
@@ -147,6 +184,11 @@ public sealed class ManagedSessionTests
         Assert.True(fixture.Managed.IsVisible);
         Assert.Equal(1, fixture.Managed.HiddenCalls);
         Assert.Equal(1, fixture.Managed.RevealCalls);
+
+        // And the suppression is never re-armed: the guard is released exactly once, by
+        // the reveal, and no amount of later background reuse touches it again.
+        Assert.Equal(1, fixture.Managed.WindowGuardReleaseCalls);
+        Assert.Equal(0, fixture.Managed.WindowGuardDisposeCalls);
     }
 
     [Fact]
@@ -164,21 +206,69 @@ public sealed class ManagedSessionTests
     }
 
     /// <summary>
-    /// Hiding is best effort by design — see the launcher tests. A session that could not
-    /// be hidden is still a working session, because failing Commit over a window would
-    /// cost the user more than the window does.
+    /// The policy the #20 certification forced. Hiding used to be best effort: a session
+    /// that could not be confirmed hidden was handed out anyway, on the reasoning that
+    /// failing over a window costs the engineer more than the window does. The supervised
+    /// run measured what that actually costs — a materially visible ETABS for 5.19 s of a
+    /// background command — so an unproven hidden state now ends the session, and the
+    /// exact owned process is cleaned up rather than left running.
     /// </summary>
     [Fact]
-    public void AHideThatCannotBeConfirmedStillYieldsAUsableSession()
+    public void AHideThatCannotBeConfirmedFailsSessionCreationAndCleansUp()
     {
-        var fixture = VisibilityFixture.Create();
+        var fixture = VisibilityFixture.Create(waitResults: [true]);
         fixture.Managed.HideSucceeds = false;
 
-        var owned = fixture.Session.GetOrStartOwned();
+        var error = Assert.Throws<EtabsLaunchException>(() => fixture.Session.GetOrStartOwned());
+        var repeated = Assert.Throws<EtabsLaunchException>(() => fixture.Session.GetOrStartOwned());
 
-        Assert.Same(fixture.Managed, owned);
-        Assert.True(fixture.Session.IsStarted);
+        Assert.Equal(EtabsLaunchErrorCodes.HiddenStateNotEstablished, error.Code);
+        Assert.Contains(
+            EtabsApiErrorCodes.VisibilityNotConfirmed,
+            error.Message,
+            StringComparison.Ordinal);
+        Assert.Contains("processExitConfirmed=True", error.Message, StringComparison.Ordinal);
+        Assert.Equal(error.Message, repeated.Message);
+        Assert.False(fixture.Session.IsStarted);
+
+        // The exact owned process is exited, not abandoned with an unproven window.
         Assert.Equal(1, fixture.Managed.HiddenCalls);
+        Assert.Equal(1, fixture.Managed.ExitCount);
+        Assert.Equal(1, fixture.Managed.ProcessHandleReleaseCount);
+        Assert.Equal(1, fixture.Managed.WindowGuardDisposeCalls);
+    }
+
+    /// <summary>
+    /// The false-success line the #20 run caught: "✓ ETABS started hidden (PID …)" printed
+    /// immediately after two "could not be confirmed hidden" warnings. It is now
+    /// unreachable — the same failure path that tears the session down is the only exit
+    /// from an unconfirmed hide, so no run can report a hidden state nothing observed.
+    /// </summary>
+    [Fact]
+    public void NoStartedHiddenSuccessLineIsEmittedWhenVisibilityIsUnconfirmed()
+    {
+        var fixture = VisibilityFixture.Create(waitResults: [true]);
+        fixture.Managed.HideSucceeds = false;
+
+        Assert.Throws<EtabsLaunchException>(() => fixture.Session.GetOrStartOwned());
+
+        var written = fixture.Diagnostics.ToString();
+        Assert.DoesNotContain("started hidden", written, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("hidden before use", written, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>The other side of it: a confirmed hide still reports the success it proved.</summary>
+    [Fact]
+    public void AConfirmedHideReportsTheStartedHiddenSuccessLine()
+    {
+        var fixture = VisibilityFixture.Create();
+
+        fixture.Session.GetOrStartOwned();
+
+        Assert.Contains(
+            "started hidden",
+            fixture.Diagnostics.ToString(),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -223,6 +313,8 @@ public sealed class ManagedSessionTests
                 "ownership-proven",
                 "record-write",
                 "initialize",
+                // Shutdown retires the window guard first, on every route in.
+                "window-guard-dispose",
                 "application-exit",
                 "wait-10",
                 "record-clear",
@@ -516,7 +608,16 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, fixture.Managed.KillCount);
         Assert.Equal([ManagedEtabsShutdownMachine.GracefulExitTimeout], fixture.Managed.WaitTimeouts);
         Assert.Null(fixture.Store.Record);
-        Assert.Equal(["application-exit", "wait-10", "record-clear", "process-handle-release", "release-api-references"], fixture.Events);
+        Assert.Equal(
+            [
+                "window-guard-dispose",
+                "application-exit",
+                "wait-10",
+                "record-clear",
+                "process-handle-release",
+                "release-api-references"
+            ],
+            fixture.Events);
     }
 
     [Fact]
@@ -632,7 +733,11 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Empty(fixture.Managed.WaitTimeouts);
         Assert.NotNull(fixture.Store.Record);
-        Assert.Empty(fixture.Events);
+
+        // The mismatch refuses to touch the PROCESS, but the guard is this session's own
+        // resource and is retired on every shutdown route — including the ones that
+        // terminate without exiting anything.
+        Assert.Equal(["window-guard-dispose"], fixture.Events);
     }
 
     [Fact]
@@ -691,7 +796,7 @@ public sealed class ManagedSessionTests
         // not a reason to keep holding references.
         Assert.Equal(1, fixture.Managed.ApiReferenceReleaseCount);
         Assert.Equal(
-            ["record-clear", "process-handle-release", "release-api-references"],
+            ["window-guard-dispose", "record-clear", "process-handle-release", "release-api-references"],
             fixture.Events);
     }
 
@@ -716,7 +821,7 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, fixture.Managed.ProcessHandleReleaseCount);
         Assert.Empty(fixture.Managed.WaitTimeouts);
         Assert.NotNull(fixture.Store.Record);
-        Assert.Empty(fixture.Events);
+        Assert.Equal(["window-guard-dispose"], fixture.Events);
 
     }
 
@@ -837,12 +942,20 @@ public sealed class ManagedSessionTests
         DateTimeOffset.UtcNow);
 
     /// <summary>A ready session over a fake managed application, for visibility tests.</summary>
-    private sealed class VisibilityFixture(EtabsSession session, FakeManaged managed)
+    private sealed class VisibilityFixture(
+        EtabsSession session,
+        FakeManaged managed,
+        List<string> events,
+        StringWriter diagnostics)
     {
         public EtabsSession Session { get; } = session;
         public FakeManaged Managed { get; } = managed;
+        public List<string> Events { get; } = events;
 
-        public static VisibilityFixture Create()
+        /// <summary>What the session actually printed, so success lines are assertable.</summary>
+        public StringWriter Diagnostics { get; } = diagnostics;
+
+        public static VisibilityFixture Create(IEnumerable<bool>? waitResults = null)
         {
             var events = new List<string>();
             var launchId = Guid.NewGuid();
@@ -852,13 +965,17 @@ public sealed class ManagedSessionTests
                 events,
                 exitReturnCode: 0,
                 exitException: null,
-                waitResults: [],
+                waitResults: waitResults ?? [],
                 hasExited: false);
+            var store = new MemoryStore(events);
+            var diagnostics = new StringWriter();
             var session = new EtabsSession(
                 new FakeLauncher(managed, events),
                 new FakeProcesses { Live = Identity },
-                new MemoryStore(events));
-            return new(session, managed);
+                store,
+                new ManagedEtabsShutdownMachine(store),
+                diagnostics);
+            return new(session, managed, events, diagnostics);
         }
     }
 
@@ -1119,6 +1236,21 @@ public sealed class ManagedSessionTests
             var changed = !IsVisible;
             IsVisible = true;
             return new(ManagedEtabsVisibilityIntent.Visible, true, changed, null);
+        }
+
+        public int WindowGuardReleaseCalls { get; private set; }
+        public int WindowGuardDisposeCalls { get; private set; }
+
+        public void ReleaseWindowGuardForExplicitUserAction()
+        {
+            _events.Add("window-guard-release");
+            WindowGuardReleaseCalls++;
+        }
+
+        public void DisposeWindowGuard()
+        {
+            _events.Add("window-guard-dispose");
+            WindowGuardDisposeCalls++;
         }
 
         public void ReleaseApiReferences()

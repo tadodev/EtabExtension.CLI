@@ -23,7 +23,7 @@ public sealed class ManagedEtabsVisibilityTests
     {
         var api = new FakeVisibilityApi(visible: true);
 
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api);
+        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
 
         Assert.Equal(ManagedEtabsVisibilityIntent.Hidden, outcome.Intent);
         Assert.True(outcome.Confirmed);
@@ -46,7 +46,7 @@ public sealed class ManagedEtabsVisibilityTests
     {
         var api = new FakeVisibilityApi(visible: false);
 
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api);
+        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
 
         Assert.True(outcome.Confirmed);
         Assert.False(outcome.Changed);
@@ -59,7 +59,7 @@ public sealed class ManagedEtabsVisibilityTests
     {
         var api = new FakeVisibilityApi(visible: false);
 
-        var outcome = ManagedEtabsVisibility.EnsureVisible(api);
+        var outcome = ManagedEtabsVisibility.EnsureVisible(api, Converging());
 
         Assert.Equal(ManagedEtabsVisibilityIntent.Visible, outcome.Intent);
         Assert.True(outcome.Confirmed);
@@ -78,7 +78,7 @@ public sealed class ManagedEtabsVisibilityTests
     {
         var api = new FakeVisibilityApi(visible: true);
 
-        var outcome = ManagedEtabsVisibility.EnsureVisible(api);
+        var outcome = ManagedEtabsVisibility.EnsureVisible(api, Converging());
 
         Assert.True(outcome.Confirmed);
         Assert.False(outcome.Changed);
@@ -96,8 +96,8 @@ public sealed class ManagedEtabsVisibilityTests
         var api = new FakeVisibilityApi(startVisible) { TransitionReturnCode = 7 };
 
         var outcome = startVisible
-            ? ManagedEtabsVisibility.EnsureHidden(api)
-            : ManagedEtabsVisibility.EnsureVisible(api);
+            ? ManagedEtabsVisibility.EnsureHidden(api, Converging())
+            : ManagedEtabsVisibility.EnsureVisible(api, Converging());
 
         Assert.False(outcome.Confirmed);
         Assert.NotNull(outcome.Diagnostic);
@@ -116,7 +116,7 @@ public sealed class ManagedEtabsVisibilityTests
     {
         var api = new FakeVisibilityApi(visible: true) { IgnoreTransition = true };
 
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api);
+        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
 
         Assert.False(outcome.Confirmed);
         Assert.True(outcome.Changed);
@@ -129,6 +129,119 @@ public sealed class ManagedEtabsVisibilityTests
         Assert.Contains("observed=visible", outcome.Diagnostic, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The #20 measurement, stated as the primitive's contract: <c>Hide()</c> returns
+    /// success and <c>Visible()</c> keeps saying visible for a while. The candidate called
+    /// that a failure on the first read. It is a deferred transition, and the only correct
+    /// answer is to keep observing to a bound.
+    /// </summary>
+    [Fact]
+    public void ASuccessfulHideThatTakesEffectLaterEventuallyConfirms()
+    {
+        var clock = new VirtualClock();
+        var api = new FakeVisibilityApi(visible: true) { VisibleReadsBeforeHideLands = 20 };
+
+        var outcome = ManagedEtabsVisibility.EnsureHidden(
+            api,
+            new(TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100), clock));
+
+        Assert.True(outcome.Confirmed);
+        Assert.True(outcome.Changed);
+        Assert.Null(outcome.Diagnostic);
+        // Twenty reads still said visible, one poll interval apart, and the twenty-first
+        // agreed. The candidate declared failure after the first of those.
+        Assert.Equal(22, outcome.Reads);
+        Assert.Equal(TimeSpan.FromMilliseconds(2000), outcome.Waited);
+        Assert.Equal(TimeSpan.FromMilliseconds(2000), clock.Elapsed);
+    }
+
+    /// <summary>
+    /// And the transition is issued ONCE. Cardex documents <c>Hide</c> erroring when the
+    /// application is already hidden, so re-issuing it while a first call is still landing
+    /// would manufacture exactly the failure the convergence exists to avoid.
+    /// </summary>
+    [Fact]
+    public void ConvergencePollsTheStateAndNeverReIssuesTheTransition()
+    {
+        var api = new FakeVisibilityApi(visible: true) { VisibleReadsBeforeHideLands = 30 };
+
+        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
+
+        Assert.True(outcome.Confirmed);
+        Assert.Equal(1, api.HideCalls);
+        Assert.Equal(0, api.UnhideCalls);
+        Assert.Equal(1, api.Events.Count(step => step == "hide"));
+        Assert.Equal(outcome.Reads, api.Events.Count(step => step == "visible"));
+    }
+
+    /// <summary>
+    /// The bound is a bound. A hide that never lands is still a refusal, and the diagnostic
+    /// carries the measurements — reads and waited — the supervised gate cannot otherwise
+    /// reconstruct.
+    /// </summary>
+    [Fact]
+    public void AHideThatNeverLandsFailsAtTheDeadlineWithItsMeasurements()
+    {
+        var clock = new VirtualClock();
+        var api = new FakeVisibilityApi(visible: true) { IgnoreTransition = true };
+
+        var outcome = ManagedEtabsVisibility.EnsureHidden(
+            api,
+            new(TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100), clock));
+
+        Assert.False(outcome.Confirmed);
+        Assert.Equal(1, api.HideCalls);
+        Assert.Equal(TimeSpan.FromSeconds(10), clock.Elapsed);
+        Assert.Contains(
+            EtabsApiErrorCodes.VisibilityNotConfirmed,
+            outcome.Diagnostic!,
+            StringComparison.Ordinal);
+        Assert.Contains($"reads={outcome.Reads}", outcome.Diagnostic!, StringComparison.Ordinal);
+        Assert.Contains("waitedMs=10000", outcome.Diagnostic!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A non-zero return does not get the convergence budget. Cardex's documented cause of
+    /// a non-zero <c>Hide</c> is "already hidden", so it is re-read once — the observation
+    /// decides — and a disagreeing observation reports the return code rather than waiting
+    /// out a call ETABS refused.
+    /// </summary>
+    [Fact]
+    public void ARejectedTransitionIsReadOnceAndNotWaitedOut()
+    {
+        var clock = new VirtualClock();
+        var api = new FakeVisibilityApi(visible: true) { TransitionReturnCode = 7 };
+
+        var outcome = ManagedEtabsVisibility.EnsureHidden(
+            api,
+            new(TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100), clock));
+
+        Assert.False(outcome.Confirmed);
+        Assert.Equal(TimeSpan.Zero, clock.Elapsed);
+        Assert.Empty(clock.Waits);
+        Assert.Equal(2, outcome.Reads);
+    }
+
+    /// <summary>
+    /// The same read, when the state agrees. A non-zero return whose documented meaning is
+    /// "already in the requested state" must not be reported as a failure to reach it.
+    /// </summary>
+    [Fact]
+    public void ARejectedTransitionThatTheStateAgreesWithIsConfirmed()
+    {
+        var api = new FakeVisibilityApi(visible: true)
+        {
+            TransitionReturnCode = 7,
+            HidesDespiteNonZeroReturn = true
+        };
+
+        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
+
+        Assert.True(outcome.Confirmed);
+        Assert.Null(outcome.Diagnostic);
+        Assert.Equal(1, api.HideCalls);
+    }
+
     [Fact]
     public void AThrowingVisibilityReadIsBoundedAndNeverThrowsOutOfThePolicy()
     {
@@ -137,7 +250,7 @@ public sealed class ManagedEtabsVisibilityTests
             ReadException = new InvalidOperationException("COM went away")
         };
 
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api);
+        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
 
         Assert.False(outcome.Confirmed);
         Assert.False(outcome.Changed);
@@ -161,7 +274,7 @@ public sealed class ManagedEtabsVisibilityTests
             TransitionException = new InvalidOperationException("RPC_E_DISCONNECTED")
         };
 
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api);
+        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
 
         Assert.False(outcome.Confirmed);
         Assert.NotNull(outcome.Diagnostic);
@@ -171,6 +284,34 @@ public sealed class ManagedEtabsVisibilityTests
             StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The production convergence policy on virtual time: the same deadline and interval
+    /// the daemon ships with, and no real sleeping.
+    /// </summary>
+    private static ManagedEtabsVisibilityPolicy Converging() => new(
+        ManagedEtabsVisibilityPolicy.Default.ConvergenceDeadline,
+        ManagedEtabsVisibilityPolicy.Default.PollInterval,
+        new VirtualClock());
+
+    internal sealed class VirtualClock : IManagedEtabsClock
+    {
+        private readonly DateTimeOffset _origin = new(2026, 8, 21, 0, 0, 0, TimeSpan.Zero);
+
+        public VirtualClock() => UtcNow = _origin;
+
+        public DateTimeOffset UtcNow { get; private set; }
+
+        public List<TimeSpan> Waits { get; } = [];
+
+        public TimeSpan Elapsed => UtcNow - _origin;
+
+        public void Wait(TimeSpan interval)
+        {
+            Waits.Add(interval);
+            UtcNow = UtcNow.Add(interval);
+        }
+    }
+
     internal sealed class FakeVisibilityApi(bool visible) : IEtabsVisibilityApi
     {
         public List<string> Events { get; } = [];
@@ -178,6 +319,17 @@ public sealed class ManagedEtabsVisibilityTests
         public int UnhideCalls { get; private set; }
         public int TransitionReturnCode { get; init; }
         public bool IgnoreTransition { get; init; }
+
+        /// <summary>
+        /// Reads that keep reporting the OLD state after an accepted transition — the #20
+        /// measurement, where Hide() returned success and Visible() disagreed for seconds.
+        /// </summary>
+        public int VisibleReadsBeforeHideLands { get; init; }
+
+        /// <summary>A refused call that nevertheless left the state where it was wanted.</summary>
+        public bool HidesDespiteNonZeroReturn { get; init; }
+
+        private int _pendingDeferredReads;
         public Exception? ReadException { get; init; }
         public Exception? TransitionException { get; init; }
         public bool IsVisible { get; private set; } = visible;
@@ -185,7 +337,15 @@ public sealed class ManagedEtabsVisibilityTests
         public bool Visible()
         {
             Events.Add("visible");
-            return ReadException is null ? IsVisible : throw ReadException;
+            if (ReadException is not null) throw ReadException;
+            if (_pendingDeferredReads > 0)
+            {
+                _pendingDeferredReads--;
+                if (_pendingDeferredReads == 0) IsVisible = false;
+                return true;
+            }
+
+            return IsVisible;
         }
 
         public int Hide()
@@ -193,7 +353,20 @@ public sealed class ManagedEtabsVisibilityTests
             Events.Add("hide");
             HideCalls++;
             if (TransitionException is not null) throw TransitionException;
-            if (TransitionReturnCode == 0 && !IgnoreTransition) IsVisible = false;
+            if (TransitionReturnCode != 0)
+            {
+                if (HidesDespiteNonZeroReturn) IsVisible = false;
+                return TransitionReturnCode;
+            }
+
+            if (IgnoreTransition) return 0;
+            if (VisibleReadsBeforeHideLands > 0)
+            {
+                _pendingDeferredReads = VisibleReadsBeforeHideLands;
+                return 0;
+            }
+
+            IsVisible = false;
             return TransitionReturnCode;
         }
 
