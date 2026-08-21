@@ -1,4 +1,5 @@
-﻿using EtabExtension.CLI.Features.Serve;
+﻿using System.Runtime.Versioning;
+using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
@@ -423,6 +424,60 @@ public sealed class ManagedEtabsLauncherTests
     }
 
     /// <summary>
+    /// The subscription's teardown could not be joined, and the launch failure the release
+    /// gate reads says so.
+    ///
+    /// <para>Nothing about <c>SetWinEventHook</c> can be cancelled once it is in flight, so
+    /// a pump can still be inside it when activation gives up. The monitor disarms that
+    /// thread and lets it remove its own hook, but it does NOT get to call the cleanup
+    /// complete — and this is the wiring that carries the difference out: through the guard
+    /// constructor, through the launcher's typed <c>WindowSuppressionUnavailable</c> wrap,
+    /// through the diagnostic formatter's 512-character message bound, and into the
+    /// exception the cleanup envelope rethrows.</para>
+    ///
+    /// <para>Everything below the factory is the production monitor. Only the two user32
+    /// hook calls are the test's, which is the only way to hold an install open on demand.</para>
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void AnUnjoinableWindowSubscriptionTeardownIsNamedInTheLaunchFailure()
+    {
+        var api = new FakeRawApi();
+        var owned = new FakeOwnedProcess(Identity);
+        var guards = new LateSubscriptionGuardFactory();
+        var processes = new FakeProcesses
+        {
+            AfterStart = [Identity],
+            OpenExactResult = owned
+        };
+        var launcher = new ManagedEtabsLauncher(
+            processes,
+            new FakeResolver(Identity.ExecutablePath),
+            new FakeApiFactory(api, []),
+            new FakeVersionProbe(),
+            TextWriter.Null,
+            guards,
+            new FakeClock());
+
+        var error = Assert.Throws<EtabsLaunchException>(launcher.Launch);
+
+        Assert.Equal(EtabsLaunchErrorCodes.WindowSuppressionUnavailable, error.Code);
+        Assert.Contains("UNRESOLVED", error.Message, StringComparison.Ordinal);
+
+        // The launch was not derailed by the thread it could not join: the process this
+        // attempt started is still stopped, and ApplicationStart was never reached.
+        Assert.Equal(1, owned.KillCount);
+        Assert.True(owned.Disposed);
+        Assert.Equal(0, api.StartCount);
+
+        // And when the held install finally returns, that pump takes its own hook off.
+        guards.Release.Set();
+        Assert.True(
+            guards.Removed.Wait(TimeSpan.FromSeconds(30)),
+            "the late hook was never removed.");
+    }
+
+    /// <summary>
     /// The measured RC1 defect, stated as a test: the window became visible 8.5 s into a
     /// background snapshot-export and showed a blank <c>(Untitled)</c> model at 14.8 s,
     /// while the requested EDB only opened at 16.9 s. Hiding must therefore happen on the
@@ -836,6 +891,54 @@ public sealed class ManagedEtabsLauncherTests
         public void ReleaseForExplicitUserAction() => ReleasedForUser = true;
 
         public void Dispose() => Disposed = true;
+    }
+
+    /// <summary>
+    /// The PRODUCTION window monitor, over a <c>SetWinEventHook</c> the test holds open past
+    /// both of the monitor's deadlines. Only the two user32 calls are faked — there is no
+    /// other way to keep an install in flight on demand — so the failure the launcher
+    /// reports is the real one, formatted by the real formatter.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    private sealed class LateSubscriptionGuardFactory : IManagedEtabsWindowGuardFactory
+    {
+        public ManualResetEventSlim Release { get; } = new(false);
+
+        public ManualResetEventSlim Removed { get; } = new(false);
+
+        public IManagedEtabsWindowGuard Activate(IOwnedEtabsProcess ownedProcess) =>
+            new ManagedEtabsWindowGuard(
+                ownedProcess,
+                new NoWindows(),
+                ManagedEtabsWindowPolicy.Default,
+                new Win32OwnedWindowSurfaceMonitor(
+                    TimeSpan.FromMilliseconds(5),
+                    HoldTheInstallOpen,
+                    _ => Removed.Set(),
+                    TimeSpan.FromMilliseconds(250),
+                    TimeSpan.FromMilliseconds(50)));
+
+        private nint HoldTheInstallOpen(
+            int processId,
+            Win32OwnedWindowSurfaceMonitor.WinEventProc proc)
+        {
+            _ = Release.Wait(TimeSpan.FromSeconds(30));
+            return 0x5150;
+        }
+
+        /// <summary>An empty window station: this launch never gets far enough to sweep.</summary>
+        private sealed class NoWindows : ITopLevelWindows
+        {
+            public IReadOnlyList<TopLevelWindow> Enumerate() => [];
+
+            public void Hide(nint handle)
+            {
+            }
+
+            public void Show(nint handle)
+            {
+            }
+        }
     }
 
     private sealed class FakeResolver(string path) : IEtabsExecutableResolver

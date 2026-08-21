@@ -1075,6 +1075,7 @@ public sealed class ManagedEtabsWindowGuardTests
     /// and the run asserts that the pump really did reach the install rather than passing
     /// on a pump that never started.</para>
     /// </summary>
+    [SupportedOSPlatform("windows")]
     private static LateInstallRun StartOverAnInstallThatOutlivesBothDeadlines()
     {
         var run = new LateInstallRun();
@@ -1096,6 +1097,7 @@ public sealed class ManagedEtabsWindowGuardTests
     }
 
     /// <summary>One failed activation over an install the test still holds open.</summary>
+    [SupportedOSPlatform("windows")]
     private sealed class LateInstallRun
     {
         private int _surfaced;
