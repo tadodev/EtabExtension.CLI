@@ -1,5 +1,6 @@
 using EtabExtension.CLI.Features.Serve;
 using EtabExtension.CLI.Features.Serve.Operations;
+using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
 using Microsoft.Extensions.DependencyInjection;
@@ -229,6 +230,7 @@ public sealed class ServeShutdownCoordinatorTests
         public int? ProcessId => terminal.Data.OwnedPid;
         public ETABSApplication GetOrStart() => throw new NotSupportedException();
         public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
+        public Result RevealForExplicitUserRequest() => throw new NotSupportedException();
 
         public ManagedEtabsShutdownResult Shutdown()
         {

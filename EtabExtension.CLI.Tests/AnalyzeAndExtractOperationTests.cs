@@ -48,6 +48,9 @@ public sealed class AnalyzeAndExtractOperationTests : IDisposable
         Assert.Equal("US_Kip_Ft", analyze.Request!.Units);
         Assert.NotNull(analyze.Progress);
         Assert.Equal(1, session.GetOrStartCalls);
+        // CLI #22: analyze-and-extract is background work. It uses the shared session and
+        // never asks for it to be put on screen.
+        Assert.Equal(0, session.RevealCalls);
     }
 
     public void Dispose()
@@ -108,6 +111,12 @@ public sealed class AnalyzeAndExtractOperationTests : IDisposable
             return null!;
         }
         public IManagedEtabsApplication GetOrStartOwned() => throw new NotSupportedException();
+        public int RevealCalls { get; private set; }
+        public Result RevealForExplicitUserRequest()
+        {
+            RevealCalls++;
+            return Result.Ok();
+        }
         public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
         public void Dispose() { }
     }

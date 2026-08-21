@@ -12,6 +12,14 @@ public static class EtabsApiErrorCodes
     /// foreign current model.
     /// </summary>
     public const string ModelOpenNotConfirmed = "ETABS_MODEL_OPEN_NOT_CONFIRMED";
+
+    /// <summary>
+    /// A <c>cOAPI.Hide</c>/<c>cOAPI.Unhide</c> call returned zero while
+    /// <c>cOAPI.Visible</c> still reports the opposite state. Same shape as
+    /// <see cref="ModelOpenNotConfirmed"/>: the call was accepted, the state was not
+    /// established, and only the second read tells them apart.
+    /// </summary>
+    public const string VisibilityNotConfirmed = "ETABS_VISIBILITY_NOT_CONFIRMED";
 }
 
 public static class EtabsApiDiagnosticFormatter

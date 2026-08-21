@@ -34,6 +34,11 @@ public sealed class ManagedEtabsLauncherTests
                 "census-preflight",
                 "create-object",
                 "application-start",
+                // Hidden before anything else touches the started application: the window
+                // must never reach the screen for a session created to do background work.
+                "visible",
+                "hide",
+                "visible",
                 "sap-model",
                 "census-ownership",
                 "open-exact",
@@ -379,6 +384,61 @@ public sealed class ManagedEtabsLauncherTests
         Assert.Equal(0, processes.TerminateExactCalls);
     }
 
+    /// <summary>
+    /// The measured RC1 defect, stated as a test: the window became visible 8.5 s into a
+    /// background snapshot-export and showed a blank <c>(Untitled)</c> model at 14.8 s,
+    /// while the requested EDB only opened at 16.9 s. Hiding must therefore happen on the
+    /// start path — before SapModel, before the census, and long before any model open.
+    /// </summary>
+    [Fact]
+    public void LaunchHidesTheStartedApplicationBeforeAnythingElseTouchesIt()
+    {
+        var api = new FakeRawApi();
+        var launcher = Build(api, new FakeProcesses { AfterStart = [Identity] }, out var events);
+
+        launcher.Launch();
+
+        Assert.Equal(1, api.HideCalls);
+        Assert.False(api.IsVisible);
+        var hide = events.IndexOf("hide");
+        Assert.True(hide > events.IndexOf("application-start"), "Hide must follow ApplicationStart.");
+        Assert.True(hide < events.IndexOf("sap-model"), "Hide must precede everything after the start.");
+    }
+
+    /// <summary>
+    /// A visibility problem must not become a startup refusal. Startup readiness,
+    /// identity and recovery semantics are unchanged by CLI #22 — a session that cannot
+    /// be hidden is loud on stderr and still usable, because failing Commit outright over
+    /// a window would be a worse outcome than the window.
+    /// </summary>
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public void AHideThatCannotBeConfirmedIsLoudButDoesNotFailTheLaunch(
+        bool nonZeroReturn,
+        bool ignoreHide)
+    {
+        var api = new FakeRawApi
+        {
+            HideReturnCode = nonZeroReturn ? 1 : 0,
+            IgnoreHide = ignoreHide
+        };
+        var diagnostics = new StringWriter();
+        var launcher = new ManagedEtabsLauncher(
+            new FakeProcesses { AfterStart = [Identity] },
+            new FakeResolver(Identity.ExecutablePath),
+            new FakeApiFactory(api, []),
+            new FakeVersionProbe(),
+            diagnostics);
+
+        var managed = launcher.Launch();
+
+        Assert.Equal(Identity, managed.Identity);
+        Assert.Equal(1, api.HideCalls);
+        Assert.Contains("ETABS", diagnostics.ToString(), StringComparison.Ordinal);
+        Assert.Contains("hidden", diagnostics.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
     [Fact]
     public void UnreadableApiVersionDoesNotFailAProvenLifecycle()
     {
@@ -410,14 +470,23 @@ public sealed class ManagedEtabsLauncherTests
             $"EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.{typeName}"));
     }
 
-    // The raw boundary exposes no visibility or attach surface at all, so an early Hide or
-    // a ROT lookup is not expressible from managed startup.
+    // The raw boundary is lifecycle plus the three cOAPI visibility calls, and nothing
+    // else — no attach, no ROT lookup, no out-of-band process start.
+    //
+    // Visibility was deliberately excluded here once, on the reasoning that "an early
+    // Hide is not expressible from managed startup". CLI #22 is the bill for that: the
+    // one-shot Mode B commands hid the instance they created, the daemon that replaced
+    // them could not, and a background Commit left a blank (Untitled) ETABS window on the
+    // engineer's screen for 8.4 seconds. Hiding at startup IS the requirement, so the
+    // capability belongs on the boundary that owns startup.
     [Fact]
-    public void RawApiBoundaryExposesOnlyLifecycleMembers()
+    public void RawApiBoundaryExposesLifecycleAndVisibilityAndNothingElse()
     {
         var members = typeof(IEtabsRawApi).GetMembers()
+            .Concat(typeof(IEtabsVisibilityApi).GetMembers())
             .Select(member => member.Name)
             .Where(name => !name.StartsWith("get_", StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
             .Order(StringComparer.Ordinal)
             .ToArray();
 
@@ -429,8 +498,11 @@ public sealed class ManagedEtabsLauncherTests
                 "CompleteApiReadiness",
                 "GetOapiVersionNumber",
                 "HasSapModel",
+                "Hide",
                 "InitializeNewModel",
-                "ReleaseApiReferences"
+                "ReleaseApiReferences",
+                "Unhide",
+                "Visible"
             ],
             members);
     }
@@ -509,6 +581,11 @@ public sealed class ManagedEtabsLauncherTests
         public Exception? StartException { get; set; }
         public bool HasSapModelValue { get; set; } = true;
         public Exception? OapiVersionException { get; set; }
+        public int HideReturnCode { get; set; }
+        public bool IgnoreHide { get; set; }
+        public bool IsVisible { get; private set; }
+        public int HideCalls { get; private set; }
+        public int UnhideCalls { get; private set; }
         public int StartCount { get; private set; }
         public int ExitCount { get; private set; }
         public int InitializeCount { get; private set; }
@@ -523,7 +600,33 @@ public sealed class ManagedEtabsLauncherTests
         {
             Events.Add("application-start");
             StartCount++;
+            // Cardex documents no visibility argument on ApplicationStart and says nothing
+            // about the resulting state; the supervised RC1 run observed a window arriving.
+            // The fake reproduces the observed case, which is the one that matters.
+            IsVisible = true;
             return StartException is null ? StartReturnCode : throw StartException;
+        }
+
+        public bool Visible()
+        {
+            Events.Add("visible");
+            return IsVisible;
+        }
+
+        public int Hide()
+        {
+            Events.Add("hide");
+            HideCalls++;
+            if (HideReturnCode == 0 && !IgnoreHide) IsVisible = false;
+            return HideReturnCode;
+        }
+
+        public int Unhide()
+        {
+            Events.Add("unhide");
+            UnhideCalls++;
+            IsVisible = true;
+            return 0;
         }
 
         public double GetOapiVersionNumber()

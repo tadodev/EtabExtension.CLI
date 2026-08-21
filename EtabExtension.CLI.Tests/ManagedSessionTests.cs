@@ -76,8 +76,109 @@ public sealed class ManagedSessionTests
         Assert.True(session.IsStarted);
         Assert.NotNull(store.Record);
         Assert.Equal(
-            ["launch", "ownership-proven", "record-write", "initialize", "wrap-existing"],
+            [
+                "launch",
+                "ownership-proven",
+                "record-write",
+                "initialize",
+                "wrap-existing",
+                // Re-asserted hidden after InitializeNewModel — the call that puts the
+                // blank (Untitled) model behind the window — and still before the session
+                // is handed to any command.
+                "ensure-hidden"
+            ],
             events);
+    }
+
+    /// <summary>
+    /// The background half of the CLI #22 contract. A session created because some
+    /// background command needed COM must be hidden by the time anything can use it, and
+    /// hidden exactly once: re-hiding on every request is how a session the user asked to
+    /// see would get yanked off the screen.
+    /// </summary>
+    [Fact]
+    public void ACreatedSessionIsHiddenOnceBeforeAnyCommandCanUseIt()
+    {
+        var fixture = VisibilityFixture.Create();
+
+        fixture.Session.GetOrStartOwned();
+        fixture.Session.GetOrStartOwned();
+
+        Assert.Equal(1, fixture.Managed.HiddenCalls);
+        Assert.False(fixture.Managed.IsVisible);
+        Assert.Equal(0, fixture.Managed.RevealCalls);
+    }
+
+    /// <summary>
+    /// The explicit half. Nothing else in the daemon can make ETABS visible, so this is
+    /// the single transition the "Open in ETABS" intent travels through.
+    /// </summary>
+    [Fact]
+    public void AnExplicitUserRequestMakesTheManagedSessionVisible()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+
+        var revealed = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.True(revealed.Success);
+        Assert.Null(revealed.Error);
+        Assert.Equal(1, fixture.Managed.RevealCalls);
+        Assert.True(fixture.Managed.IsVisible);
+    }
+
+    /// <summary>
+    /// The reuse rule, and the reason the hide lives at creation rather than at the head
+    /// of every background command: a background command running against a session the
+    /// user explicitly opened must leave it on screen.
+    /// </summary>
+    [Fact]
+    public void ABackgroundCommandReusingARevealedSessionLeavesItVisible()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Session.RevealForExplicitUserRequest();
+
+        // Stands in for snapshot-export / analyze-and-extract asking the shared session
+        // for its application.
+        fixture.Session.GetOrStartOwned();
+        fixture.Session.GetOrStart();
+
+        Assert.True(fixture.Managed.IsVisible);
+        Assert.Equal(1, fixture.Managed.HiddenCalls);
+        Assert.Equal(1, fixture.Managed.RevealCalls);
+    }
+
+    [Fact]
+    public void ARevealThatCannotBeConfirmedIsReportedAsAFailure()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.RevealSucceeds = false;
+        fixture.Session.GetOrStartOwned();
+
+        var revealed = fixture.Session.RevealForExplicitUserRequest();
+
+        Assert.False(revealed.Success);
+        Assert.NotNull(revealed.Error);
+        Assert.Contains("cOAPI.Unhide", revealed.Error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Hiding is best effort by design — see the launcher tests. A session that could not
+    /// be hidden is still a working session, because failing Commit over a window would
+    /// cost the user more than the window does.
+    /// </summary>
+    [Fact]
+    public void AHideThatCannotBeConfirmedStillYieldsAUsableSession()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Managed.HideSucceeds = false;
+
+        var owned = fixture.Session.GetOrStartOwned();
+
+        Assert.Same(fixture.Managed, owned);
+        Assert.True(fixture.Session.IsStarted);
+        Assert.Equal(1, fixture.Managed.HiddenCalls);
     }
 
     [Fact]
@@ -735,6 +836,32 @@ public sealed class ManagedSessionTests
         launchId,
         DateTimeOffset.UtcNow);
 
+    /// <summary>A ready session over a fake managed application, for visibility tests.</summary>
+    private sealed class VisibilityFixture(EtabsSession session, FakeManaged managed)
+    {
+        public EtabsSession Session { get; } = session;
+        public FakeManaged Managed { get; } = managed;
+
+        public static VisibilityFixture Create()
+        {
+            var events = new List<string>();
+            var launchId = Guid.NewGuid();
+            var managed = new FakeManaged(
+                Identity,
+                launchId,
+                events,
+                exitReturnCode: 0,
+                exitException: null,
+                waitResults: [],
+                hasExited: false);
+            var session = new EtabsSession(
+                new FakeLauncher(managed, events),
+                new FakeProcesses { Live = Identity },
+                new MemoryStore(events));
+            return new(session, managed);
+        }
+    }
+
     private sealed class ShutdownFixture
     {
         private ShutdownFixture(
@@ -950,6 +1077,48 @@ public sealed class ManagedSessionTests
         {
             _events.Add("wrap-existing");
             ReadinessCount++;
+        }
+
+        public bool IsVisible { get; private set; } = true;
+        public int HiddenCalls { get; private set; }
+        public int RevealCalls { get; private set; }
+        public bool HideSucceeds { get; set; } = true;
+        public bool RevealSucceeds { get; set; } = true;
+
+        public ManagedEtabsVisibilityOutcome EnsureHiddenForBackgroundWork()
+        {
+            _events.Add("ensure-hidden");
+            HiddenCalls++;
+            if (!HideSucceeds)
+            {
+                return new(
+                    ManagedEtabsVisibilityIntent.Hidden,
+                    Confirmed: false,
+                    Changed: true,
+                    "ETABS_VISIBILITY_NOT_CONFIRMED; operation=cOAPI.Hide");
+            }
+
+            var changed = IsVisible;
+            IsVisible = false;
+            return new(ManagedEtabsVisibilityIntent.Hidden, true, changed, null);
+        }
+
+        public ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction()
+        {
+            _events.Add("ensure-visible");
+            RevealCalls++;
+            if (!RevealSucceeds)
+            {
+                return new(
+                    ManagedEtabsVisibilityIntent.Visible,
+                    Confirmed: false,
+                    Changed: true,
+                    "ETABS_VISIBILITY_NOT_CONFIRMED; operation=cOAPI.Unhide");
+            }
+
+            var changed = !IsVisible;
+            IsVisible = true;
+            return new(ManagedEtabsVisibilityIntent.Visible, true, changed, null);
         }
 
         public void ReleaseApiReferences()

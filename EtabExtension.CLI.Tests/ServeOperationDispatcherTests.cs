@@ -1,6 +1,8 @@
 ﻿using System.Text.Json;
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 using EtabExtension.CLI.Features.GetStatus.Models;
+using EtabExtension.CLI.Features.OpenModel;
+using EtabExtension.CLI.Features.OpenModel.Models;
 using EtabExtension.CLI.Features.RunAnalysis;
 using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Features.Serve;
@@ -393,6 +395,113 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         await _manager.WaitAsync(started.Data!.OperationId, TestContext.Current.CancellationToken);
     }
 
+    // ── CLI #22: the two intents must not collapse into one behaviour ───────────
+    //
+    // The daemon creates its managed ETABS hidden. Whether it ever reaches the screen is
+    // decided HERE, by which command was asked for — not by whether an ETABS process
+    // happens to exist. These tests fail if a background command starts revealing, if
+    // open-model stops revealing, or if the reveal drifts ahead of the model confirmation.
+
+    /// <summary>
+    /// Explicit "Open in ETABS": ends visible, and visible only AFTER the open returned
+    /// success. The ordering is the whole point — revealing first is precisely the blank
+    /// <c>(Untitled)</c> window this issue exists to remove.
+    /// </summary>
+    [Fact]
+    public async Task OpenModelRevealsEtabsOnlyAfterTheRequestedModelIsConfirmedOpen()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var open = new FakeOpenModelService(session.Events);
+        var dispatcher = CreateDispatcher(_manager, session, open: open);
+
+        var response = Assert.IsType<Result<OpenModelData>>(await dispatcher.DispatchAsync(
+            "open-model",
+            Json("""{"filePath":"C:\\v1\\sample_v2.edb","saveOnClose":false}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.True(response.Success);
+        Assert.Equal(1, session.RevealCalls);
+        Assert.Equal(["get-or-start", "open", "reveal"], session.Events);
+        Assert.Equal(@"C:\v1\sample_v2.edb", open.FilePath);
+    }
+
+    /// <summary>
+    /// A failed open leaves nothing on screen. The user asked to see a model, not an empty
+    /// application, so an open that could not be confirmed must not put a window up.
+    /// </summary>
+    [Fact]
+    public async Task AFailedOpenNeverRevealsEtabs()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var open = new FakeOpenModelService
+        {
+            Failure = "ETABS_MODEL_OPEN_NOT_CONFIRMED; operation=cFile.OpenFile"
+        };
+        var dispatcher = CreateDispatcher(_manager, session, open: open);
+
+        var response = Assert.IsType<Result<OpenModelData>>(await dispatcher.DispatchAsync(
+            "open-model",
+            Json("""{"filePath":"C:\\v1\\sample_v2.edb","saveOnClose":false}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.False(response.Success);
+        Assert.Equal("ETABS_MODEL_OPEN_NOT_CONFIRMED; operation=cFile.OpenFile", response.Error);
+        Assert.Equal(0, session.RevealCalls);
+    }
+
+    /// <summary>
+    /// "Open in ETABS" that leaves nothing on screen has not done what was asked, even
+    /// though the model is loaded. The response says so rather than reporting success.
+    /// </summary>
+    [Fact]
+    public async Task AnOpenThatCannotBeMadeVisibleIsReportedAsAFailure()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession { RevealSucceeds = false };
+        var dispatcher = CreateDispatcher(_manager, session, open: new FakeOpenModelService());
+
+        var response = Assert.IsType<Result<OpenModelData>>(await dispatcher.DispatchAsync(
+            "open-model",
+            Json("""{"filePath":"C:\\v1\\sample_v2.edb","saveOnClose":false}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.False(response.Success);
+        Assert.Contains("cOAPI.Unhide", response.Error, StringComparison.Ordinal);
+        Assert.Contains(@"C:\v1\sample_v2.edb", response.Error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The background half. These commands need COM; they do not need a window. If one of
+    /// them ever calls the reveal, this fails — which is the "two intents did not collapse"
+    /// acceptance criterion, stated as an executable assertion.
+    /// </summary>
+    [Theory]
+    [InlineData(
+        "snapshot-export",
+        """{"filePath":"C:\\v1\\sample_v2.edb","outputDir":"C:\\v1\\snapshot","tables":{}}""")]
+    [InlineData(
+        "run-analysis",
+        """{"filePath":"C:\\v1\\sample_v2.edb","cases":["DEAD"],"units":"SI_kN_m_C"}""")]
+    public async Task BackgroundCommandsNeverAskForEtabsToBeShown(string command, string payload)
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            runAnalysis: new FakeRunAnalysisService(),
+            snapshot: new FakeSnapshotExportService(),
+            open: new FakeOpenModelService());
+
+        await dispatcher.DispatchAsync(command, Json(payload), TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, session.GetOrStartCalls);
+        Assert.Equal(0, session.RevealCalls);
+        Assert.DoesNotContain("reveal", session.Events);
+    }
+
     private OperationManager CreateManager(IOperationDefinition definition) => new(
         new StaExecutionWorker(),
         new OperationEventJournalFactory(_directory, memoryCapacity: 4),
@@ -422,10 +531,11 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         IProcessInspector? processes = null,
         IRunAnalysisService? runAnalysis = null,
         ICachedSessionStatus? cachedStatus = null,
-        ISnapshotExportService? snapshot = null) => new(
+        ISnapshotExportService? snapshot = null,
+        IOpenModelService? open = null) => new(
             session ?? null!,
             null!,
-            null!,
+            open ?? null!,
             snapshot ?? null!,
             null!,
             null!,
@@ -468,11 +578,22 @@ public sealed class ServeOperationDispatcherTests : IDisposable
     {
         public int GetOrStartCalls { get; private set; }
         public int GetOrStartOwnedCalls { get; private set; }
+        public int RevealCalls { get; private set; }
+        public bool RevealSucceeds { get; init; } = true;
+
+        /// <summary>
+        /// Ordered log of what the dispatcher asked this session to do, so a reveal that
+        /// happened BEFORE the model was confirmed open is distinguishable from one that
+        /// happened after it.
+        /// </summary>
+        public List<string> Events { get; } = [];
+
         public bool IsStarted => isStarted;
         public int? ProcessId => processId;
         public ETABSApplication GetOrStart()
         {
             GetOrStartCalls++;
+            Events.Add("get-or-start");
             return null!;
         }
         public IManagedEtabsApplication GetOrStartOwned()
@@ -480,8 +601,45 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             GetOrStartOwnedCalls++;
             return null!;
         }
+        public Result RevealForExplicitUserRequest()
+        {
+            RevealCalls++;
+            Events.Add("reveal");
+            return RevealSucceeds
+                ? Result.Ok()
+                : Result.Fail("ETABS_VISIBILITY_NOT_CONFIRMED; operation=cOAPI.Unhide");
+        }
         public ManagedEtabsShutdownResult Shutdown() => throw new NotSupportedException();
         public void Dispose() { }
+    }
+
+    private sealed class FakeOpenModelService : IOpenModelService
+    {
+        private readonly List<string>? _events;
+
+        public FakeOpenModelService(List<string>? events = null) => _events = events;
+
+        public string? FilePath { get; private set; }
+        public bool Save { get; private set; }
+        public string? Failure { get; init; }
+
+        public Task<Result<OpenModelData>> OpenModelAsync(
+            string filePath,
+            bool save,
+            bool newInstance) => throw new NotSupportedException();
+
+        public Task<Result<OpenModelData>> OpenModelOnAppAsync(
+            ETABSApplication app,
+            string filePath,
+            bool save)
+        {
+            FilePath = filePath;
+            Save = save;
+            _events?.Add("open");
+            return Task.FromResult(Failure is null
+                ? Result.Ok(new OpenModelData { FilePath = filePath })
+                : Result.Fail<OpenModelData>(Failure));
+        }
     }
 
     private sealed class FakeSnapshotExportService : ISnapshotExportService

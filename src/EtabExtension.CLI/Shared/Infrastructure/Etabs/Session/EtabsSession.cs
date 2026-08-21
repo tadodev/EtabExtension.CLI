@@ -1,3 +1,4 @@
+using EtabExtension.CLI.Shared.Common;
 using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
@@ -8,6 +9,17 @@ public interface IEtabsSession : IDisposable
     IManagedEtabsApplication GetOrStartOwned();
     bool IsStarted { get; }
     int? ProcessId { get; }
+
+    /// <summary>
+    /// Shows the managed ETABS window because the USER asked to see it.
+    ///
+    /// <para>The session is created hidden and stays hidden for every background
+    /// command, so this is the only way it ever reaches the screen. Callers must invoke
+    /// it only after the requested model is confirmed open — revealing before that is
+    /// exactly the blank <c>(Untitled)</c> window CLI #22 exists to remove.</para>
+    /// </summary>
+    Result RevealForExplicitUserRequest();
+
     ManagedEtabsShutdownResult Shutdown();
 }
 
@@ -237,6 +249,10 @@ public sealed class EtabsSession : IEtabsSession
                 "Managed ETABS identity verification failed; a clean reopen is required.");
         }
     }
+
+    /// <inheritdoc />
+    public Result RevealForExplicitUserRequest() =>
+        Result.Fail("Managed ETABS reveal is not implemented yet.");
 
     public ManagedEtabsShutdownResult Shutdown()
     {

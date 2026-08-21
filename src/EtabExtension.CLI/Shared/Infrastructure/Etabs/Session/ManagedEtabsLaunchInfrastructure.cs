@@ -240,8 +240,14 @@ public interface IOwnedEtabsProcess : IDisposable
 /// returns zero on success, <c>cSapModel.InitializeNewModel()</c> returns zero on
 /// success, and <c>cOAPI.ApplicationExit(false)</c> returns zero on success with the
 /// <c>cSapModel</c> reference dropped afterwards.</para>
+///
+/// <para>It also carries the three <c>cOAPI</c> visibility calls through
+/// <see cref="IEtabsVisibilityApi"/>. They belong here rather than on the EtabSharp
+/// wrapper because the managed session must be hidden BEFORE that wrap exists — the
+/// whole point of CLI #22 is that nothing reaches the screen between
+/// <c>ApplicationStart</c> and the requested model being open.</para>
 /// </summary>
-public interface IEtabsRawApi
+public interface IEtabsRawApi : IEtabsVisibilityApi
 {
     /// <summary>Raw <c>cOAPI.ApplicationStart()</c>. Zero means started.</summary>
     int ApplicationStart();
@@ -333,6 +339,26 @@ public sealed class EtabsRawApi(cOAPI api, cHelper helper) : IEtabsRawApi
 
     public int ApplicationStart() => api.ApplicationStart();
 
+    /// <summary>
+    /// Raw <c>cOAPI.Visible()</c> — the CSI read, not a cached flag of our own. Cardex:
+    /// "Returns True if the application is visible on the screen, otherwise it returns
+    /// False."
+    /// </summary>
+    public bool Visible() => api.Visible();
+
+    /// <summary>
+    /// Raw <c>cOAPI.Hide()</c>. Cardex: zero when the application is successfully
+    /// hidden; an already-hidden application returns an error, which is why
+    /// <see cref="ManagedEtabsVisibility"/> reads the state before calling this.
+    /// </summary>
+    public int Hide() => api.Hide();
+
+    /// <summary>
+    /// Raw <c>cOAPI.Unhide()</c>. Cardex: zero when the application is successfully
+    /// unhidden; an already-visible application returns an error.
+    /// </summary>
+    public int Unhide() => api.Unhide();
+
     public double GetOapiVersionNumber() => helper.GetOAPIVersionNumber();
 
     public bool HasSapModel => api.SapModel is not null;
@@ -363,6 +389,20 @@ public interface IManagedEtabsApplication
     int InitializeNewModel();
     int ExitWithoutSaving();
     void CompleteApiReadiness();
+
+    /// <summary>
+    /// Puts this managed application into the background-work state: not on screen, not
+    /// in the taskbar. Called only while the session is being created, before any
+    /// command can have run against it.
+    /// </summary>
+    ManagedEtabsVisibilityOutcome EnsureHiddenForBackgroundWork();
+
+    /// <summary>
+    /// Puts this managed application on screen because the user explicitly asked for it.
+    /// Called only after the requested model has been confirmed open.
+    /// </summary>
+    ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction();
+
     bool HasExited { get; }
     bool WaitForExit(TimeSpan timeout);
     void Kill();
@@ -391,6 +431,14 @@ public sealed class ManagedEtabsApplication(
     public int InitializeNewModel() => rawApi.InitializeNewModel();
 
     public int ExitWithoutSaving() => rawApi.ApplicationExit(false);
+
+    /// <inheritdoc />
+    public ManagedEtabsVisibilityOutcome EnsureHiddenForBackgroundWork() =>
+        ManagedEtabsVisibility.EnsureHidden(rawApi);
+
+    /// <inheritdoc />
+    public ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction() =>
+        ManagedEtabsVisibility.EnsureVisible(rawApi);
 
     /// <summary>Wraps the same started object once initialization has returned zero.</summary>
     public void CompleteApiReadiness() => rawApi.CompleteApiReadiness(
