@@ -101,7 +101,10 @@ public static class EtabsModelOpen
         return OpenOnAttachedModel(
             filePath,
             save,
-            () => app.Model.ModelInfo.GetModelFilepath(),
+            // Cardex: cSapModel.GetModelFilepath() returns the model's FOLDER, while
+            // GetModelFilename(IncludePath: true) returns the full file path. Only the
+            // latter can be saved back or compared against the requested model.
+            () => app.Model.ModelInfo.GetModelFilename(includePath: true),
             currentPath => app.Model.Files.SaveFile(currentPath),
             targetPath => app.Model.Files.OpenFile(targetPath));
     }
@@ -196,6 +199,14 @@ public static class EtabsModelOpen
         }
 
         var openedName = Path.GetFileName(opened);
+        if (string.IsNullOrEmpty(openedName))
+        {
+            return NotConfirmed(
+                requestedName,
+                "(no file name)",
+                $"ETABS returned success but names no current model file (reported '{opened}').");
+        }
+
         if (!string.Equals(requestedName, openedName, StringComparison.OrdinalIgnoreCase))
         {
             return NotConfirmed(

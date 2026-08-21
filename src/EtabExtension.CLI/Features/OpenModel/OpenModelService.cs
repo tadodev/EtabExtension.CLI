@@ -98,7 +98,9 @@ public class OpenModelService : IOpenModelService
             if (app is null)
                 return Result.Fail<OpenModelData>("ETABS process identity was selected but COM attach failed.");
 
-            var currentPath = app.Model.ModelInfo.GetModelFilepath();
+            // GetModelFilepath() is the model's FOLDER; only GetModelFilename(true)
+            // yields a path that SaveFile can write back to.
+            var currentPath = app.Model.ModelInfo.GetModelFilename(includePath: true);
             var hasCurrentFile = !string.IsNullOrEmpty(currentPath);
 
             Console.Error.WriteLine(
