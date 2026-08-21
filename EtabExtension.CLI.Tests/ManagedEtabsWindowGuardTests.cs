@@ -3,6 +3,7 @@
 
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.Versioning;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using Xunit;
 
@@ -593,6 +594,7 @@ public sealed class ManagedEtabsWindowGuardTests
     /// suppress anything here.</para>
     /// </summary>
     [Fact]
+    [SupportedOSPlatform("windows")]
     public void TheWin32SubscriptionInstallsPumpsAndTearsDownDeterministically()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "Windows-only subscription.");
@@ -630,6 +632,7 @@ public sealed class ManagedEtabsWindowGuardTests
     }
 
     [Fact]
+    [SupportedOSPlatform("windows")]
     public void TheWin32SubscriptionRefusesToBeStartedTwice()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "Windows-only subscription.");
