@@ -164,7 +164,7 @@ public sealed class OpenModelDiagnosticsTests
                 new DelegateModelFileApi(getCurrentPath, saveFile, openFile),
                 filePath,
                 save,
-                sameFile: (_, _) => false));
+                compareIdentity: (_, _) => FileIdentityResult.Different));
 
     private sealed class DelegateModelFileApi(
         Func<string?> getCurrentPath,

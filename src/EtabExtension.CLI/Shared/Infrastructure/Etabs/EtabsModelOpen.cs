@@ -172,15 +172,17 @@ public static class EtabsModelOpen
     /// job — this overload is also used by the one-shot attach paths, which validate
     /// earlier.
     /// </summary>
-    /// <param name="sameFile">
+    /// <param name="compareIdentity">
     /// File-identity test used to tell a legitimate re-spelling of the requested path
-    /// from a genuinely different model. Defaults to the real Windows check.
+    /// from a genuinely different model. Defaults to the real Windows check — which is
+    /// itself asserted by test, because a default on the far side of a seam is exactly
+    /// the kind of production-only choice no fake can reach.
     /// </param>
     internal static Result<ModelOpenOutcome> OpenOnApi(
         IEtabsModelFileApi api,
         string filePath,
         bool save,
-        Func<string, string, bool>? sameFile = null)
+        Func<string, string, FileIdentityResult>? compareIdentity = null)
     {
         string resolvedPath;
         try
@@ -224,7 +226,7 @@ public static class EtabsModelOpen
             var confirmation = ConfirmOpened(
                 resolvedPath,
                 api.GetModelFilename(),
-                sameFile ?? WindowsFileIdentity.SameFile);
+                compareIdentity ?? WindowsFileIdentity.Compare);
             if (confirmation is not null)
             {
                 return Result.Fail<ModelOpenOutcome>(confirmation);
@@ -255,11 +257,17 @@ public static class EtabsModelOpen
     /// this machine has exactly that: a byte-identical <c>sample_v2.EDB</c> under both
     /// <c>D:\Work\test\</c> and the sanctioned <c>D:\Work\tadoEng\TestModel\</c>.
     /// Only a path that provably reaches the same file is downgraded to a warning.</para>
+    ///
+    /// <para>"Could not be identified" is kept distinct from "is a different file".
+    /// Both fail, but they fail for different reasons and a reader debugging a network
+    /// share or an exotic filesystem needs to know which one happened — telling them a
+    /// different model is loaded when nothing of the sort was established is the
+    /// costliest possible wording in exactly the hardest case to diagnose.</para>
     /// </summary>
     private static string? ConfirmOpened(
         string resolvedPath,
         string? openedPath,
-        Func<string, string, bool> sameFile)
+        Func<string, string, FileIdentityResult> compareIdentity)
     {
         var opened = openedPath?.Trim();
         if (string.IsNullOrEmpty(opened))
@@ -284,7 +292,8 @@ public static class EtabsModelOpen
             return null;
         }
 
-        if (sameFile(resolvedPath, openedFull))
+        var identity = compareIdentity(resolvedPath, openedFull);
+        if (identity.Match == FileIdentityMatch.Same)
         {
             // A different spelling of the same file: UNC share, subst drive, mapped
             // drive, junction. Proven identical, so this is information, not failure.
@@ -294,10 +303,17 @@ public static class EtabsModelOpen
             return null;
         }
 
-        return NotConfirmed(
-            resolvedPath,
-            openedFull,
-            "ETABS returned success but a different model is current.");
+        return identity.Match == FileIdentityMatch.Different
+            ? NotConfirmed(
+                resolvedPath,
+                openedFull,
+                "ETABS returned success but a different model is current.")
+            : NotConfirmed(
+                resolvedPath,
+                openedFull,
+                "ETABS returned success with a path this host could not identify, so it " +
+                "could not be shown to be the requested file; " +
+                $"win32Error={identity.Win32Error}.");
     }
 
     private static string TryGetFullPath(string path)

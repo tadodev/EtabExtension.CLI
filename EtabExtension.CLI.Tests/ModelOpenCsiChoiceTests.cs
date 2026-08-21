@@ -6,38 +6,80 @@ using Xunit;
 namespace EtabExtension.CLI.Tests;
 
 /// <summary>
-/// Guards the one CSI choice that no behavioral test can reach.
+/// Guards the CSI and identity choices that no behavioral test can reach.
 ///
 /// <para>Everything else about the model-open boundary is proven through
-/// <see cref="IEtabsModelFileApi"/> with a fake. The single line that picks the real
-/// CSI call sits on the far side of that seam, against a COM object no test can
-/// construct — and picking the wrong one there is exactly the defect that shipped
-/// and had to be caught by a supervised live run. These tests fail on the revert.</para>
+/// <see cref="IEtabsModelFileApi"/> with a fake. What remains on the far side of that
+/// seam is a handful of production-only choices — which CSI call reads the current
+/// model, and which identity check the primitive defaults to — where picking wrong is
+/// invisible to every fake. One of those already shipped as a defect and had to be
+/// caught by a supervised live run. These tests fail on the revert.</para>
 /// </summary>
 public sealed class ModelOpenCsiChoiceTests
 {
     /// <summary>
-    /// <c>GetModelFilepath()</c> returns the model's FOLDER (observed, ETABS 23.3.0).
-    /// Nothing on the model-open path may call it — a folder cannot be saved back and
-    /// cannot confirm which model is loaded.
+    /// The call that returns the model's FOLDER rather than its file path (observed,
+    /// ETABS 23.3.0). A folder cannot be saved back and cannot confirm which model is
+    /// loaded, so nothing on the model-open path may use it.
     /// </summary>
-    [Theory]
-    [InlineData(@"src\EtabExtension.CLI\Shared\Infrastructure\Etabs\EtabsModelOpen.cs")]
-    [InlineData(@"src\EtabExtension.CLI\Shared\Infrastructure\Etabs\EtabsSessionHelpers.cs")]
-    [InlineData(@"src\EtabExtension.CLI\Features\OpenModel\OpenModelService.cs")]
-    [InlineData(@"src\EtabExtension.CLI\Features\SnapshotExport\SnapshotExportService.cs")]
-    public void ModelOpenPathNeverCallsTheFolderReturningApi(string relativePath)
-    {
-        var source = ReadRepositoryFile(relativePath);
+    private const string FolderApiCallPattern = @"\.\s*GetModelFilepath\s*\(";
 
-        var calls = Regex.Matches(source, @"\.\s*GetModelFilepath\s*\(", RegexOptions.None);
+    /// <summary>
+    /// The files still permitted to call the folder-returning API, each a known defect
+    /// tracked by CLI #21 and being repaired on <c>codex/alpha-21-getstatus-path</c>.
+    ///
+    /// <para>This list is meant to reach zero. When #21 lands, each repaired file makes
+    /// <see cref="TheFolderApiAllowListHasNoStaleEntries"/> fail with the path to
+    /// delete — one line each, then the array is empty and the guard covers the whole
+    /// tree unconditionally.</para>
+    /// </summary>
+    private static readonly string[] AllowedFolderApiCallers =
+    [
+        Path.Combine("src", "EtabExtension.CLI", "Features", "GetStatus", "GetStatusService.cs"),
+        Path.Combine("src", "EtabExtension.CLI", "Features", "UnlockModel", "UnlockModelService.cs"),
+        Path.Combine("src", "EtabExtension.CLI", "Features", "CloseModel", "CloseModelService.cs")
+    ];
+
+    /// <summary>
+    /// Scans the whole source tree rather than a fixed file list: a hardcoded list rots
+    /// toward a false pass, because adding a fifth file to the model-open path would
+    /// silently stop being guarded.
+    /// </summary>
+    [Fact]
+    public void NoSourceOutsideTheKnownExceptionsCallsTheFolderReturningApi()
+    {
+        var offenders = ProductionSources()
+            .Where(file => Regex.IsMatch(file.Text, FolderApiCallPattern))
+            .Select(file => file.RelativePath)
+            .Where(relative => !AllowedFolderApiCallers.Contains(relative, StringComparer.OrdinalIgnoreCase))
+            .Order(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
         Assert.True(
-            calls.Count == 0,
-            $"{relativePath} calls GetModelFilepath(). That call returns the model's " +
-            "FOLDER, not its file path — it cannot be handed to cFile.Save and cannot " +
-            "confirm which model is open. Use GetModelFilename(includePath: true) " +
-            "through IEtabsModelFileApi.");
+            offenders.Length == 0,
+            $"These files call GetModelFilepath(): {string.Join(", ", offenders)}. That call " +
+            "returns the model's FOLDER, not its file path — it cannot be handed to " +
+            "cFile.Save and cannot confirm which model is open. Use " +
+            "GetModelFilename(includePath: true) through IEtabsModelFileApi.");
+    }
+
+    /// <summary>
+    /// Keeps the allow-list honest in the other direction. An entry that no longer
+    /// calls the folder API is a repaired file, and leaving it listed would quietly
+    /// re-open the hole for that path.
+    /// </summary>
+    [Fact]
+    public void TheFolderApiAllowListHasNoStaleEntries()
+    {
+        foreach (var relative in AllowedFolderApiCallers)
+        {
+            var source = ReadRepositoryFile(relative);
+
+            Assert.True(
+                Regex.IsMatch(source, FolderApiCallPattern),
+                $"{relative} no longer calls GetModelFilepath() — it has been repaired. " +
+                "Delete its line from AllowedFolderApiCallers so the guard covers it too.");
+        }
     }
 
     /// <summary>
@@ -48,16 +90,57 @@ public sealed class ModelOpenCsiChoiceTests
     [Fact]
     public void TheModelFileApiReadsTheCurrentModelWithGetModelFilename()
     {
-        var source = ReadRepositoryFile(
-            @"src\EtabExtension.CLI\Shared\Infrastructure\Etabs\EtabsModelOpen.cs");
-
         var implementation = Between(
-            source,
+            ReadRepositoryFile(ModelOpenSource),
             "public string? GetModelFilename() =>",
             ";");
 
         Assert.Contains("ModelInfo.GetModelFilename(", implementation, StringComparison.Ordinal);
         Assert.Contains("includePath: true", implementation, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Same class of hazard as the CSI choice: every test supplies the identity check
+    /// explicitly, so the production default is never exercised. Swapping it for a
+    /// permissive stub would disable the guard against a same-named model in another
+    /// folder while leaving the suite green.
+    ///
+    /// <para>Asserted on source text rather than by comparing delegates —
+    /// a method-group conversion allocates a fresh delegate per call, so
+    /// <c>Assert.Same</c> could never hold.</para>
+    /// </summary>
+    [Fact]
+    public void TheOpenPrimitiveDefaultsToTheRealFileIdentityCheck()
+    {
+        var defaulting = Between(
+            ReadRepositoryFile(ModelOpenSource),
+            "compareIdentity ??",
+            ")");
+
+        Assert.Contains("WindowsFileIdentity.Compare", defaulting, StringComparison.Ordinal);
+    }
+
+    private static string ModelOpenSource => Path.Combine(
+        "src", "EtabExtension.CLI", "Shared", "Infrastructure", "Etabs", "EtabsModelOpen.cs");
+
+    private static IEnumerable<(string RelativePath, string Text)> ProductionSources()
+    {
+        var root = RepositoryRoot();
+        var sourceRoot = Path.Combine(root, "src");
+        Assert.True(Directory.Exists(sourceRoot), $"Expected source root not found: {sourceRoot}");
+
+        return Directory
+            .EnumerateFiles(sourceRoot, "*.cs", SearchOption.AllDirectories)
+            .Where(path => !IsBuildOutput(path, root))
+            .Select(path => (Path.GetRelativePath(root, path), File.ReadAllText(path)));
+    }
+
+    private static bool IsBuildOutput(string path, string root)
+    {
+        var relative = Path.GetRelativePath(root, path);
+        var segments = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return segments.Contains("obj", StringComparer.OrdinalIgnoreCase)
+            || segments.Contains("bin", StringComparer.OrdinalIgnoreCase);
     }
 
     private static string Between(string source, string start, string end)

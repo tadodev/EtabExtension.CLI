@@ -7,6 +7,37 @@ using System.Runtime.InteropServices;
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
 
 /// <summary>
+/// Whether two paths were shown to name the same file — and, crucially, whether the
+/// question could be answered at all.
+/// </summary>
+internal enum FileIdentityMatch
+{
+    /// <summary>Both paths resolved, and to the same file.</summary>
+    Same,
+
+    /// <summary>Both paths resolved, to different files.</summary>
+    Different,
+
+    /// <summary>At least one path could not be identified. Nothing was disproved.</summary>
+    Unprovable
+}
+
+/// <summary>
+/// The verdict plus the Win32 error that produced it, so an unprovable answer can say
+/// why rather than leaving a caller to guess at a network share or an exotic
+/// filesystem.
+/// </summary>
+internal readonly record struct FileIdentityResult(FileIdentityMatch Match, int Win32Error)
+{
+    internal static FileIdentityResult Same { get; } = new(FileIdentityMatch.Same, 0);
+
+    internal static FileIdentityResult Different { get; } = new(FileIdentityMatch.Different, 0);
+
+    internal static FileIdentityResult Unprovable(int win32Error) =>
+        new(FileIdentityMatch.Unprovable, win32Error);
+}
+
+/// <summary>
 /// Answers "are these two paths the same file on disk?" by identity rather than by
 /// spelling.
 ///
@@ -27,45 +58,58 @@ internal static class WindowsFileIdentity
     private const uint OpenExisting = 3;
 
     /// <summary>
-    /// True only when both paths resolve to the same file. Any path that cannot be
-    /// identified — missing, locked against even an attributes-only open, a folder,
-    /// or a non-Windows host — answers false, so an unprovable match never passes as
-    /// a proven one.
+    /// Compares two paths by file identity.
+    ///
+    /// <para>Never guesses. A path that cannot be identified — missing, a folder, an
+    /// exotic or network filesystem that reports no index, or a non-Windows host —
+    /// yields <see cref="FileIdentityMatch.Unprovable"/> carrying the Win32 error, not
+    /// a match and not a mismatch. Callers decide what an unanswerable question means;
+    /// this does not decide it for them by returning "different".</para>
     /// </summary>
-    internal static bool SameFile(string? left, string? right)
+    internal static FileIdentityResult Compare(string? left, string? right)
     {
         if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
         {
-            return false;
+            return FileIdentityResult.Unprovable(0);
         }
 
         if (!OperatingSystem.IsWindows())
         {
-            return false;
+            return FileIdentityResult.Unprovable(0);
         }
 
         try
         {
-            var leftIdentity = TryReadIdentity(left);
+            var (leftIdentity, leftError) = TryReadIdentity(left);
             if (leftIdentity is null)
             {
-                return false;
+                return FileIdentityResult.Unprovable(leftError);
             }
 
-            var rightIdentity = TryReadIdentity(right);
-            return rightIdentity is not null && leftIdentity == rightIdentity;
+            var (rightIdentity, rightError) = TryReadIdentity(right);
+            if (rightIdentity is null)
+            {
+                return FileIdentityResult.Unprovable(rightError);
+            }
+
+            return leftIdentity == rightIdentity
+                ? FileIdentityResult.Same
+                : FileIdentityResult.Different;
         }
         catch (Exception exception) when (
             exception is DllNotFoundException or EntryPointNotFoundException)
         {
-            return false;
+            return FileIdentityResult.Unprovable(0);
         }
     }
 
-    private static (uint Volume, uint IndexHigh, uint IndexLow)? TryReadIdentity(string path)
+    private static ((uint Volume, uint IndexHigh, uint IndexLow)? Identity, int Win32Error)
+        TryReadIdentity(string path)
     {
-        // Attributes-only access with full sharing: ETABS holds the .edb open while
-        // the model is loaded, and this must never contend with it.
+        // Attributes-only access with full sharing: ETABS holds the .edb open while the
+        // model is loaded, and this must never contend with it. FILE_READ_ATTRIBUTES is
+        // deliberate — unlike GENERIC_READ it is exempt from share-access checking, so
+        // even a FileShare.None holder does not block identification.
         using var handle = CreateFileW(
             path,
             FileReadAttributes,
@@ -77,12 +121,25 @@ internal static class WindowsFileIdentity
 
         if (handle.IsInvalid)
         {
-            return null;
+            return (null, Marshal.GetLastWin32Error());
         }
 
-        return GetFileInformationByHandle(handle, out var information)
-            ? (information.VolumeSerialNumber, information.FileIndexHigh, information.FileIndexLow)
-            : null;
+        if (!GetFileInformationByHandle(handle, out var information))
+        {
+            return (null, Marshal.GetLastWin32Error());
+        }
+
+        // Some network redirectors and filesystems report a zero index. That is "no
+        // answer", not "index zero" — treating it as an identity would make every such
+        // file identical to every other.
+        if (information.FileIndexHigh == 0 && information.FileIndexLow == 0)
+        {
+            return (null, 0);
+        }
+
+        return (
+            (information.VolumeSerialNumber, information.FileIndexHigh, information.FileIndexLow),
+            0);
     }
 
     // Classic DllImport rather than the source-generated LibraryImport: the latter
