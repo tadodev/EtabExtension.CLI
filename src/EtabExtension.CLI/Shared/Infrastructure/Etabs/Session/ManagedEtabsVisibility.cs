@@ -107,11 +107,81 @@ public static class ManagedEtabsVisibility
         ManagedEtabsVisibilityIntent intent)
     {
         ArgumentNullException.ThrowIfNull(api);
-        _ = intent;
-        return new(
-            intent,
-            Confirmed: false,
-            Changed: false,
-            Diagnostic: "Managed ETABS visibility policy is not implemented yet.");
+        var wantVisible = intent == ManagedEtabsVisibilityIntent.Visible;
+
+        bool before;
+        try
+        {
+            before = api.Visible();
+        }
+        catch (Exception exception)
+        {
+            return NotConfirmed(
+                intent,
+                changed: false,
+                EtabsApiDiagnosticFormatter.Exception(ReadOperation, exception));
+        }
+
+        if (before == wantVisible)
+        {
+            // Already right. Calling the transition anyway would return an error for the
+            // state we wanted, per the Cardex remarks on Hide and Unhide.
+            return new(intent, Confirmed: true, Changed: false, Diagnostic: null);
+        }
+
+        var operation = wantVisible ? UnhideOperation : HideOperation;
+        int returnCode;
+        try
+        {
+            returnCode = wantVisible ? api.Unhide() : api.Hide();
+        }
+        catch (Exception exception)
+        {
+            return NotConfirmed(
+                intent,
+                changed: true,
+                EtabsApiDiagnosticFormatter.Exception(operation, exception));
+        }
+
+        if (returnCode != 0)
+        {
+            return NotConfirmed(
+                intent,
+                changed: true,
+                EtabsApiDiagnosticFormatter.ApiReturn(operation, returnCode));
+        }
+
+        bool after;
+        try
+        {
+            after = api.Visible();
+        }
+        catch (Exception exception)
+        {
+            return NotConfirmed(
+                intent,
+                changed: true,
+                EtabsApiDiagnosticFormatter.Exception(ReadOperation, exception));
+        }
+
+        return after == wantVisible
+            ? new(intent, Confirmed: true, Changed: true, Diagnostic: null)
+            : NotConfirmed(intent, changed: true, Contradicted(operation, wantVisible, after));
     }
+
+    private static ManagedEtabsVisibilityOutcome NotConfirmed(
+        ManagedEtabsVisibilityIntent intent,
+        bool changed,
+        string diagnostic) => new(intent, Confirmed: false, changed, diagnostic);
+
+    private static string Contradicted(string operation, bool wantVisible, bool observed) =>
+        EtabsApiDiagnosticFormatter.Bounded(string.Join(
+            "; ",
+            EtabsApiErrorCodes.VisibilityNotConfirmed,
+            $"operation={operation}",
+            $"requested={Describe(wantVisible)}",
+            $"observed={Describe(observed)}",
+            "ETABS returned success but still reports the opposite application visibility."));
+
+    private static string Describe(bool visible) => visible ? "visible" : "hidden";
 }

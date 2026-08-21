@@ -134,8 +134,9 @@ public sealed class EtabsSession : IEtabsSession
                     throw _launchFailure;
                 }
 
+                ConfirmHiddenForBackgroundWork(launched);
                 _ready = true;
-                Console.Error.WriteLine($"✓ ETABS started (PID {_owned.Identity.Pid})");
+                Console.Error.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
             }
 
             try
@@ -250,9 +251,53 @@ public sealed class EtabsSession : IEtabsSession
         }
     }
 
+    /// <summary>
+    /// The second and last hide of a session's life, taken once
+    /// <c>InitializeNewModel</c> has produced the blank model and the EtabSharp wrap
+    /// exists, and still before the application is handed to any command.
+    ///
+    /// <para>The launcher already hid the application at <c>ApplicationStart</c>. This is
+    /// not redundant: the RC1 timeline shows the window becoming visible at +8.5 s and
+    /// only reporting <c>(Untitled)</c> at +14.8 s, so ETABS finishes building its UI well
+    /// after the start call returns — and Cardex documents nothing about when. A second
+    /// read costs one CSI call and closes that gap.</para>
+    ///
+    /// <para>It runs ONLY while the session is being created. That is the whole reason a
+    /// background command can safely reuse a session the user asked to see: nothing on the
+    /// command path ever hides anything.</para>
+    /// </summary>
+    private static void ConfirmHiddenForBackgroundWork(IManagedEtabsApplication owned)
+    {
+        var outcome = owned.EnsureHiddenForBackgroundWork();
+        if (!outcome.Confirmed)
+        {
+            Console.Error.WriteLine(
+                "⚠ Managed ETABS could not be confirmed hidden before use; a window may be " +
+                $"visible during background work. {outcome.Diagnostic}");
+        }
+    }
+
     /// <inheritdoc />
-    public Result RevealForExplicitUserRequest() =>
-        Result.Fail("Managed ETABS reveal is not implemented yet.");
+    public Result RevealForExplicitUserRequest()
+    {
+        lock (_gate)
+        {
+            var owned = GetOrStartOwned();
+            var outcome = owned.EnsureVisibleForExplicitUserAction();
+            if (!outcome.Confirmed)
+            {
+                return Result.Fail(outcome.Diagnostic
+                    ?? "Managed ETABS could not be confirmed visible.");
+            }
+
+            if (outcome.Changed)
+            {
+                Console.Error.WriteLine($"✓ ETABS shown (PID {owned.Identity.Pid})");
+            }
+
+            return Result.Ok();
+        }
+    }
 
     public ManagedEtabsShutdownResult Shutdown()
     {

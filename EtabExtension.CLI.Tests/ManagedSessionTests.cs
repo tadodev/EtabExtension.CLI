@@ -142,7 +142,7 @@ public sealed class ManagedSessionTests
         // Stands in for snapshot-export / analyze-and-extract asking the shared session
         // for its application.
         fixture.Session.GetOrStartOwned();
-        fixture.Session.GetOrStart();
+        fixture.Session.GetOrStartOwned();
 
         Assert.True(fixture.Managed.IsVisible);
         Assert.Equal(1, fixture.Managed.HiddenCalls);

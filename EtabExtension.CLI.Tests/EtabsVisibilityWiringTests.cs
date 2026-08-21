@@ -118,13 +118,14 @@ public sealed class EtabsVisibilityWiringTests
     [Fact]
     public void TheManagedLaunchHidesTheApplicationItStarted()
     {
-        var calls = Calls(
-            "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher.Launch");
-
-        Assert.Contains(
-            $"{typeof(ManagedEtabsVisibility).FullName}.{nameof(ManagedEtabsVisibility.EnsureHidden)}",
-            calls,
-            StringComparer.Ordinal);
+        Assert.True(
+            Reaches(
+                "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher.Launch",
+                $"{typeof(ManagedEtabsVisibility).FullName}." +
+                nameof(ManagedEtabsVisibility.EnsureHidden)),
+            "ManagedEtabsLauncher.Launch no longer hides the application it started. A managed " +
+            "session exists to do background work; nothing may reach the screen between " +
+            "ApplicationStart and an explicit user request.");
     }
 
     /// <summary>
@@ -136,14 +137,13 @@ public sealed class EtabsVisibilityWiringTests
     [Fact]
     public void TheSessionReAssertsHiddenBeforeHandingTheApplicationOut()
     {
-        var calls = Calls(
-            "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.EtabsSession.GetOrStartOwned");
-
-        Assert.Contains(
-            $"{typeof(IManagedEtabsApplication).FullName}." +
-            nameof(IManagedEtabsApplication.EnsureHiddenForBackgroundWork),
-            calls,
-            StringComparer.Ordinal);
+        Assert.True(
+            Reaches(
+                "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.EtabsSession.GetOrStartOwned",
+                $"{typeof(IManagedEtabsApplication).FullName}." +
+                nameof(IManagedEtabsApplication.EnsureHiddenForBackgroundWork)),
+            "EtabsSession no longer confirms the managed application hidden before handing it " +
+            "to a command.");
     }
 
     /// <summary>
@@ -174,7 +174,8 @@ public sealed class EtabsVisibilityWiringTests
 
     /// <summary>
     /// The other direction: the allow-listed caller must actually make the call, so the
-    /// list cannot silently describe a path that no longer reveals anything.
+    /// list cannot silently describe a path that no longer reveals anything, and the
+    /// open-model handler must actually reach it.
     /// </summary>
     [Fact]
     public void TheExplicitOpenPathReallyDoesRevealAndIsReachedFromTheOpenDispatch()
@@ -182,12 +183,38 @@ public sealed class EtabsVisibilityWiringTests
         var reveal = $"{typeof(IEtabsSession).FullName}." +
             nameof(IEtabsSession.RevealForExplicitUserRequest);
 
-        Assert.All(RevealCallers, caller => Assert.Contains(reveal, Calls(caller), StringComparer.Ordinal));
-        Assert.Contains(
-            $"{typeof(ServeDispatcher).FullName}.RevealAfterConfirmedOpen",
-            Calls($"{typeof(ServeDispatcher).FullName}.DispatchOpenModelAsync"),
-            StringComparer.Ordinal);
+        Assert.All(
+            RevealCallers,
+            caller => Assert.Contains(reveal, Calls(caller), StringComparer.Ordinal));
+        Assert.True(
+            Reaches($"{typeof(ServeDispatcher).FullName}.{OpenDispatch}", reveal),
+            "open-model no longer ends with ETABS visible.");
     }
+
+    /// <summary>
+    /// The acceptance criterion in its sharpest form. <c>ServeDispatcher</c> hosts every
+    /// command, so this walks its dispatch handlers and requires that exactly one of them
+    /// — the explicit open — can reach the reveal at all. Collapsing the two intents, in
+    /// either direction, fails here.
+    /// </summary>
+    [Fact]
+    public void ExactlyOneDispatchHandlerCanEverPutEtabsOnScreen()
+    {
+        var reveal = $"{typeof(IEtabsSession).FullName}." +
+            nameof(IEtabsSession.RevealForExplicitUserRequest);
+        var dispatchHandlers = ProductionCalls.Keys
+            .Where(name => name.StartsWith($"{typeof(ServeDispatcher).FullName}.Dispatch", StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.True(dispatchHandlers.Length > 5, "The dispatch-handler scan found almost nothing.");
+
+        var revealing = dispatchHandlers.Where(handler => Reaches(handler, reveal)).ToArray();
+
+        Assert.Equal([$"{typeof(ServeDispatcher).FullName}.{OpenDispatch}"], revealing);
+    }
+
+    private const string OpenDispatch = "DispatchOpenModelAsync";
 
     private static IReadOnlyList<string> Calls(string methodFullName)
     {
@@ -195,6 +222,40 @@ public sealed class EtabsVisibilityWiringTests
             ProductionCalls.ContainsKey(methodFullName),
             $"{methodFullName} was not found in the production assembly — was it renamed or moved?");
         return ProductionCalls[methodFullName];
+    }
+
+    /// <summary>
+    /// Whether <paramref name="target"/> is callable from <paramref name="from"/> through
+    /// production code. Transitive on purpose: moving a call one helper deeper is the
+    /// cheapest way to slip past a direct-call assertion, and it changes nothing about what
+    /// the daemon actually does.
+    /// </summary>
+    private static bool Reaches(string from, string target)
+    {
+        Assert.True(
+            ProductionCalls.ContainsKey(from),
+            $"{from} was not found in the production assembly — was it renamed or moved?");
+
+        var seen = new HashSet<string>(StringComparer.Ordinal) { from };
+        var pending = new Queue<string>();
+        pending.Enqueue(from);
+        while (pending.Count > 0)
+        {
+            foreach (var call in ProductionCalls[pending.Dequeue()])
+            {
+                if (string.Equals(call, target, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                if (ProductionCalls.ContainsKey(call) && seen.Add(call))
+                {
+                    pending.Enqueue(call);
+                }
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -288,16 +349,45 @@ internal static class VisibilityCallGraph
     /// <c>&lt;Foo&gt;b__7_0</c> and <c>&lt;Foo&gt;g__Local|7_0</c> all yield <c>Foo</c>.
     /// Display-class names such as <c>&lt;&gt;c</c> yield null and fall through to the
     /// method's own name.
+    ///
+    /// <para>Unwraps repeatedly and matches angle brackets by depth, because the nesting
+    /// really does stack: an async lambda inside an async method compiles to
+    /// <c>&lt;&lt;Foo&gt;b__0&gt;d</c>, and stopping at the first <c>&gt;</c> would
+    /// attribute its calls to a method that does not exist.</para>
     /// </summary>
     private static string? Origin(string name)
     {
-        if (name.Length == 0 || name[0] != '<')
+        var unwrapped = false;
+        while (name.Length > 0 && name[0] == '<')
         {
-            return null;
+            unwrapped = true;
+            var depth = 0;
+            var end = -1;
+            for (var index = 0; index < name.Length; index++)
+            {
+                if (name[index] == '<')
+                {
+                    depth++;
+                }
+                else if (name[index] == '>' && --depth == 0)
+                {
+                    end = index;
+                    break;
+                }
+            }
+
+            if (end <= 1)
+            {
+                return null;
+            }
+
+            name = name[1..end];
         }
 
-        var end = name.IndexOf('>', StringComparison.Ordinal);
-        return end > 1 ? name[1..end] : null;
+        // A plain method name is NOT an origin. Returning it here would key an async
+        // method's MoveNext under "MoveNext" and quietly drop the entire body of every
+        // async method from the graph — which is most of the dispatcher.
+        return unwrapped && name.Length > 0 ? name : null;
     }
 
     private static bool IsProduction(string? typeNamespace) =>

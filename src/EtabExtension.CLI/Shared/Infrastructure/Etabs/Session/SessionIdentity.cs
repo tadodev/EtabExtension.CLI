@@ -395,15 +395,26 @@ public interface IManagedEtabsLauncher
 ///
 /// <para>Sequence: preflight census (no external or ambiguous instance) →
 /// <c>cHelper.CreateObject(exact ETABS.exe)</c>, which starts the program →
-/// <c>cOAPI.ApplicationStart()</c> exactly once, requiring zero → <c>cOAPI.SapModel</c>
-/// present → an exact OS census proving exactly one ETABS process, captured as pid +
-/// start time UTC + executable path with an authoritative handle.</para>
+/// <c>cOAPI.ApplicationStart()</c> exactly once, requiring zero → hide the started
+/// application → <c>cOAPI.SapModel</c> present → an exact OS census proving exactly one
+/// ETABS process, captured as pid + start time UTC + executable path with an
+/// authoritative handle.</para>
+///
+/// <para><b>Why the hide is here</b> (CLI #22). Cardex documents exactly one
+/// <c>ApplicationStart</c> overload — <c>int ApplicationStart()</c>, no visibility
+/// argument — and does not say what the application's visibility is afterwards. The
+/// supervised RC1 reproduction observed a window arriving 8.5 s into a background
+/// snapshot-export and showing a blank <c>(Untitled)</c> model at 14.8 s, with the
+/// requested EDB only opening at 16.9 s. Every session this launcher creates is created
+/// for work, not for looking at, so it is hidden here — at the first instant there is
+/// anything to hide — and only an explicit user request through
+/// <see cref="IEtabsSession.RevealForExplicitUserRequest"/> ever brings it back.</para>
 ///
 /// <para>The returned application is owned but <b>not yet API-ready</b>: the caller writes
 /// the recovery record and calls <c>InitializeNewModel</c> before exposing it. Nothing here
-/// starts a process out of band, attaches by pid, falls back to the ROT, hides a window, or
-/// sleeps waiting for readiness — the previous path did all four and still could not prove
-/// that the object it attached to was usable.</para>
+/// starts a process out of band, attaches by pid, falls back to the ROT, or sleeps waiting
+/// for readiness — the previous path did all four and still could not prove that the
+/// object it attached to was usable.</para>
 /// </summary>
 public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
 {
@@ -454,6 +465,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         {
             rawApi = _apiFactory.CreateFromExecutable(executablePath);
             StartApplication(rawApi);
+            HideBeforeAnythingElseTouchesIt(rawApi);
             RequireSapModel(rawApi);
 
             var identity = CensusExactlyOneOwnedProcess();
@@ -527,6 +539,28 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             throw new EtabsLaunchException(
                 EtabsLaunchErrorCodes.ApplicationStartFailed,
                 EtabsApiDiagnosticFormatter.ApiReturn("cOAPI.ApplicationStart", returnCode));
+        }
+    }
+
+    /// <summary>
+    /// Puts the just-started application into the background-work state, before the
+    /// census, the version probe, the recovery record, or <c>InitializeNewModel</c> — the
+    /// earliest point at which there is an application to hide at all.
+    ///
+    /// <para>Deliberately NOT a launch failure. Startup readiness, identity and recovery
+    /// semantics are unchanged by CLI #22: an ETABS that refuses to hide is still a
+    /// working ETABS, and failing Commit outright over a window would cost the engineer
+    /// more than the window does. The failure is reported on stderr with the CSI operation
+    /// named, so a live run says which call disagreed.</para>
+    /// </summary>
+    private void HideBeforeAnythingElseTouchesIt(IEtabsRawApi rawApi)
+    {
+        var outcome = ManagedEtabsVisibility.EnsureHidden(rawApi);
+        if (!outcome.Confirmed)
+        {
+            _diagnostics.WriteLine(
+                "⚠ Managed ETABS could not be confirmed hidden at startup; a window may be " +
+                $"visible during background work. {outcome.Diagnostic}");
         }
     }
 

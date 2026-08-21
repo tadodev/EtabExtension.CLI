@@ -10,6 +10,7 @@ using EtabExtension.CLI.Features.GenerateE2K;
 using EtabExtension.CLI.Features.GetStatus;
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.OpenModel;
+using EtabExtension.CLI.Features.OpenModel.Models;
 using EtabExtension.CLI.Features.ReadModelMetadata;
 using EtabExtension.CLI.Features.RunAnalysis;
 using EtabExtension.CLI.Features.Serve.Inspection;
@@ -18,6 +19,7 @@ using EtabExtension.CLI.Features.SnapshotExport;
 using EtabExtension.CLI.Features.SnapshotExport.Models;
 using EtabExtension.CLI.Features.UnlockModel;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 namespace EtabExtension.CLI.Features.Serve;
@@ -200,14 +202,52 @@ public sealed class ServeDispatcher : IServeDispatcher
         return Task.FromResult<object>(_operations.Cancel(req.OperationId));
     }
 
+    /// <summary>
+    /// The daemon's only user-visible ETABS intent.
+    ///
+    /// <para>Every other handler here is background work against a session that was
+    /// created hidden and stays hidden. This one — and only this one — ends with ETABS on
+    /// screen, because the engineer asked to look at a model.</para>
+    /// </summary>
     private async Task<object> DispatchOpenModelAsync(
         JsonElement? request,
         CancellationToken ct)
     {
         _ = ct;
         var req = Deserialize<ServeOpenModelRequest>(request);
-        return await ExecuteComAsync(async () => await _open.OpenModelOnAppAsync(
-            _session.GetOrStart(), req.FilePath, req.SaveOnClose));
+        return await ExecuteComAsync(async () => (object)RevealAfterConfirmedOpen(
+            await _open.OpenModelOnAppAsync(
+                _session.GetOrStart(),
+                req.FilePath,
+                req.SaveOnClose)));
+    }
+
+    /// <summary>
+    /// Shows ETABS once the requested model is confirmed open — never before.
+    ///
+    /// <para>The ordering is the point of CLI #22. Revealing first is exactly the
+    /// packaged-RC symptom: a blank <c>(Untitled)</c> window on screen for seconds while
+    /// the real model is still loading, which reads as a hung application. A failed open
+    /// therefore reveals nothing at all.</para>
+    ///
+    /// <para>An open that cannot be made visible is reported as a FAILURE even though the
+    /// model is loaded: "Open in ETABS" that leaves nothing on screen has not done what was
+    /// asked, and the response names the CSI call that disagreed rather than claiming a
+    /// success the engineer cannot see.</para>
+    /// </summary>
+    private Result<OpenModelData> RevealAfterConfirmedOpen(Result<OpenModelData> opened)
+    {
+        if (!opened.Success)
+        {
+            return opened;
+        }
+
+        var revealed = _session.RevealForExplicitUserRequest();
+        return revealed.Success
+            ? opened
+            : Result.Fail<OpenModelData>(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                revealed.Error ?? "Managed ETABS could not be confirmed visible.",
+                $"modelOpened={opened.Data?.FilePath}"));
     }
 
     private async Task<object> DispatchAnalyzeAndExtractAsync(
