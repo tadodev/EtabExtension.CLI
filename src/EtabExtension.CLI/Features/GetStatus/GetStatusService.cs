@@ -1,5 +1,6 @@
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabSharp.Core;
 using ETABSv1;
 
@@ -73,8 +74,7 @@ public class GetStatusService : IGetStatusService
         EtabsInstanceOwnership ownership,
         IReadOnlyList<int> observedPids)
     {
-        var openFilePath = app.Model.ModelInfo.GetModelFilepath();
-        var isModelOpen = !string.IsNullOrEmpty(openFilePath);
+        var reportedModelPath = EtabsCurrentModelPath.Read(app);
         var isLocked = app.Model.ModelInfo.IsLocked();
         var isAnalyzed = app.Model.Analyze.GetCaseStatus().Any(cs => cs.IsFinished);
 
@@ -99,15 +99,52 @@ public class GetStatusService : IGetStatusService
             Console.Error.WriteLine($"⚠ Could not read units: {ex.Message}");
         }
 
+        return ComposeStatus(
+            reportedModelPath,
+            pid,
+            ownership,
+            observedPids,
+            app.FullVersion,
+            isLocked,
+            isAnalyzed,
+            unitSystem);
+    }
+
+    /// <summary>
+    /// Turns what ETABS reported into the published status.
+    ///
+    /// <para><c>isModelOpen</c> is derived from the reported value naming a FILE, never
+    /// from that value merely being non-empty: a folder answer is non-empty and would
+    /// otherwise publish "a model is open" while naming no model. Rust compares
+    /// <c>openFilePath</c> against a working <c>.edb</c> by whole-path equality, so a
+    /// value that names no file must be published as no value at all.</para>
+    /// </summary>
+    internal static GetStatusData ComposeStatus(
+        string? reportedModelPath,
+        int? pid,
+        EtabsInstanceOwnership ownership,
+        IReadOnlyList<int> observedPids,
+        string? etabsVersion,
+        bool? isLocked,
+        bool? isAnalyzed,
+        UnitSystemInfo? unitSystem)
+    {
+        var openFilePath = EtabsCurrentModelPath.ResolveOpenFile(reportedModelPath);
+        if (EtabsCurrentModelPath.ReportedWithoutFileName(reportedModelPath))
+        {
+            Console.Error.WriteLine(
+                $"⚠ ETABS names no current model file (reported '{EtabsCurrentModelPath.Describe(reportedModelPath)}')");
+        }
+
         return new GetStatusData
         {
             IsRunning = true,
             Pid = pid,
             Ownership = ownership,
             ObservedPids = observedPids,
-            EtabsVersion = app.FullVersion,
-            OpenFilePath = isModelOpen ? openFilePath : null,
-            IsModelOpen = isModelOpen,
+            EtabsVersion = etabsVersion,
+            OpenFilePath = openFilePath,
+            IsModelOpen = openFilePath is not null,
             IsLocked = isLocked,
             IsAnalyzed = isAnalyzed,
             UnitSystem = unitSystem
