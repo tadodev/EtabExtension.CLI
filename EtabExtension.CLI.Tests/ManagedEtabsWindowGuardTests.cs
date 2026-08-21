@@ -585,13 +585,20 @@ public sealed class ManagedEtabsWindowGuardTests
     // ── The real Win32 subscription ──────────────────────────────────────────
 
     /// <summary>
-    /// The production mechanism, exercised for real: the hook installs, the message-pumping
-    /// thread runs, the backstop ticks, and disposal tears both down deterministically.
+    /// The production mechanism, exercised for real with the real user32 calls: the hook
+    /// installs, the message-pumping thread runs, the backstop ticks, and disposal tears
+    /// both down deterministically.
     ///
     /// <para>Subscribed to THIS process, with a callback that only counts. Nothing is
-    /// enumerated and no window is touched, so the test host's own windows cannot be
+    /// enumerated and no window is touched, so the test host own windows cannot be
     /// affected — the point is that the subscription and its pump are real, not that they
     /// suppress anything here.</para>
+    ///
+    /// <para>It also times <c>Start</c>. The defect this replaced could only ever return by
+    /// burning its full timeout, so an activation that completes in milliseconds is
+    /// evidence the handshake really is a handshake and not a discarded wait — the previous
+    /// version of this test asserted <c>Subscribed</c> after the fact and would have passed
+    /// against that defect.</para>
     /// </summary>
     [Fact]
     [SupportedOSPlatform("windows")]
@@ -604,12 +611,18 @@ public sealed class ManagedEtabsWindowGuardTests
         var monitor = new Win32OwnedWindowSurfaceMonitor(TimeSpan.FromMilliseconds(10));
         try
         {
+            var watch = Stopwatch.StartNew();
             monitor.Start(
                 Environment.ProcessId,
                 () => Interlocked.Increment(ref surfaced),
                 () => Interlocked.Increment(ref ticks));
+            watch.Stop();
 
             Assert.True(monitor.Subscribed, "SetWinEventHook did not install.");
+            Assert.True(
+                watch.Elapsed < TimeSpan.FromSeconds(1),
+                $"activation took {watch.ElapsedMilliseconds} ms — it is waiting out a " +
+                "deadline rather than being acknowledged.");
             Assert.True(
                 SpinUntil(() => Volatile.Read(ref ticks) >= 3, TimeSpan.FromSeconds(10)),
                 $"the pump thread ticked {Volatile.Read(ref ticks)} times");
@@ -642,6 +655,155 @@ public sealed class ManagedEtabsWindowGuardTests
 
         Assert.Throws<InvalidOperationException>(
             () => monitor.Start(Environment.ProcessId, () => { }, () => { }));
+    }
+
+    // ── The activation handshake ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Activation is a handshake, and this is the half that was missing: <c>Start</c> must
+    /// not return until the pump has reported that the hook is installed.
+    ///
+    /// <para>The defect it replaces waited for that acknowledgement while holding the lock
+    /// the pump needed to publish it, so the wait could only ever time out — and its result
+    /// was discarded. Activation therefore "succeeded" with no subscription in place, and
+    /// <c>ApplicationStart</c> could begin in exactly the unguarded window the hook exists
+    /// to cover. Deleting the acknowledgement check fails here.</para>
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ActivationDoesNotReturnUntilTheSubscriptionIsInstalled()
+    {
+        var hook = new ControlledHook();
+        using var monitor = new Win32OwnedWindowSurfaceMonitor(
+            TimeSpan.FromMilliseconds(50),
+            hook.Install,
+            hook.Remove,
+            TimeSpan.FromSeconds(10));
+
+        var activation = Task.Run(() => monitor.Start(Owned.Pid, () => { }, () => { }));
+
+        // The install is still in flight, so activation must still be blocked and the
+        // monitor must not be claiming a subscription it does not have.
+        Assert.False(
+            activation.Wait(TimeSpan.FromMilliseconds(250)),
+            "Start returned before the subscription was installed.");
+        Assert.False(monitor.Subscribed);
+
+        hook.Release.Set();
+
+        Assert.True(activation.Wait(TimeSpan.FromSeconds(10)), "Start never returned.");
+        Assert.True(monitor.Subscribed);
+        Assert.Equal(Owned.Pid, hook.ProcessId);
+    }
+
+    /// <summary>
+    /// A zero hook is a failure, not a fallback. Running the backstop timer on its own would
+    /// be sampling-only suppression — the mechanism #20 measured the ~234 ms and ~462 ms
+    /// flickers through — presented as a working guard.
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void AZeroHookFailsActivationRatherThanDegradingToSampling()
+    {
+        var ticks = 0;
+        var hook = new ControlledHook { Result = nint.Zero };
+        hook.Release.Set();
+        var monitor = new Win32OwnedWindowSurfaceMonitor(
+            TimeSpan.FromMilliseconds(5),
+            hook.Install,
+            hook.Remove,
+            TimeSpan.FromSeconds(10));
+
+        var error = Assert.Throws<InvalidOperationException>(
+            () => monitor.Start(Owned.Pid, () => { }, () => Interlocked.Increment(ref ticks)));
+
+        Assert.Contains("SetWinEventHook", error.Message, StringComparison.Ordinal);
+        Assert.False(monitor.Subscribed);
+        Assert.False(monitor.PumpAlive);
+
+        // And the backstop never ran, despite an interval short enough to have ticked many
+        // times over the assertions above.
+        Assert.Equal(0, Volatile.Read(ref ticks));
+        Assert.Equal(0, hook.Removes);
+    }
+
+    /// <summary>
+    /// An acknowledgement that never arrives fails activation too, and the late hook the
+    /// pump eventually installs is removed rather than orphaned.
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void AnInstallThatMissesTheDeadlineFailsActivationAndLeavesNothingBehind()
+    {
+        var hook = new ControlledHook { InstallDelay = TimeSpan.FromMilliseconds(400) };
+        hook.Release.Set();
+        var monitor = new Win32OwnedWindowSurfaceMonitor(
+            TimeSpan.FromMilliseconds(50),
+            hook.Install,
+            hook.Remove,
+            TimeSpan.FromMilliseconds(50));
+
+        var error = Assert.Throws<InvalidOperationException>(
+            () => monitor.Start(Owned.Pid, () => { }, () => { }));
+
+        Assert.Contains("did not report installation", error.Message, StringComparison.Ordinal);
+        Assert.False(monitor.Subscribed);
+        Assert.False(monitor.PumpAlive);
+        Assert.Equal([hook.Result], hook.Removed);
+    }
+
+    /// <summary>
+    /// Failed activation tears the pump down deterministically: the thread is gone, the
+    /// hook is removed, and the monitor cannot be started again or leak a second thread on
+    /// a later dispose.
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void FailedActivationTearsThePumpDownAndStaysTerminal()
+    {
+        var hook = new ControlledHook { Result = nint.Zero };
+        hook.Release.Set();
+        var monitor = new Win32OwnedWindowSurfaceMonitor(
+            TimeSpan.FromMilliseconds(5),
+            hook.Install,
+            hook.Remove,
+            TimeSpan.FromSeconds(10));
+
+        Assert.Throws<InvalidOperationException>(
+            () => monitor.Start(Owned.Pid, () => { }, () => { }));
+
+        Assert.False(monitor.PumpAlive);
+        Assert.Equal(1, hook.Installs);
+
+        // Terminal: disposal is a no-op rather than a second teardown, and a retry is
+        // refused rather than starting another pump over a monitor that already failed.
+        monitor.Dispose();
+        Assert.Throws<ObjectDisposedException>(
+            () => monitor.Start(Owned.Pid, () => { }, () => { }));
+        Assert.Equal(1, hook.Installs);
+    }
+
+    /// <summary>
+    /// And the guard propagates that failure rather than constructing over a monitor that
+    /// never subscribed — so the launcher cleanup envelope stops the owned process.
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void AGuardCannotBeBuiltOverAMonitorThatFailedToSubscribe()
+    {
+        var hook = new ControlledHook { Result = nint.Zero };
+        hook.Release.Set();
+        var monitor = new Win32OwnedWindowSurfaceMonitor(
+            TimeSpan.FromMilliseconds(5),
+            hook.Install,
+            hook.Remove,
+            TimeSpan.FromSeconds(10));
+
+        Assert.Throws<InvalidOperationException>(() => new ManagedEtabsWindowGuard(
+            new FakeOwnedProcess(Owned),
+            new FakeWindows(),
+            Policy(new VirtualClock()),
+            monitor));
     }
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
@@ -683,6 +845,49 @@ public sealed class ManagedEtabsWindowGuardTests
         }
 
         return condition();
+    }
+
+    /// <summary>
+    /// The two user32 hook calls, under the test control. Everything the activation
+    /// contract does is control flow around these, so this is the seam that makes the
+    /// contract falsifiable without waiting on a real window station to misbehave.
+    /// </summary>
+    private sealed class ControlledHook
+    {
+        public ManualResetEventSlim Release { get; } = new(false);
+
+        public nint Result { get; init; } = 0x1234;
+
+        public TimeSpan InstallDelay { get; init; }
+
+        public int Installs { get; private set; }
+
+        public int Removes => Removed.Count;
+
+        public List<nint> Removed { get; } = [];
+
+        public int? ProcessId { get; private set; }
+
+        public nint Install(int processId, Win32OwnedWindowSurfaceMonitor.WinEventProc proc)
+        {
+            Installs++;
+            ProcessId = processId;
+            _ = Release.Wait(TimeSpan.FromSeconds(30));
+            if (InstallDelay > TimeSpan.Zero)
+            {
+                Thread.Sleep(InstallDelay);
+            }
+
+            return Result;
+        }
+
+        public void Remove(nint hook)
+        {
+            lock (Removed)
+            {
+                Removed.Add(hook);
+            }
+        }
     }
 
     private sealed class VirtualClock : IManagedEtabsClock
