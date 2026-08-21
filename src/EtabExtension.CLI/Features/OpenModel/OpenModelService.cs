@@ -15,6 +15,13 @@ namespace EtabExtension.CLI.Features.OpenModel;
 /// <see cref="EtabsModelOpen"/> primitive. Only the process lifecycle around it
 /// differs (caller-owned session, ROT attach, or a new visible instance), so the
 /// COM boundary itself is identical to the one <c>snapshot-export</c> uses.</para>
+///
+/// <para>The <b>open</b> half is unified; the <b>save</b> half deliberately is not.
+/// The daemon path saves through the primitive, where a non-zero <c>cFile.Save</c>
+/// aborts before anything is opened — a daemon must not discard a caller's unsaved
+/// work on its way to the next model. Mode A keeps its own warn-and-continue save
+/// below, because there a human is driving a visible ETABS they can still recover
+/// from. Do not "unify" that without deciding which of the two is wrong.</para>
 /// </summary>
 public class OpenModelService : IOpenModelService
 {

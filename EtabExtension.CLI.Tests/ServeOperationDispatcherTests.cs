@@ -352,7 +352,9 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Equal(2, snapshot.SharedCalls);
         Assert.Equal(0, snapshot.OneShotCalls);
         Assert.Equal(0, session.GetOrStartOwnedCalls);
-        Assert.Equal(42, session.ProcessId);
+        // Both dispatches asked the SAME shared session for its app; neither reached
+        // for a session of its own.
+        Assert.Equal(2, session.GetOrStartCalls);
     }
 
     [Theory]

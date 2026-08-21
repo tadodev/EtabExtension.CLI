@@ -173,6 +173,8 @@ public class SnapshotExportService : ISnapshotExportService
         RunMetricsBuilder metricsBuilder,
         Stopwatch totalSw)
     {
+        // Seeded with the first stage: an exception can escape before any transition
+        // is marked, and an unattributed diagnostic is the thing this exists to avoid.
         var stage = Stages.OpenModel;
         try
         {
@@ -198,7 +200,6 @@ public class SnapshotExportService : ISnapshotExportService
         Stopwatch totalSw,
         Action<string> enterStage)
     {
-        enterStage(Stages.OpenModel);
         var openResult = await metricsBuilder.MeasureAsync(
             Stages.OpenModel,
             () => Task.FromResult(_opener.Open(app, filePath, save: false)));

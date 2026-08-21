@@ -22,7 +22,10 @@ public sealed class SnapshotExportSharedSessionTests : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(_directory)) Directory.Delete(_directory, recursive: true);
+        if (Directory.Exists(_directory))
+        {
+            Directory.Delete(_directory, recursive: true);
+        }
     }
 
     private string CreateModel(string name = "sample.edb")
@@ -75,6 +78,29 @@ public sealed class SnapshotExportSharedSessionTests : IDisposable
         Assert.Contains("openModel", result.Error, StringComparison.Ordinal);
         Assert.True(result.Error!.Length <= EtabsApiDiagnosticFormatter.TotalLimit);
         Assert.DoesNotContain(result.Error, char.IsControl);
+    }
+
+    [Fact]
+    public async Task AStageFailureAfterTheOpenIsAttributedToThatStageNotTheOpen()
+    {
+        // Discriminates the enterStage mechanism: the open succeeds, so a diagnostic
+        // still naming openModel would mean the stage marker never advanced. The COM
+        // surface is null, so the next stage — normaliseUnits — throws on first touch.
+        var model = CreateModel();
+        var opener = FakeModelOpener.Succeeding(model);
+        var service = new SnapshotExportService(null!, null!, null!, opener);
+
+        var result = await service.SnapshotExportOnAppAsync(
+            null!, model, OutputDir(), new SnapshotExportRequest());
+
+        Assert.False(result.Success);
+        Assert.Contains(
+            "operation=snapshot-export.normaliseUnits",
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("openModel", result.Error, StringComparison.Ordinal);
+        Assert.Equal(1, opener.Calls);
+        Assert.True(result.Error!.Length <= EtabsApiDiagnosticFormatter.TotalLimit);
     }
 
     [Fact]
@@ -156,6 +182,10 @@ public sealed class SnapshotExportSharedSessionTests : IDisposable
 
         public FakeModelOpener(Exception failure) => _throw = failure;
 
+        /// <summary>An opener that succeeds, so the export proceeds to the next stage.</summary>
+        public static FakeModelOpener Succeeding(string filePath) => new(
+            Result.Ok(new ModelOpenOutcome(filePath, Path.GetFullPath(filePath), null)));
+
         public int Calls { get; private set; }
         public string? FilePath { get; private set; }
         public bool Save { get; private set; }
@@ -165,7 +195,11 @@ public sealed class SnapshotExportSharedSessionTests : IDisposable
             Calls++;
             FilePath = filePath;
             Save = save;
-            if (_throw is not null) throw _throw;
+            if (_throw is not null)
+            {
+                throw _throw;
+            }
+
             return _result!;
         }
     }

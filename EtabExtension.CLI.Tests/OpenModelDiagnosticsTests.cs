@@ -160,7 +160,21 @@ public sealed class OpenModelDiagnosticsTests
         Func<string?> getCurrentPath,
         Func<string, int> saveFile,
         Func<string, int> openFile) => OpenModelService.ToOpenModelData(
-            EtabsModelOpen.OpenOnAttachedModel(filePath, save, getCurrentPath, saveFile, openFile));
+            EtabsModelOpen.OpenOnApi(
+                new DelegateModelFileApi(getCurrentPath, saveFile, openFile),
+                filePath,
+                save,
+                sameFile: (_, _) => false));
+
+    private sealed class DelegateModelFileApi(
+        Func<string?> getCurrentPath,
+        Func<string, int> saveFile,
+        Func<string, int> openFile) : IEtabsModelFileApi
+    {
+        public string? GetModelFilename() => getCurrentPath();
+        public int SaveFile(string filePath) => saveFile(filePath);
+        public int OpenFile(string filePath) => openFile(filePath);
+    }
 
     private sealed class TestException : Exception
     {

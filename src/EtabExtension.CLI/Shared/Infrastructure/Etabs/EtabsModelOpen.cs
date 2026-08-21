@@ -16,6 +16,65 @@ public sealed record ModelOpenOutcome(
     string? PreviousFilePath);
 
 /// <summary>
+/// The three CSI calls a model open needs, behind one named seam.
+///
+/// <para>This exists so the calls are chosen once, in one reviewable place, instead
+/// of being spelled out as anonymous lambdas at each call site. The choice of
+/// <c>GetModelFilename</c> over <c>GetModelFilepath</c> was a shipped defect; naming
+/// the contract here — and testing through this interface — is what keeps it
+/// chosen.</para>
+/// </summary>
+public interface IEtabsModelFileApi
+{
+    /// <summary>
+    /// The FULL PATH of the currently loaded model, or empty when none is loaded.
+    ///
+    /// <para>Implementations must use <c>cSapModel.GetModelFilename(IncludePath: true)</c>.
+    /// The folder-returning call is NOT a substitute — see
+    /// <see cref="EtabsModelFileApi.GetModelFilename"/> for the evidence.</para>
+    /// </summary>
+    string? GetModelFilename();
+
+    /// <summary><c>cFile.Save</c> — zero on success.</summary>
+    int SaveFile(string filePath);
+
+    /// <summary><c>cFile.OpenFile</c> — zero on success.</summary>
+    int OpenFile(string filePath);
+}
+
+/// <summary>
+/// The only production implementation of <see cref="IEtabsModelFileApi"/>: three
+/// one-line adapters onto the caller-owned application's CSI surface.
+/// </summary>
+internal sealed class EtabsModelFileApi(ETABSApplication application) : IEtabsModelFileApi
+{
+    /// <summary>
+    /// Reads the current model with GetModelFilename, NOT the folder-returning call.
+    ///
+    /// <para>Cardex verifies only the call used here: <c>cSapModel.GetModelFilename</c>
+    /// returns the full path when <c>IncludePath</c> is true. It says nothing about
+    /// the other one beyond "returns the filepath of the current model", and
+    /// EtabSharp's own XML doc calls that one the "full filepath" — so the docs do not
+    /// distinguish them.</para>
+    ///
+    /// <para>The distinction is an OBSERVED behavior, not a documented one. The
+    /// supervised live run of snapshot-export against
+    /// <c>D:\Work\tadoEng\TestModel\sample_v2.EDB</c> (ETABS 23.3.0) had the primitive
+    /// wired to the folder call and failed its own confirmation with an empty
+    /// <c>opened=</c> field; the same session's <c>get-status</c> reported
+    /// <c>openFilePath</c> as <c>"D:\Work\tadoEng\TestModel\"</c> — the FOLDER, with no
+    /// file name. Re-verify empirically before trusting the folder call as a file path
+    /// anywhere.</para>
+    /// </summary>
+    public string? GetModelFilename() =>
+        application.Model.ModelInfo.GetModelFilename(includePath: true);
+
+    public int SaveFile(string filePath) => application.Model.Files.SaveFile(filePath);
+
+    public int OpenFile(string filePath) => application.Model.Files.OpenFile(filePath);
+}
+
+/// <summary>
 /// The one managed-app model-open boundary. Injected wherever a shared-session
 /// command needs a model loaded so that <c>open-model</c> and <c>snapshot-export</c>
 /// cannot grow divergent OpenFile implementations.
@@ -63,9 +122,8 @@ public sealed class EtabsModelOpener : IEtabsModelOpener
 /// "the full path of a model file" and a zero return as the only success. A zero
 /// return is necessary but not sufficient: it does not prove the requested model is
 /// the one now loaded, so the primitive re-reads the current model file through
-/// <c>cSapModel.GetModelFilename</c> — which Cardex documents as returning the full
-/// path when <c>IncludePath</c> is true — and fails explicitly when a blank or
-/// foreign model is current.</para>
+/// <see cref="IEtabsModelFileApi.GetModelFilename"/> and fails explicitly when a
+/// blank, folder-shaped, or foreign answer comes back.</para>
 /// </summary>
 public static class EtabsModelOpen
 {
@@ -103,46 +161,26 @@ public static class EtabsModelOpen
         ArgumentNullException.ThrowIfNull(app);
 
         var validation = ValidateModelPath(filePath);
-        if (validation is not null)
-        {
-            return Result.Fail<ModelOpenOutcome>(validation);
-        }
-
-        return OpenOnAttachedModel(
-            filePath,
-            save,
-            // Read the current model with GetModelFilename, NOT GetModelFilepath.
-            //
-            // Cardex verifies only the call used here: cSapModel.GetModelFilename
-            // returns the full path when IncludePath is true. It says nothing about
-            // GetModelFilepath beyond "returns the filepath of the current model",
-            // and EtabSharp's own XML doc calls that one the "full filepath" — so the
-            // docs do not distinguish them.
-            //
-            // The distinction is an OBSERVED behavior, not a documented one. The
-            // supervised live run of snapshot-export against
-            // D:\Work\tadoEng\TestModel\sample_v2.EDB (ETABS 23.3.0) had this
-            // primitive wired to GetModelFilepath and failed its own confirmation with
-            // an empty opened= field; the same session's get-status reported
-            // openFilePath as "D:\Work\tadoEng\TestModel\" — the FOLDER, with no
-            // file name. Re-verify empirically before trusting GetModelFilepath as a
-            // file path anywhere.
-            () => app.Model.ModelInfo.GetModelFilename(includePath: true),
-            currentPath => app.Model.Files.SaveFile(currentPath),
-            targetPath => app.Model.Files.OpenFile(targetPath));
+        return validation is not null
+            ? Result.Fail<ModelOpenOutcome>(validation)
+            : OpenOnApi(new EtabsModelFileApi(app), filePath, save);
     }
 
     /// <summary>
-    /// The COM sequence itself, expressed over injectable CSI calls so every stage
-    /// failure is provable without ETABS. Path validation is the caller's job — this
-    /// overload is also used by the one-shot attach paths, which validate earlier.
+    /// The COM sequence itself, expressed over <see cref="IEtabsModelFileApi"/> so
+    /// every stage failure is provable without ETABS. Path validation is the caller's
+    /// job — this overload is also used by the one-shot attach paths, which validate
+    /// earlier.
     /// </summary>
-    internal static Result<ModelOpenOutcome> OpenOnAttachedModel(
+    /// <param name="sameFile">
+    /// File-identity test used to tell a legitimate re-spelling of the requested path
+    /// from a genuinely different model. Defaults to the real Windows check.
+    /// </param>
+    internal static Result<ModelOpenOutcome> OpenOnApi(
+        IEtabsModelFileApi api,
         string filePath,
         bool save,
-        Func<string?> getCurrentPath,
-        Func<string, int> saveFile,
-        Func<string, int> openFile)
+        Func<string, string, bool>? sameFile = null)
     {
         string resolvedPath;
         try
@@ -158,14 +196,14 @@ public static class EtabsModelOpen
         var activeOperation = ReadCurrentPathOperation;
         try
         {
-            var currentPath = getCurrentPath();
+            var currentPath = api.GetModelFilename();
             var hasCurrentFile = !string.IsNullOrEmpty(currentPath);
 
             if (hasCurrentFile && save)
             {
                 Console.Error.WriteLine("ℹ Saving current file...");
                 activeOperation = SaveOperation;
-                var saveReturnCode = saveFile(currentPath!);
+                var saveReturnCode = api.SaveFile(currentPath!);
                 if (saveReturnCode != 0)
                 {
                     return Result.Fail<ModelOpenOutcome>(
@@ -175,7 +213,7 @@ public static class EtabsModelOpen
 
             Console.Error.WriteLine($"ℹ Opening: {Path.GetFileName(resolvedPath)}");
             activeOperation = OpenOperation;
-            var openReturnCode = openFile(resolvedPath);
+            var openReturnCode = api.OpenFile(resolvedPath);
             if (openReturnCode != 0)
             {
                 return Result.Fail<ModelOpenOutcome>(
@@ -183,7 +221,10 @@ public static class EtabsModelOpen
             }
 
             activeOperation = ReadCurrentPathOperation;
-            var confirmation = ConfirmOpened(resolvedPath, getCurrentPath());
+            var confirmation = ConfirmOpened(
+                resolvedPath,
+                api.GetModelFilename(),
+                sameFile ?? WindowsFileIdentity.SameFile);
             if (confirmation is not null)
             {
                 return Result.Fail<ModelOpenOutcome>(confirmation);
@@ -208,53 +249,76 @@ public static class EtabsModelOpen
     /// <para>The packaged-RC defect this guards: ETABS started, the blank initialized
     /// model stayed loaded, and the export ran against nothing. A blank model reports
     /// no current file, so an empty answer is a hard failure — never a warning.</para>
+    ///
+    /// <para>Comparison is by full path, then by file IDENTITY — never by file name.
+    /// Name equality would accept a different model that happens to share a name, and
+    /// this machine has exactly that: a byte-identical <c>sample_v2.EDB</c> under both
+    /// <c>D:\Work\test\</c> and the sanctioned <c>D:\Work\tadoEng\TestModel\</c>.
+    /// Only a path that provably reaches the same file is downgraded to a warning.</para>
     /// </summary>
-    private static string? ConfirmOpened(string resolvedPath, string? openedPath)
+    private static string? ConfirmOpened(
+        string resolvedPath,
+        string? openedPath,
+        Func<string, string, bool> sameFile)
     {
-        var requestedName = Path.GetFileName(resolvedPath);
         var opened = openedPath?.Trim();
         if (string.IsNullOrEmpty(opened))
         {
             return NotConfirmed(
-                requestedName,
+                resolvedPath,
                 "(none)",
                 "ETABS returned success but reports no current model file.");
         }
 
-        var openedName = Path.GetFileName(opened);
-        if (string.IsNullOrEmpty(openedName))
+        if (string.IsNullOrEmpty(Path.GetFileName(opened)))
         {
             return NotConfirmed(
-                requestedName,
+                resolvedPath,
                 "(no file name)",
                 $"ETABS returned success but names no current model file (reported '{opened}').");
         }
 
-        if (!string.Equals(requestedName, openedName, StringComparison.OrdinalIgnoreCase))
+        var openedFull = TryGetFullPath(opened);
+        if (string.Equals(openedFull, resolvedPath, StringComparison.OrdinalIgnoreCase))
         {
-            return NotConfirmed(
-                requestedName,
-                openedName,
-                "ETABS returned success but a different model is current.");
+            return null;
         }
 
-        if (!string.Equals(opened, resolvedPath, StringComparison.OrdinalIgnoreCase))
+        if (sameFile(resolvedPath, openedFull))
         {
-            // Same file name, different spelling of the path (UNC, short path, mapped
-            // drive). Not a failure — but it is worth seeing in the daemon log.
+            // A different spelling of the same file: UNC share, subst drive, mapped
+            // drive, junction. Proven identical, so this is information, not failure.
             Console.Error.WriteLine(
-                $"⚠ ETABS reports the current model as '{opened}' for requested '{resolvedPath}'");
+                $"⚠ ETABS reports the current model as '{openedFull}' for requested " +
+                $"'{resolvedPath}' — different path, same file.");
+            return null;
         }
 
-        return null;
+        return NotConfirmed(
+            resolvedPath,
+            openedFull,
+            "ETABS returned success but a different model is current.");
     }
 
-    private static string NotConfirmed(string requestedName, string openedName, string detail) =>
+    private static string TryGetFullPath(string path)
+    {
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return path;
+        }
+    }
+
+    private static string NotConfirmed(string requestedPath, string openedPath, string detail) =>
         EtabsApiDiagnosticFormatter.Bounded(string.Join(
             "; ",
             EtabsApiErrorCodes.ModelOpenNotConfirmed,
             $"operation={OpenOperation}",
-            $"requested={requestedName}",
-            $"opened={openedName}",
+            $"requested={requestedPath}",
+            $"opened={openedPath}",
             detail));
 }
