@@ -647,6 +647,14 @@ internal sealed class Win32TopLevelWindows : ITopLevelWindows
 /// message queue rather than injected into ETABS, so nothing of ours runs inside the
 /// guarded process. That is also why the thread must pump messages: the callback fires
 /// from inside the message-retrieval call.</para>
+///
+/// <para><b>Activation is a handshake, and it is proven.</b> <see cref="Start"/> returns
+/// only once the pump has reported back that <c>SetWinEventHook</c> ran AND returned a
+/// non-zero hook. Anything else — the acknowledgement never arriving, or arriving with a
+/// zero hook — tears the pump down and throws. There is deliberately no backstop-only
+/// fallback: sampling alone is what #20 measured the ~234 ms and ~462 ms flickers through,
+/// so a session that cannot subscribe must fail loudly rather than quietly degrade to the
+/// mechanism that was already rejected.</para>
 /// </summary>
 [SupportedOSPlatform("windows")]
 internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonitor
@@ -660,9 +668,19 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
     private const uint PmRemove = 0x0001;
     private const uint WaitObject0 = 0;
 
+    /// <summary>
+    /// How long activation waits for the pump's acknowledgement. Generous, because it only
+    /// covers a thread start and one user32 call — and because exceeding it is a failure,
+    /// not a fallback, so it must not fire on a merely busy machine.
+    /// </summary>
+    public static readonly TimeSpan DefaultInstallTimeout = TimeSpan.FromSeconds(5);
+
     private static readonly TimeSpan JoinTimeout = TimeSpan.FromSeconds(2);
 
     private readonly TimeSpan _backstopInterval;
+    private readonly TimeSpan _installTimeout;
+    private readonly Func<int, WinEventProc, nint> _installHook;
+    private readonly Action<nint> _removeHook;
     private readonly ManualResetEvent _stop = new(false);
     private readonly object _gate = new();
 
@@ -670,22 +688,48 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
     private WinEventProc? _proc;
     private Thread? _thread;
     private nint _hook;
+    private Exception? _installError;
     private bool _disposed;
 
     public Win32OwnedWindowSurfaceMonitor(TimeSpan backstopInterval)
+        : this(backstopInterval, InstallHook, RemoveHook, DefaultInstallTimeout)
+    {
+    }
+
+    /// <summary>
+    /// The same monitor with the user32 hook calls and the acknowledgement deadline behind
+    /// parameters, so the activation contract — which is pure control flow around two
+    /// P/Invokes — is exercisable without waiting on the real window station to misbehave.
+    /// The public constructor above binds the real calls, and that is what production uses.
+    /// </summary>
+    internal Win32OwnedWindowSurfaceMonitor(
+        TimeSpan backstopInterval,
+        Func<int, WinEventProc, nint> installHook,
+        Action<nint> removeHook,
+        TimeSpan installTimeout)
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(backstopInterval, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(installTimeout, TimeSpan.Zero);
+        ArgumentNullException.ThrowIfNull(installHook);
+        ArgumentNullException.ThrowIfNull(removeHook);
+
         _backstopInterval = backstopInterval;
+        _installTimeout = installTimeout;
+        _installHook = installHook;
+        _removeHook = removeHook;
     }
 
     /// <inheritdoc />
-    public bool Subscribed
+    public bool Subscribed => Volatile.Read(ref _hook) != nint.Zero;
+
+    /// <summary>Whether the pump thread is still alive, for teardown assertions.</summary>
+    internal bool PumpAlive
     {
         get
         {
             lock (_gate)
             {
-                return _hook != nint.Zero;
+                return _thread?.IsAlive ?? false;
             }
         }
     }
@@ -695,6 +739,8 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
     {
         ArgumentNullException.ThrowIfNull(onSurfaced);
         ArgumentNullException.ThrowIfNull(onBackstopTick);
+
+        var installed = new ManualResetEventSlim(false);
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -704,9 +750,6 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
                     "This owned-window monitor has already been started.");
             }
 
-            // Deliberately not disposed here: the pump thread signals it, and a Start that
-            // timed out waiting must not leave that thread setting a disposed handle.
-            var installed = new ManualResetEventSlim(false);
             var pump = new Thread(() => Pump(processId, onSurfaced, onBackstopTick, installed))
             {
                 IsBackground = true,
@@ -714,11 +757,19 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
             };
             _thread = pump;
             pump.Start();
-
-            // The hook must exist before the caller proceeds to ApplicationStart, which is
-            // the exact interval #20 measured a window through.
-            _ = installed.Wait(JoinTimeout);
         }
+
+        // Deliberately OUTSIDE the gate. The pump publishes its result and signals; waiting
+        // for that acknowledgement while holding the lock the pump needs would guarantee the
+        // wait times out and let activation "succeed" before any hook existed — the exact
+        // race the subscription was introduced to remove.
+        var acknowledged = installed.Wait(_installTimeout);
+        if (acknowledged && Subscribed)
+        {
+            return;
+        }
+
+        FailActivation(acknowledged);
     }
 
     public void Dispose()
@@ -740,6 +791,50 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
         _stop.Dispose();
     }
 
+    /// <summary>
+    /// Activation could not be proven, so the monitor is torn down and the caller is told.
+    /// Nothing is left running: the pump is stopped and joined, and any hook it managed to
+    /// install after the deadline is removed rather than orphaned.
+    /// </summary>
+    private void FailActivation(bool acknowledged)
+    {
+        Thread? thread;
+        lock (_gate)
+        {
+            _disposed = true;
+            thread = _thread;
+        }
+
+        _stop.Set();
+        _ = thread?.Join(JoinTimeout);
+
+        // Exactly one of this and the pump's exit path wins the exchange, so a hook is never
+        // removed twice and never left behind.
+        var late = Interlocked.Exchange(ref _hook, nint.Zero);
+        if (late != nint.Zero)
+        {
+            try
+            {
+                _removeHook(late);
+            }
+            catch (Exception removal)
+            {
+                // The activation failure is the story; a failed cleanup must not replace it.
+                _installError ??= removal;
+            }
+        }
+
+        _stop.Dispose();
+
+        var reason = acknowledged
+            ? "SetWinEventHook returned no hook for the owned ETABS process, so window " +
+                "events cannot be observed. Background UI suppression would degrade to " +
+                "sampling, which is not sufficient."
+            : $"The owned-window subscription did not report installation within " +
+                $"{_installTimeout.TotalSeconds:0.###}s.";
+        throw new InvalidOperationException(reason, _installError);
+    }
+
     private void Pump(
         int processId,
         Action onSurfaced,
@@ -757,20 +852,31 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
             }
         };
 
-        var hook = SetWinEventHook(
-            EventObjectCreate,
-            EventObjectShow,
-            nint.Zero,
-            _proc,
-            unchecked((uint)processId),
-            0,
-            WinEventOutOfContext);
-        lock (_gate)
+        var hook = nint.Zero;
+        try
         {
-            _hook = hook;
+            hook = _installHook(processId, _proc);
+            Volatile.Write(ref _hook, hook);
+        }
+        catch (Exception exception)
+        {
+            _installError = exception;
+        }
+        finally
+        {
+            // Always acknowledged, success or not: Start must never be left waiting out its
+            // deadline for an answer that already exists.
+            installed.Set();
         }
 
-        installed.Set();
+        if (hook == nint.Zero)
+        {
+            // Nothing is subscribed, so there is nothing to pump — and the backstop must NOT
+            // run on its own. Sampling-only suppression is the mechanism #20 measured
+            // flickers through, and Start is about to report this as an activation failure.
+            _proc = null;
+            return;
+        }
 
         var handles = new[] { _stop.SafeWaitHandle.DangerousGetHandle() };
         var backstopMs = (uint)Math.Max(1, (long)_backstopInterval.TotalMilliseconds);
@@ -792,19 +898,27 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
             onBackstopTick();
         }
 
-        if (hook != nint.Zero)
+        var installedHook = Interlocked.Exchange(ref _hook, nint.Zero);
+        if (installedHook != nint.Zero)
         {
-            _ = UnhookWinEvent(hook);
-            lock (_gate)
-            {
-                _hook = nint.Zero;
-            }
+            _removeHook(installedHook);
         }
 
         _proc = null;
     }
 
-    private delegate void WinEventProc(
+    private static nint InstallHook(int processId, WinEventProc proc) => SetWinEventHook(
+        EventObjectCreate,
+        EventObjectShow,
+        nint.Zero,
+        proc,
+        unchecked((uint)processId),
+        0,
+        WinEventOutOfContext);
+
+    private static void RemoveHook(nint hook) => _ = UnhookWinEvent(hook);
+
+    internal delegate void WinEventProc(
         nint hWinEventHook,
         uint eventType,
         nint hwnd,

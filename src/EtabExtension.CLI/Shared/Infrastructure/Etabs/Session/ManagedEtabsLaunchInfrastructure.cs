@@ -30,6 +30,13 @@ public static class EtabsLaunchErrorCodes
     /// actually suppressed.</para>
     /// </summary>
     public const string HiddenStateNotEstablished = "ETABS_HIDDEN_STATE_NOT_ESTABLISHED";
+
+    /// <summary>
+    /// The exact-process window subscription could not be installed, so background UI
+    /// suppression would have only the sampling backstop behind it — the mechanism #20
+    /// already measured visible flickers through. Activation fails rather than degrades.
+    /// </summary>
+    public const string WindowSuppressionUnavailable = "ETABS_WINDOW_SUPPRESSION_UNAVAILABLE";
     public const string RecoveryRecordWriteFailed = "ETABS_RECOVERY_RECORD_WRITE_FAILED";
 }
 

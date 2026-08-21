@@ -615,7 +615,24 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     /// </summary>
     private IManagedEtabsWindowGuard ActivateWindowGuard(IOwnedEtabsProcess ownedProcess)
     {
-        var guard = _windowGuards.Activate(ownedProcess);
+        IManagedEtabsWindowGuard guard;
+        try
+        {
+            guard = _windowGuards.Activate(ownedProcess);
+        }
+        catch (Exception exception) when (exception is not EtabsLaunchException)
+        {
+            // Typed rather than swallowed by the generic launch handler: a subscription that
+            // could not be installed is a materially different fact from an ambiguous ETABS
+            // instance, and the live gate has to be able to tell them apart.
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.WindowSuppressionUnavailable,
+                EtabsApiDiagnosticFormatter.InfrastructureException(
+                    "IManagedEtabsWindowGuardFactory.Activate",
+                    exception),
+                exception);
+        }
+
         _diagnostics.WriteLine(
             "ℹ ETABS window suppression armed for owned " +
             $"pid={ownedProcess.Identity.Pid} (released only by an explicit open-model).");
