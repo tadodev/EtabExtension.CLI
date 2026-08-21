@@ -83,9 +83,11 @@ public class CloseModelService : ICloseModelService
     /// an extensionless file named after the folder.</para>
     ///
     /// <para>A non-blank answer that names no file therefore fails a requested save
-    /// outright — never silently skips it — while an unsaved close still clears the
-    /// workspace, because that is the recovery path and it does not depend on the
-    /// path.</para>
+    /// outright rather than silently skipping it, while an unsaved close still clears the
+    /// workspace, because that is the recovery path and it does not depend on the path. A
+    /// BLANK answer is the separate, long-standing case and keeps its behavior: nothing is
+    /// loaded, so a requested save has nothing to write and the close succeeds with
+    /// <c>wasSaved: false</c>.</para>
     /// </summary>
     internal static Result<CloseModelData> CompleteClose(
         string? reportedPath,

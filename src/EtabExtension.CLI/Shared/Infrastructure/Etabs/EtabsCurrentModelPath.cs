@@ -6,14 +6,17 @@ using EtabSharp.Core;
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
 
 /// <summary>
-/// The one read of "which model file is loaded in this ETABS right now", plus the one
+/// The Mode A read of "which model file is loaded in this ETABS right now", plus the one
 /// rule for deciding whether the answer actually names a file.
 ///
-/// <para>Every Mode A command reads the current model through here so the choice of CSI
-/// call cannot drift per feature: <c>get-status</c> publishes it as
-/// <c>openFilePath</c>, <c>unlock-model</c> compares it against the requested file, and
-/// <c>close-model</c> hands it to <c>cFile.Save</c>. All three are wrong in the same way
-/// if the read is wrong.</para>
+/// <para><c>get-status</c>, <c>unlock-model</c> and <c>close-model</c> all read through
+/// here so the choice of CSI call cannot drift per feature: status publishes the value as
+/// <c>openFilePath</c>, unlock compares it against the requested file, and close hands it
+/// to <c>cFile.Save</c>. All three are wrong in the same way if the read is wrong. (The
+/// model-open boundary, <c>EtabsModelOpen</c>, owns the same read for the commands that
+/// open a model; folding it onto this type is deliberate follow-up work, not an
+/// oversight — see the allow-list in <c>EtabsModelPathWiringTests</c> for the full set of
+/// types permitted to make this call.)</para>
 ///
 /// <para><b>Use <c>GetModelFilename(includePath: true)</c>, never
 /// <c>GetModelFilepath()</c>.</b> The distinction is an OBSERVED behavior, not a
@@ -26,14 +29,12 @@ namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
 /// as a file path anywhere.</para>
 ///
 /// <para>Downstream, Rust compares this value against a working <c>.edb</c> file by
-/// whole-path equality. A folder never matches a file, so a folder answer does not read
-/// as "a different model" — it reads as "no model open", silently.</para>
+/// whole-path equality. Anything that is not a fully-qualified file path can never match,
+/// so publishing one does not read as "a different model" — it reads as "no model open",
+/// silently.</para>
 /// </summary>
 public static class EtabsCurrentModelPath
 {
-    /// <summary>The CSI operation named in diagnostics when this read fails.</summary>
-    public const string ReadOperation = "cSapModel.GetModelFilename";
-
     /// <summary>
     /// Reads the current model's full file path from a caller-owned application. Owns no
     /// process lifecycle: no attach, no create, no exit, no dispose.
@@ -45,8 +46,29 @@ public static class EtabsCurrentModelPath
     }
 
     /// <summary>
-    /// Narrows a reported current-model value to one that names a file, or null when it
-    /// names none — blank (no model loaded) or a bare folder (the defect signature).
+    /// Narrows a reported current-model value to one usable as a model file path, or null
+    /// when it is not.
+    ///
+    /// <para>Three things must hold, and the folder shapes fail at least one of them:</para>
+    /// <list type="bullet">
+    /// <item><description>Fully qualified. A bare <c>sample_v2.EDB</c> would resolve
+    /// against this process's working directory, which is not ETABS's — and Rust
+    /// normalizes separators without absolutizing, so a relative answer compares unequal
+    /// to the absolute working file no matter what it names.</description></item>
+    /// <item><description>Names a file. Rejects <c>D:\Work\tadoEng\TestModel\</c>,
+    /// <c>D:\</c> and <c>\\server\share</c>, whose last segment is empty.</description></item>
+    /// <item><description>Carries an extension. A separator-less folder such as
+    /// <c>D:\Models</c> passes the first two — it names <c>Models</c> — and is the same
+    /// defect in a different folder shape. ETABS models are always <c>.edb</c>, so the
+    /// extension is what separates them. Checked without touching disk: this runs on
+    /// every status read, and a filesystem probe would cost a syscall per call and race
+    /// its own answer.</description></item>
+    /// </list>
+    ///
+    /// <para>Residual, accepted: a separator-less folder that happens to carry a dot
+    /// (<c>D:\Models.v2</c>) still passes. Narrowing the rule to the <c>.edb</c>
+    /// extension itself would close it, and is available if a live run ever shows that
+    /// shape.</para>
     /// </summary>
     public static string? ResolveOpenFile(string? reported)
     {
@@ -56,15 +78,26 @@ public static class EtabsCurrentModelPath
             return null;
         }
 
-        return string.IsNullOrEmpty(Path.GetFileName(trimmed)) ? null : trimmed;
+        if (!Path.IsPathFullyQualified(trimmed))
+        {
+            return null;
+        }
+
+        if (string.IsNullOrEmpty(Path.GetFileName(trimmed)))
+        {
+            return null;
+        }
+
+        return Path.HasExtension(trimmed) ? trimmed : null;
     }
 
-    /// <summary>True when the reported value names a model file.</summary>
+    /// <summary>True when the reported value is usable as a model file path.</summary>
     public static bool NamesAFile(string? reported) => ResolveOpenFile(reported) is not null;
 
     /// <summary>
-    /// True when ETABS answered with something non-blank that still names no file. Worth
-    /// reporting: it means the model state cannot be trusted, not that nothing is open.
+    /// True when ETABS answered with something non-blank that still names no usable file.
+    /// Worth reporting: it means the model state cannot be trusted, not that nothing is
+    /// open.
     /// </summary>
     public static bool ReportedWithoutFileName(string? reported) =>
         !string.IsNullOrWhiteSpace(reported) && ResolveOpenFile(reported) is null;

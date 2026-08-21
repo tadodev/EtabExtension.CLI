@@ -89,6 +89,19 @@ public class UnlockModelService : IUnlockModelService
             $"Open the file first with: etab-cli open-model --file \"{filePath}\"";
     }
 
+    /// <summary>
+    /// Deliberately the more lenient side of the equality Rust also performs.
+    ///
+    /// <para>Rust's <c>paths_match</c> normalizes only the <c>\\?\</c> prefix and compares
+    /// ASCII-case-insensitively; this resolves through <c>Path.GetFullPath</c> and
+    /// compares <c>OrdinalIgnoreCase</c>, so the two disagree at the edges in both
+    /// directions — this accepts <c>D:/…/SAMPLE_V2.edb</c> against
+    /// <c>D:\…\sample_v2.EDB</c> where Rust would not, and <c>GetFullPath</c> keeps a
+    /// <c>\\?\</c> prefix that Rust strips. Unreachable while ETABS answers with plain
+    /// drive-rooted paths, and leniency is the safe direction here: this guard only
+    /// decides whether to REFUSE an unlock the caller asked for. Rust remains the
+    /// authority on whether the open model is the one it wants.</para>
+    /// </summary>
     private static bool PathsAreEqual(string? a, string? b)
     {
         if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
