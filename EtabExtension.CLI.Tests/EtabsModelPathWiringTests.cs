@@ -68,18 +68,18 @@ public sealed class EtabsModelPathWiringTests
     ];
 
     /// <summary>
-    /// Types still calling the folder-returning API: each a known defect owned by another
-    /// branch, not an accepted use.
+    /// Types permitted to call the folder-returning API. CLI #19 repaired
+    /// <c>OpenModelService</c>, so this list has reached its intended terminal state:
+    /// empty.
     ///
-    /// <para>This list is meant to reach zero. <c>OpenModelService</c> is repaired on
-    /// <c>codex/alpha-19-snapshot-export</c>, and when that composes in
-    /// <see cref="ThePendingFolderApiRepairListHasNoStaleEntries"/> fails with the name to
-    /// delete. One line, then the ban covers the whole assembly unconditionally.</para>
+    /// <para>Empty is the strong state, not a disabled one —
+    /// <see cref="NothingOutsideThePendingRepairsCallsTheFolderReturningApi"/> subtracts
+    /// this list from a whole-assembly scan, so with nothing to subtract it now bans the
+    /// call everywhere. Do not add an entry without a tracked defect and a reason;
+    /// <see cref="ThePendingFolderApiRepairListHasNoStaleEntries"/> forces any entry back
+    /// out once its type is repaired.</para>
     /// </summary>
-    private static readonly string[] PendingFolderApiRepairs =
-    [
-        "EtabExtension.CLI.Features.OpenModel.OpenModelService"
-    ];
+    private static readonly string[] PendingFolderApiRepairs = [];
 
     /// <summary>
     /// The whole-assembly rule. A fifth command that reads the current model itself,

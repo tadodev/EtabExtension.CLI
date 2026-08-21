@@ -26,20 +26,18 @@ public sealed partial class ModelOpenCsiChoiceTests
     private static partial Regex FolderApiCall();
 
     /// <summary>
-    /// The files still permitted to call the folder-returning API, each a known defect
-    /// tracked by CLI #21 and being repaired on <c>codex/alpha-21-getstatus-path</c>.
+    /// Files permitted to call the folder-returning API. CLI #21 repaired the three
+    /// that were listed here, so the list has reached its intended terminal state:
+    /// empty.
     ///
-    /// <para>This list is meant to reach zero. When #21 lands, each repaired file makes
-    /// <see cref="TheFolderApiAllowListHasNoStaleEntries"/> fail with the path to
-    /// delete — one line each, then the array is empty and the guard covers the whole
-    /// tree unconditionally.</para>
+    /// <para>Empty is the strong state, not a disabled one —
+    /// <see cref="NoSourceOutsideTheKnownExceptionsCallsTheFolderReturningApi"/>
+    /// subtracts this list from a whole-tree scan, so with nothing to subtract it now
+    /// covers every production file unconditionally. Do not add an entry without a
+    /// tracked defect and a reason; <see cref="TheFolderApiAllowListHasNoStaleEntries"/>
+    /// forces any entry back out once its file is repaired.</para>
     /// </summary>
-    private static readonly string[] AllowedFolderApiCallers =
-    [
-        Path.Combine("src", "EtabExtension.CLI", "Features", "GetStatus", "GetStatusService.cs"),
-        Path.Combine("src", "EtabExtension.CLI", "Features", "UnlockModel", "UnlockModelService.cs"),
-        Path.Combine("src", "EtabExtension.CLI", "Features", "CloseModel", "CloseModelService.cs")
-    ];
+    private static readonly string[] AllowedFolderApiCallers = [];
 
     /// <summary>
     /// Scans the whole source tree rather than a fixed file list: a hardcoded list rots
