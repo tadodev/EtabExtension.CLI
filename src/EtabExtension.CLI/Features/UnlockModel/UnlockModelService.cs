@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.UnlockModel.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabSharp.Core;
 
 namespace EtabExtension.CLI.Features.UnlockModel;
@@ -40,14 +41,11 @@ public class UnlockModelService : IUnlockModelService
 
     private static Result<UnlockModelData> UnlockOnApp(ETABSApplication app, string filePath)
     {
-            var currentPath = app.Model.ModelInfo.GetModelFilepath();
-
             // Guard: file must already be open
-            if (!PathsAreEqual(currentPath, filePath))
+            var notOpen = ValidateRequestedFileIsOpen(EtabsCurrentModelPath.Read(app), filePath);
+            if (notOpen is not null)
             {
-                return Result.Fail<UnlockModelData>(
-                    $"File not open in ETABS. Currently open: '{currentPath ?? "(none)"}'. " +
-                    $"Open the file first with: etab-cli open-model --file \"{filePath}\"");
+                return Result.Fail<UnlockModelData>(notOpen);
             }
 
             bool wasLocked = app.Model.ModelInfo.IsLocked();
@@ -71,6 +69,39 @@ public class UnlockModelService : IUnlockModelService
             });
         }
 
+    /// <summary>
+    /// Returns null when the requested file is the model ETABS currently has open,
+    /// otherwise the operator-facing refusal.
+    ///
+    /// <para>The comparison is against a value that names a FILE. A reported folder can
+    /// never equal the requested <c>.edb</c>, so before this was fixed the guard refused
+    /// every call and <c>unlock-model</c> was dead in serve mode.</para>
+    /// </summary>
+    internal static string? ValidateRequestedFileIsOpen(string? reportedPath, string filePath)
+    {
+        var currentFile = EtabsCurrentModelPath.ResolveOpenFile(reportedPath);
+        if (PathsAreEqual(currentFile, filePath))
+        {
+            return null;
+        }
+
+        return $"File not open in ETABS. Currently open: '{EtabsCurrentModelPath.Describe(reportedPath)}'. " +
+            $"Open the file first with: etab-cli open-model --file \"{filePath}\"";
+    }
+
+    /// <summary>
+    /// Deliberately the more lenient side of the equality Rust also performs.
+    ///
+    /// <para>Rust's <c>paths_match</c> normalizes only the <c>\\?\</c> prefix and compares
+    /// ASCII-case-insensitively; this resolves through <c>Path.GetFullPath</c> and
+    /// compares <c>OrdinalIgnoreCase</c>, so the two disagree at the edges in both
+    /// directions — this accepts <c>D:/…/SAMPLE_V2.edb</c> against
+    /// <c>D:\…\sample_v2.EDB</c> where Rust would not, and <c>GetFullPath</c> keeps a
+    /// <c>\\?\</c> prefix that Rust strips. Unreachable while ETABS answers with plain
+    /// drive-rooted paths, and leniency is the safe direction here: this guard only
+    /// decides whether to REFUSE an unlock the caller asked for. Rust remains the
+    /// authority on whether the open model is the one it wants.</para>
+    /// </summary>
     private static bool PathsAreEqual(string? a, string? b)
     {
         if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;

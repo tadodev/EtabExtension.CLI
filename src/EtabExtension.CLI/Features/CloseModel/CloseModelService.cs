@@ -3,6 +3,7 @@
 
 using EtabExtension.CLI.Features.CloseModel.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs;
 using EtabSharp.Core;
 using ETABSv1;
 
@@ -41,13 +42,14 @@ public class CloseModelService : ICloseModelService
 
     private static Result<CloseModelData> CloseOnApp(ETABSApplication app, bool save)
     {
-        var currentPath = app.Model.ModelInfo.GetModelFilepath();
-        var hasFile = !string.IsNullOrWhiteSpace(currentPath);
+        var reportedPath = EtabsCurrentModelPath.Read(app);
+        var currentFile = EtabsCurrentModelPath.ResolveOpenFile(reportedPath);
 
-        Console.Error.WriteLine($"ℹ Currently open: {(hasFile ? Path.GetFileName(currentPath) : "(none)")}");
+        Console.Error.WriteLine(
+            $"ℹ Currently open: {(currentFile is null ? "(none)" : Path.GetFileName(currentFile))}");
 
         return CompleteClose(
-            currentPath,
+            reportedPath,
             save,
             path =>
             {
@@ -72,16 +74,45 @@ public class CloseModelService : ICloseModelService
             });
     }
 
+    /// <summary>
+    /// The close sequence over injectable CSI calls.
+    ///
+    /// <para><paramref name="reportedPath"/> is what ETABS answered for "which model is
+    /// current", and only a value that names a FILE may reach <c>cFile.Save</c>. Saving
+    /// to a folder is not a harmless no-op: at best the call fails, at worst ETABS writes
+    /// an extensionless file named after the folder.</para>
+    ///
+    /// <para>A non-blank answer that names no file therefore fails a requested save
+    /// outright rather than silently skipping it, while an unsaved close still clears the
+    /// workspace, because that is the recovery path and it does not depend on the path. A
+    /// BLANK answer is the separate, long-standing case and keeps its behavior: nothing is
+    /// loaded, so a requested save has nothing to write and the close succeeds with
+    /// <c>wasSaved: false</c>.</para>
+    /// </summary>
     internal static Result<CloseModelData> CompleteClose(
-        string? currentPath,
+        string? reportedPath,
         bool save,
         Func<string, int> saveFile,
         Func<eUnits, int> initializeNewModel)
     {
-        var hasFile = !string.IsNullOrWhiteSpace(currentPath);
+        var currentFile = EtabsCurrentModelPath.ResolveOpenFile(reportedPath);
+        if (EtabsCurrentModelPath.ReportedWithoutFileName(reportedPath))
+        {
+            var reported = EtabsCurrentModelPath.Describe(reportedPath);
+            if (save)
+            {
+                return Result.Fail<CloseModelData>(EtabsApiDiagnosticFormatter.Bounded(
+                    $"Save requested but ETABS names no current model file (reported '{reported}'); " +
+                    "model remains open"));
+            }
+
+            Console.Error.WriteLine($"⚠ ETABS names no current model file (reported '{reported}')");
+        }
+
+        var hasFile = currentFile is not null;
         if (save && hasFile)
         {
-            var saveRet = saveFile(currentPath!);
+            var saveRet = saveFile(currentFile!);
             if (saveRet != 0)
             {
                 return Result.Fail<CloseModelData>(
@@ -97,7 +128,7 @@ public class CloseModelService : ICloseModelService
 
         return Result.Ok(new CloseModelData
         {
-            ClosedFilePath = hasFile ? currentPath : null,
+            ClosedFilePath = currentFile,
             WasSaved = save && hasFile
         });
     }
