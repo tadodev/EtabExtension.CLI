@@ -806,7 +806,396 @@ public sealed class ManagedEtabsWindowGuardTests
             monitor));
     }
 
+    // ── Teardown against an install that has not returned ────────────────────
+
+    /// <summary>
+    /// An install still running at the acknowledgement deadline fails activation, and the
+    /// hook it eventually obtains is removed by the thread that installed it.
+    ///
+    /// <para>The install here returns only once retirement has been latched, so it
+    /// provably outlives the deadline rather than being raced against a sleep. Teardown
+    /// still joins it, so this is the resolved half of the pair: the failure is reported
+    /// without an unresolved-cleanup claim, nothing stays subscribed, and — the part that
+    /// matters — the backstop never ran on its own.</para>
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void AnInstallStillRunningAtTheAcknowledgementDeadlineFailsAndLeavesNothingArmed()
+    {
+        var ticks = 0;
+        var installer = new LateHookInstaller();
+        installer.Release.Set();
+        var monitor = new Win32OwnedWindowSurfaceMonitor(
+            TimeSpan.FromMilliseconds(5),
+            installer.Install,
+            installer.Remove,
+            TimeSpan.FromMilliseconds(250),
+            Generous);
+        installer.HoldUntil = () => monitor.IsRetired;
+
+        var error = Assert.Throws<InvalidOperationException>(
+            () => monitor.Start(Owned.Pid, () => { }, () => Interlocked.Increment(ref ticks)));
+
+        Assert.True(
+            installer.Entered.IsSet,
+            "the pump never reached SetWinEventHook, so this proves nothing about a late install.");
+        Assert.Contains("did not report installation", error.Message, StringComparison.Ordinal);
+        Assert.Equal(OwnedWindowMonitorTeardown.Resolved, monitor.Teardown);
+        Assert.DoesNotContain("UNRESOLVED", error.Message, StringComparison.Ordinal);
+
+        Assert.False(monitor.Subscribed);
+        Assert.False(monitor.PumpAlive);
+        Assert.Equal([installer.Result], installer.Snapshot());
+        Assert.Null(monitor.TeardownError);
+        Assert.Equal(0, Volatile.Read(ref ticks));
+    }
+
+    /// <summary>
+    /// And the half the exact-head review found missing: an install that has not returned
+    /// when the TEARDOWN JOIN expires either.
+    ///
+    /// <para>The old shape discarded that join's result, so this state was reported as a
+    /// clean failed teardown while a thread of ours was still inside <c>SetWinEventHook</c>.
+    /// It must not be. Retirement has taken effect — nothing can be claimed, pumped or
+    /// delivered — but "disarmed" and "gone" are different facts, and the release gate is
+    /// entitled to the true one. A teardown path that reports success here fails this
+    /// test.</para>
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void AnInstallThatOutlivesTheTeardownJoinIsReportedRatherThanClaimedClean()
+    {
+        var run = StartOverAnInstallThatOutlivesBothDeadlines();
+        try
+        {
+            Assert.True(run.Monitor.PumpAlive, "the pump exited, so nothing outlived the join.");
+            Assert.Equal(OwnedWindowMonitorTeardown.PumpStillAlive, run.Monitor.Teardown);
+            Assert.Contains("UNRESOLVED", run.Failure.Message, StringComparison.Ordinal);
+
+            // Unresolved is not the same as degraded: nothing is subscribed and the backstop
+            // is not running on its own behind the failure.
+            Assert.False(run.Monitor.Subscribed);
+            Assert.Equal(0, run.Ticks);
+        }
+        finally
+        {
+            run.Finish();
+        }
+    }
+
+    /// <summary>
+    /// The blocker, stated as a resource rule: a teardown that could not join its pump must
+    /// not close the handle that pump can still reach.
+    ///
+    /// <para>Disposing it there is not a leak-shaped defect, it is a correctness one — the
+    /// late pump would go on to wait on a closed, and eventually recycled, kernel handle.
+    /// Signalling and disposal are therefore separate: teardown signals, and the handle is
+    /// released by whichever of the two leaves last.</para>
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void AFailedActivationDoesNotCloseTheStopHandleUnderALivePump()
+    {
+        var run = StartOverAnInstallThatOutlivesBothDeadlines();
+        try
+        {
+            Assert.True(run.Monitor.PumpAlive, "the pump exited, so there is nothing to protect.");
+            Assert.False(
+                run.Monitor.StopSignalClosed,
+                "teardown closed the stop handle while its own pump was still running.");
+        }
+        finally
+        {
+            run.Finish();
+        }
+
+        // Held only as long as it is reachable, then released — not leaked either.
+        Assert.False(run.Monitor.PumpAlive);
+        Assert.True(run.Monitor.StopSignalClosed, "the stop handle was never released.");
+    }
+
+    /// <summary>
+    /// And when the delayed install finally returns, the pump that issued it takes its own
+    /// hook back off and arms nothing on its way out.
+    ///
+    /// <para>Every survivor the exact-head review named is checked here: the hook is
+    /// removed exactly once, no subscription is published, the backstop never pumps on its
+    /// own, and the callback the operating system holds a pointer to refuses even when
+    /// invoked directly with an event it would otherwise act on. That last one is what
+    /// stops a late delivery reaching a pid whose ownership has already ended.</para>
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ALateInstallIsRemovedByItsOwnPumpAndArmsNothing()
+    {
+        var run = StartOverAnInstallThatOutlivesBothDeadlines();
+        run.Finish();
+
+        Assert.Equal([run.Installer.Result], run.Installer.Snapshot());
+        Assert.Null(run.Monitor.TeardownError);
+        Assert.False(run.Monitor.Subscribed);
+        Assert.Equal(0, run.Ticks);
+
+        run.Installer.Callback!.Invoke(
+            hWinEventHook: run.Installer.Result,
+            eventType: EventObjectShow,
+            hwnd: 0x99,
+            idObject: 0,
+            idChild: 0,
+            idEventThread: 0,
+            dwmsEventTime: 0);
+
+        Assert.Equal(0, run.Surfaced);
+    }
+
+    /// <summary>
+    /// An unresolved teardown is still terminal. It is not a retryable state, and a later
+    /// disposal must not start a second teardown over the pump that is still finishing.
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void AMonitorStaysTerminalAfterAnUnresolvedTeardown()
+    {
+        var run = StartOverAnInstallThatOutlivesBothDeadlines();
+        try
+        {
+            Assert.True(run.Monitor.IsRetired);
+
+            run.Monitor.Dispose();
+            Assert.Equal(OwnedWindowMonitorTeardown.PumpStillAlive, run.Monitor.Teardown);
+            Assert.False(run.Monitor.StopSignalClosed, "a second teardown released the handle again.");
+
+            _ = Assert.Throws<ObjectDisposedException>(
+                () => run.Monitor.Start(Owned.Pid, () => { }, () => { }));
+        }
+        finally
+        {
+            run.Finish();
+        }
+
+        Assert.Equal(1, run.Installer.Installs);
+        Assert.Equal([run.Installer.Result], run.Installer.Snapshot());
+    }
+
+    /// <summary>
+    /// The other direction, so the unresolved report cannot be a constant: a failure with
+    /// nothing installed has nothing to outlive anything, and is reported as the joined,
+    /// fully released teardown it is.
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void AZeroHookFailureStillTearsDownAndReportsItResolved()
+    {
+        var installer = new LateHookInstaller { Result = nint.Zero };
+        installer.Release.Set();
+        var monitor = new Win32OwnedWindowSurfaceMonitor(
+            TimeSpan.FromMilliseconds(5),
+            installer.Install,
+            installer.Remove,
+            Generous,
+            Generous);
+
+        var error = Assert.Throws<InvalidOperationException>(
+            () => monitor.Start(Owned.Pid, () => { }, () => { }));
+
+        Assert.Contains("SetWinEventHook", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("UNRESOLVED", error.Message, StringComparison.Ordinal);
+        Assert.Equal(OwnedWindowMonitorTeardown.Resolved, monitor.Teardown);
+        Assert.False(monitor.PumpAlive);
+        Assert.True(monitor.StopSignalClosed);
+        Assert.Empty(installer.Snapshot());
+    }
+
+    /// <summary>
+    /// And a successful activation is unchanged by all of it: the subscription is published
+    /// before <c>Start</c> returns, the real message-pumping loop runs the backstop, the
+    /// callback delivers while the monitor is live, and disposal joins the pump, removes
+    /// the hook once, releases the handle and disarms the callback.
+    /// </summary>
+    [Fact]
+    [SupportedOSPlatform("windows")]
+    public void ASuccessfulActivationSubscribesPumpsAndTearsDownResolved()
+    {
+        var surfaced = 0;
+        var ticks = 0;
+        var installer = new LateHookInstaller();
+        installer.Release.Set();
+        var monitor = new Win32OwnedWindowSurfaceMonitor(
+            TimeSpan.FromMilliseconds(5),
+            installer.Install,
+            installer.Remove,
+            Generous,
+            Generous);
+
+        monitor.Start(
+            Owned.Pid,
+            () => Interlocked.Increment(ref surfaced),
+            () => Interlocked.Increment(ref ticks));
+
+        Assert.True(monitor.Subscribed);
+        Assert.Equal(Owned.Pid, installer.ProcessId);
+        Assert.Equal(OwnedWindowMonitorTeardown.NotTornDown, monitor.Teardown);
+        Assert.False(monitor.StopSignalClosed);
+        Assert.True(
+            SpinUntil(() => Volatile.Read(ref ticks) >= 2, Generous),
+            "the real message loop never reached the backstop.");
+
+        // Live, the callback does the thing it exists for.
+        installer.Callback!.Invoke(0, EventObjectShow, 0x99, 0, 0, 0, 0);
+        Assert.Equal(1, Volatile.Read(ref surfaced));
+
+        monitor.Dispose();
+
+        Assert.Equal(OwnedWindowMonitorTeardown.Resolved, monitor.Teardown);
+        Assert.False(monitor.Subscribed);
+        Assert.False(monitor.PumpAlive);
+        Assert.True(monitor.StopSignalClosed);
+        Assert.Equal([installer.Result], installer.Snapshot());
+
+        // Retired, the same callback refuses.
+        installer.Callback!.Invoke(0, EventObjectShow, 0x99, 0, 0, 0, 0);
+        Assert.Equal(1, Volatile.Read(ref surfaced));
+    }
+
     // ── Fixtures ─────────────────────────────────────────────────────────────
+
+    /// <summary>How long a bounded wait may take before the test itself is the failure.</summary>
+    private static readonly TimeSpan Generous = TimeSpan.FromSeconds(30);
+
+    /// <summary>The <c>EVENT_OBJECT_SHOW</c> the guard's callback is meant to act on.</summary>
+    private const uint EventObjectShow = 0x8002;
+
+    /// <summary>
+    /// Drives an activation whose <c>SetWinEventHook</c> call is STILL RUNNING when both
+    /// deadlines expire, and hands the pieces back.
+    ///
+    /// <para>Nothing here is timed against a sleep. The install blocks on a gate this
+    /// method holds, so "the install outlives the teardown join" is arranged by
+    /// construction; the two deadlines are short because they are the thing being exceeded,
+    /// and the run asserts that the pump really did reach the install rather than passing
+    /// on a pump that never started.</para>
+    /// </summary>
+    private static LateInstallRun StartOverAnInstallThatOutlivesBothDeadlines()
+    {
+        var run = new LateInstallRun();
+        run.Monitor = new Win32OwnedWindowSurfaceMonitor(
+            TimeSpan.FromMilliseconds(5),
+            run.Installer.Install,
+            run.Installer.Remove,
+            TimeSpan.FromMilliseconds(250),
+            TimeSpan.FromMilliseconds(50));
+
+        run.Failure = Assert.Throws<InvalidOperationException>(
+            () => run.Monitor.Start(Owned.Pid, run.CountSurfaced, run.CountTick));
+
+        Assert.True(
+            run.Installer.Entered.IsSet,
+            "the pump never reached SetWinEventHook, so this run proves nothing about a " +
+            "late install.");
+        return run;
+    }
+
+    /// <summary>One failed activation over an install the test still holds open.</summary>
+    private sealed class LateInstallRun
+    {
+        private int _surfaced;
+        private int _ticks;
+
+        public LateHookInstaller Installer { get; } = new();
+
+        public Win32OwnedWindowSurfaceMonitor Monitor { get; set; } = null!;
+
+        public InvalidOperationException Failure { get; set; } = null!;
+
+        public int Surfaced => Volatile.Read(ref _surfaced);
+
+        public int Ticks => Volatile.Read(ref _ticks);
+
+        public void CountSurfaced() => Interlocked.Increment(ref _surfaced);
+
+        public void CountTick() => Interlocked.Increment(ref _ticks);
+
+        /// <summary>Lets the held install return, and waits for that pump to finish.</summary>
+        public void Finish()
+        {
+            Installer.Release.Set();
+            Assert.True(Installer.Removed.Wait(Generous), "the late hook was never removed.");
+            Assert.True(SpinUntil(() => !Monitor.PumpAlive, Generous), "the pump never exited.");
+        }
+    }
+
+    /// <summary>
+    /// The two user32 hook calls with the RETURN of the install under test control — the one
+    /// thing teardown cannot cancel, and therefore the seam the late-install contract has to
+    /// be proven over.
+    ///
+    /// <para><see cref="Entered"/> reports that the pump is inside <c>SetWinEventHook</c>.
+    /// The call then returns only once <see cref="HoldUntil"/> comes true and
+    /// <see cref="Release"/> is set, so a test states when the install returns instead of
+    /// hoping a sleep lands on the right side of a deadline.</para>
+    /// </summary>
+    private sealed class LateHookInstaller
+    {
+        private int _installs;
+
+        public ManualResetEventSlim Entered { get; } = new(false);
+
+        public ManualResetEventSlim Release { get; } = new(false);
+
+        public ManualResetEventSlim Removed { get; } = new(false);
+
+        public nint Result { get; init; } = 0x5150;
+
+        /// <summary>An extra condition the install waits for before it returns.</summary>
+        public Func<bool>? HoldUntil { get; set; }
+
+        public int Installs => Volatile.Read(ref _installs);
+
+        public int? ProcessId { get; private set; }
+
+        public Win32OwnedWindowSurfaceMonitor.WinEventProc? Callback { get; private set; }
+
+        private List<nint> RemovedHooks { get; } = [];
+
+        public nint Install(int processId, Win32OwnedWindowSurfaceMonitor.WinEventProc proc)
+        {
+            _ = Interlocked.Increment(ref _installs);
+            ProcessId = processId;
+            Callback = proc;
+            Entered.Set();
+
+            if (HoldUntil is not null)
+            {
+                var spin = new SpinWait();
+                var watch = Stopwatch.StartNew();
+                while (!HoldUntil() && watch.Elapsed < Generous)
+                {
+                    spin.SpinOnce();
+                }
+            }
+
+            _ = Release.Wait(Generous);
+            return Result;
+        }
+
+        public void Remove(nint hook)
+        {
+            lock (RemovedHooks)
+            {
+                RemovedHooks.Add(hook);
+            }
+
+            Removed.Set();
+        }
+
+        public nint[] Snapshot()
+        {
+            lock (RemovedHooks)
+            {
+                return [.. RemovedHooks];
+            }
+        }
+    }
 
     private static ManagedEtabsWindowPolicy Policy(VirtualClock clock) => new(
         TimeSpan.FromSeconds(5),

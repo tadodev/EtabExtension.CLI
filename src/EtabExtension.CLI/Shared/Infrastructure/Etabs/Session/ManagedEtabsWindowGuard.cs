@@ -635,6 +635,27 @@ internal sealed class Win32TopLevelWindows : ITopLevelWindows
 }
 
 /// <summary>
+/// How a monitor teardown ended. Teardown asks the pump thread to stop and gives it a
+/// bounded wait; the two answers are materially different and are never conflated.
+/// </summary>
+internal enum OwnedWindowMonitorTeardown
+{
+    /// <summary>Teardown has not been attempted.</summary>
+    NotTornDown,
+
+    /// <summary>The pump exited within the bound, or there was never a pump to wait for.</summary>
+    Resolved,
+
+    /// <summary>
+    /// The pump had NOT exited when the bound expired — almost always because the
+    /// <c>SetWinEventHook</c> call it is inside has not returned yet. Retirement has taken
+    /// effect regardless, so that thread can no longer pump, observe, or hand a hook to the
+    /// monitor; it is reported rather than presented as a clean teardown.
+    /// </summary>
+    PumpStillAlive
+}
+
+/// <summary>
 /// A process-scoped <c>SetWinEventHook</c> subscription plus a backstop tick, on one
 /// dedicated message-pumping thread.
 ///
@@ -655,6 +676,29 @@ internal sealed class Win32TopLevelWindows : ITopLevelWindows
 /// fallback: sampling alone is what #20 measured the ~234 ms and ~462 ms flickers through,
 /// so a session that cannot subscribe must fail loudly rather than quietly degrade to the
 /// mechanism that was already rejected.</para>
+///
+/// <para><b>Teardown is a custody transfer, not a deadline.</b> The one thing teardown
+/// cannot do is cancel a <c>SetWinEventHook</c> call that is already in flight, so a pump
+/// can outlive any join bound it is given. Three rules make that survivable, and none of
+/// them depends on the pump being quick:</para>
+///
+/// <list type="number">
+/// <item><description><b>Retirement is a latch, taken before the wait.</b> Once it is set
+/// the monitor will not accept a hook, the callback refuses to run, and the message loop is
+/// never entered. A pump that wakes up afterwards is already disarmed.</description></item>
+/// <item><description><b>The installing thread is the only remover.</b> Whatever
+/// <c>SetWinEventHook</c> returns, and however late, that same thread unhooks it before it
+/// exits. Teardown never removes a hook itself — which is also what user32 asks for, since
+/// <c>UnhookWinEvent</c> belongs on the thread that hooked.</description></item>
+/// <item><description><b>The stop handle is reference counted.</b> Signalling and disposal
+/// are separate concerns: teardown signals, and whichever of {teardown, pump} leaves last
+/// disposes. Nothing a live pump can still reach is closed underneath it.</description></item>
+/// </list>
+///
+/// <para>What teardown does NOT do is claim a success it cannot see. A pump still alive at
+/// the bound is reported as <see cref="OwnedWindowMonitorTeardown.PumpStillAlive"/> and
+/// named in the activation failure, because "that thread is disarmed" and "that thread is
+/// gone" are different facts and the release gate is entitled to both.</para>
 /// </summary>
 [SupportedOSPlatform("windows")]
 internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonitor
@@ -675,21 +719,39 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
     /// </summary>
     public static readonly TimeSpan DefaultInstallTimeout = TimeSpan.FromSeconds(5);
 
-    private static readonly TimeSpan JoinTimeout = TimeSpan.FromSeconds(2);
+    /// <summary>
+    /// How long teardown waits for the pump to exit before reporting it as still alive.
+    /// This is a REPORTING bound, not a safety bound: correctness does not improve by
+    /// lengthening it, because retirement has already disarmed that thread and it removes
+    /// its own hook whenever its install returns. The bound only decides whether teardown
+    /// gets to say "gone" or has to say "disarmed, still running".
+    /// </summary>
+    public static readonly TimeSpan DefaultJoinTimeout = TimeSpan.FromSeconds(2);
 
     private readonly TimeSpan _backstopInterval;
     private readonly TimeSpan _installTimeout;
+    private readonly TimeSpan _joinTimeout;
     private readonly Func<int, WinEventProc, nint> _installHook;
     private readonly Action<nint> _removeHook;
     private readonly ManualResetEvent _stop = new(false);
     private readonly object _gate = new();
 
+    /// <summary>
+    /// Live references on <see cref="_stop"/>: one held by the monitor, and one more by a
+    /// pump from before it can run until after its last use of the handle. It is disposed
+    /// by whichever releases last, which is the whole reason a pump that outlives teardown
+    /// cannot come back to a closed — or worse, recycled — kernel handle.
+    /// </summary>
+    private int _stopUsers = 1;
+
     // The delegate must outlive the hook: the OS holds a raw function pointer to it.
     private WinEventProc? _proc;
     private Thread? _thread;
     private nint _hook;
+    private int _retired;
+    private OwnedWindowMonitorTeardown _teardown = OwnedWindowMonitorTeardown.NotTornDown;
     private Exception? _installError;
-    private bool _disposed;
+    private Exception? _teardownError;
 
     public Win32OwnedWindowSurfaceMonitor(TimeSpan backstopInterval)
         : this(backstopInterval, InstallHook, RemoveHook, DefaultInstallTimeout)
@@ -707,20 +769,65 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
         Func<int, WinEventProc, nint> installHook,
         Action<nint> removeHook,
         TimeSpan installTimeout)
+        : this(backstopInterval, installHook, removeHook, installTimeout, DefaultJoinTimeout)
+    {
+    }
+
+    /// <summary>
+    /// And with the teardown join bound behind a parameter too, so the state a pump enters
+    /// when it outlives that bound is reachable in a test without anyone sleeping for
+    /// seconds to get there. Production always takes <see cref="DefaultJoinTimeout"/>.
+    /// </summary>
+    internal Win32OwnedWindowSurfaceMonitor(
+        TimeSpan backstopInterval,
+        Func<int, WinEventProc, nint> installHook,
+        Action<nint> removeHook,
+        TimeSpan installTimeout,
+        TimeSpan joinTimeout)
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(backstopInterval, TimeSpan.Zero);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(installTimeout, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(joinTimeout, TimeSpan.Zero);
         ArgumentNullException.ThrowIfNull(installHook);
         ArgumentNullException.ThrowIfNull(removeHook);
 
         _backstopInterval = backstopInterval;
         _installTimeout = installTimeout;
+        _joinTimeout = joinTimeout;
         _installHook = installHook;
         _removeHook = removeHook;
     }
 
     /// <inheritdoc />
     public bool Subscribed => Volatile.Read(ref _hook) != nint.Zero;
+
+    /// <summary>
+    /// Whether this monitor has been retired. Never false again once true, and the single
+    /// fact every disarming rule below reads.
+    /// </summary>
+    internal bool IsRetired => Volatile.Read(ref _retired) != 0;
+
+    /// <summary>How the teardown ended — for the failure text, and for teardown assertions.</summary>
+    internal OwnedWindowMonitorTeardown Teardown
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _teardown;
+            }
+        }
+    }
+
+    /// <summary>A failure while removing a hook, if any. Recorded, never thrown.</summary>
+    internal Exception? TeardownError => _teardownError;
+
+    /// <summary>
+    /// Whether the stop handle has been closed. This is the one resource a still-live pump
+    /// can reach, so it is observable rather than assumed: a teardown that closed it while
+    /// its pump was still running is exactly the defect this monitor was repaired for.
+    /// </summary>
+    internal bool StopSignalClosed => _stop.SafeWaitHandle.IsClosed;
 
     /// <summary>Whether the pump thread is still alive, for teardown assertions.</summary>
     internal bool PumpAlive
@@ -740,10 +847,14 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
         ArgumentNullException.ThrowIfNull(onSurfaced);
         ArgumentNullException.ThrowIfNull(onBackstopTick);
 
+        // Deliberately never disposed. The pump sets it on its way past the install call,
+        // which may be long after this method has given up waiting — disposing it here
+        // would be the same defect as closing the stop handle underneath a live pump, and
+        // the runtime reclaims its handle either way.
         var installed = new ManualResetEventSlim(false);
         lock (_gate)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(_retired != 0, this);
             if (_thread is not null)
             {
                 throw new InvalidOperationException(
@@ -756,7 +867,20 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
                 Name = "etabs-window-guard"
             };
             _thread = pump;
-            pump.Start();
+
+            // The pump's reference is taken BEFORE it can run, so there is no instant in
+            // which a pump exists uncounted and teardown could close the handle under it.
+            _ = Interlocked.Increment(ref _stopUsers);
+            try
+            {
+                pump.Start();
+            }
+            catch
+            {
+                _ = Interlocked.Decrement(ref _stopUsers);
+                _thread = null;
+                throw;
+            }
         }
 
         // Deliberately OUTSIDE the gate. The pump publishes its result and signals; waiting
@@ -772,67 +896,114 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
         FailActivation(acknowledged);
     }
 
-    public void Dispose()
-    {
-        Thread? thread;
-        lock (_gate)
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _disposed = true;
-            thread = _thread;
-        }
-
-        _stop.Set();
-        _ = thread?.Join(JoinTimeout);
-        _stop.Dispose();
-    }
+    public void Dispose() => _ = Retire();
 
     /// <summary>
-    /// Activation could not be proven, so the monitor is torn down and the caller is told.
-    /// Nothing is left running: the pump is stopped and joined, and any hook it managed to
-    /// install after the deadline is removed rather than orphaned.
+    /// Activation could not be proven, so the monitor is retired and the caller is told —
+    /// including, when it is true, that the pump had not exited yet. That last part is the
+    /// point: an activation that throws while a thread of ours is still running is a
+    /// different fact from one that throws over a fully joined teardown, and this text is
+    /// what the caller carries into the launch cleanup envelope.
     /// </summary>
     private void FailActivation(bool acknowledged)
     {
-        Thread? thread;
-        lock (_gate)
-        {
-            _disposed = true;
-            thread = _thread;
-        }
-
-        _stop.Set();
-        _ = thread?.Join(JoinTimeout);
-
-        // Exactly one of this and the pump's exit path wins the exchange, so a hook is never
-        // removed twice and never left behind.
-        var late = Interlocked.Exchange(ref _hook, nint.Zero);
-        if (late != nint.Zero)
-        {
-            try
-            {
-                _removeHook(late);
-            }
-            catch (Exception removal)
-            {
-                // The activation failure is the story; a failed cleanup must not replace it.
-                _installError ??= removal;
-            }
-        }
-
-        _stop.Dispose();
+        var teardown = Retire();
 
         var reason = acknowledged
             ? "SetWinEventHook returned no hook for the owned ETABS process, so window " +
                 "events cannot be observed. Background UI suppression would degrade to " +
                 "sampling, which is not sufficient."
-            : $"The owned-window subscription did not report installation within " +
+            : "The owned-window subscription did not report installation within " +
                 $"{_installTimeout.TotalSeconds:0.###}s.";
+
+        if (teardown == OwnedWindowMonitorTeardown.PumpStillAlive)
+        {
+            reason +=
+                " Teardown is UNRESOLVED: the subscription thread had still not exited " +
+                $"{_joinTimeout.TotalSeconds:0.###}s after being told to stop, so this " +
+                "activation is reported as failed WITHOUT a completed cleanup. That thread " +
+                "is already retired — it cannot pump, cannot deliver a callback, and it " +
+                "removes whatever hook its install returns before it exits.";
+        }
+
         throw new InvalidOperationException(reason, _installError);
+    }
+
+    /// <summary>
+    /// The single teardown path, shared by disposal and by failed activation, and idempotent
+    /// because reveal-then-shutdown reaches it twice.
+    ///
+    /// <para>Retirement is latched first and under the gate, so it is in force BEFORE the
+    /// wait rather than after it. Everything that could still act — claiming a hook, running
+    /// the callback, entering the message loop — reads that latch, which is why the bounded
+    /// join below is only ever a question about reporting, never about safety.</para>
+    /// </summary>
+    private OwnedWindowMonitorTeardown Retire()
+    {
+        Thread? thread;
+        lock (_gate)
+        {
+            if (_retired != 0)
+            {
+                return _teardown;
+            }
+
+            Volatile.Write(ref _retired, 1);
+            thread = _thread;
+        }
+
+        // Signalling is not disposal. Set() only wakes a pump that is in the message loop;
+        // the handle stays open until this reference is released AND the pump has released
+        // its own, so a pump still inside its install call cannot return to a closed handle.
+        _stop.Set();
+
+        var resolved = thread is null || thread.Join(_joinTimeout);
+        var teardown = resolved
+            ? OwnedWindowMonitorTeardown.Resolved
+            : OwnedWindowMonitorTeardown.PumpStillAlive;
+        lock (_gate)
+        {
+            _teardown = teardown;
+        }
+
+        ReleaseStopHandle();
+        return teardown;
+    }
+
+    /// <summary>Drops one reference on the stop handle, disposing it on the last one.</summary>
+    private void ReleaseStopHandle()
+    {
+        if (Interlocked.Decrement(ref _stopUsers) == 0)
+        {
+            _stop.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Hands a freshly installed hook to the monitor, but only while the monitor is still
+    /// live. A refusal means this pump is late: the hook stays its own to remove, and it
+    /// must not arm anything with it.
+    /// </summary>
+    private bool TryClaimHook(nint hook)
+    {
+        lock (_gate)
+        {
+            if (_retired != 0)
+            {
+                return false;
+            }
+
+            Volatile.Write(ref _hook, hook);
+            return true;
+        }
+    }
+
+    private void ReleaseClaimedHook()
+    {
+        lock (_gate)
+        {
+            Volatile.Write(ref _hook, nint.Zero);
+        }
     }
 
     private void Pump(
@@ -841,9 +1012,83 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
         Action onBackstopTick,
         ManualResetEventSlim installed)
     {
-        // Held in a field for the hook's lifetime; a collected delegate is a hard crash.
-        _proc = (_, eventType, _, idObject, idChild, _, _) =>
+        var hook = nint.Zero;
+        try
         {
+            // Held in a field for the hook's lifetime; a collected delegate is a hard crash.
+            var proc = BuildCallback(onSurfaced);
+            _proc = proc;
+
+            // Retirement can beat this thread to its first instruction — the activation
+            // deadline is a wall clock and this thread is at the scheduler's mercy.
+            // Installing then would put a hook on the window station only to take it off
+            // again, against a pid that is already no longer provably ours.
+            if (!IsRetired)
+            {
+                try
+                {
+                    hook = _installHook(processId, proc);
+                }
+                catch (Exception exception)
+                {
+                    _installError = exception;
+                }
+            }
+
+            // Custody, decided exactly once and under the gate.
+            var claimed = hook != nint.Zero && TryClaimHook(hook);
+
+            // Acknowledged only once custody is settled, success or not: Start must never
+            // wait out its deadline for an answer that already exists, and must never see a
+            // Subscribed that is about to be true rather than true.
+            installed.Set();
+
+            if (!claimed)
+            {
+                // Either nothing installed, or this pump is late and owns its own hook.
+                // Both mean the same thing here: nothing is subscribed on the monitor's
+                // behalf, so there is nothing to pump — and the backstop must NOT run on
+                // its own. Sampling-only suppression is the mechanism #20 measured the
+                // flickers through, and a failed activation is about to be reported.
+                return;
+            }
+
+            RunMessageLoop(onBackstopTick);
+            ReleaseClaimedHook();
+        }
+        finally
+        {
+            // The installing thread is the only remover, on every path out of this method.
+            // user32 wants the unhook from the thread that hooked, and putting it here
+            // rather than on the caller's thread during teardown is also what makes a late
+            // install impossible to orphan: this runs whenever the install returns, however
+            // long after teardown gave up waiting for it.
+            if (hook != nint.Zero)
+            {
+                RemoveHookSafely(hook);
+            }
+
+            // Unrooted only after the hook is gone: the OS held a raw pointer to it.
+            _proc = null;
+            ReleaseStopHandle();
+        }
+    }
+
+    /// <summary>
+    /// The callback the operating system is given. It reads the retirement latch itself
+    /// rather than trusting the pump to be the only gate: out-of-context delivery can only
+    /// reach us from inside this thread's message retrieval, which retirement stops — but
+    /// the pid this hook was scoped to also stops being provably ours at that same instant,
+    /// so the callback refuses on its own account too.
+    /// </summary>
+    private WinEventProc BuildCallback(Action onSurfaced) =>
+        (_, eventType, _, idObject, idChild, _, _) =>
+        {
+            if (IsRetired)
+            {
+                return;
+            }
+
             if (idObject == ObjIdWindow
                 && idChild == ChildIdSelf
                 && (eventType == EventObjectCreate || eventType == EventObjectShow))
@@ -852,32 +1097,8 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
             }
         };
 
-        var hook = nint.Zero;
-        try
-        {
-            hook = _installHook(processId, _proc);
-            Volatile.Write(ref _hook, hook);
-        }
-        catch (Exception exception)
-        {
-            _installError = exception;
-        }
-        finally
-        {
-            // Always acknowledged, success or not: Start must never be left waiting out its
-            // deadline for an answer that already exists.
-            installed.Set();
-        }
-
-        if (hook == nint.Zero)
-        {
-            // Nothing is subscribed, so there is nothing to pump — and the backstop must NOT
-            // run on its own. Sampling-only suppression is the mechanism #20 measured
-            // flickers through, and Start is about to report this as an activation failure.
-            _proc = null;
-            return;
-        }
-
+    private void RunMessageLoop(Action onBackstopTick)
+    {
         var handles = new[] { _stop.SafeWaitHandle.DangerousGetHandle() };
         var backstopMs = (uint)Math.Max(1, (long)_backstopInterval.TotalMilliseconds);
         while (true)
@@ -885,7 +1106,7 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
             var wait = MsgWaitForMultipleObjects(1, handles, false, backstopMs, QsAllInput);
             if (wait == WaitObject0)
             {
-                break;
+                return;
             }
 
             // Draining the queue is what actually invokes the WinEvent callback above.
@@ -897,14 +1118,21 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
 
             onBackstopTick();
         }
+    }
 
-        var installedHook = Interlocked.Exchange(ref _hook, nint.Zero);
-        if (installedHook != nint.Zero)
+    private void RemoveHookSafely(nint hook)
+    {
+        try
         {
-            _removeHook(installedHook);
+            _removeHook(hook);
         }
-
-        _proc = null;
+        catch (Exception exception)
+        {
+            // Recorded rather than thrown. This runs on the pump thread while it is on its
+            // way out, where an escaping exception would take the whole daemon down and
+            // still would not have removed the hook.
+            _teardownError = exception;
+        }
     }
 
     private static nint InstallHook(int processId, WinEventProc proc) => SetWinEventHook(
