@@ -491,9 +491,45 @@ public sealed class ManagedEtabsApplication(
     public ManagedEtabsVisibilityOutcome EnsureHiddenForBackgroundWork() =>
         ManagedEtabsVisibility.EnsureHidden(rawApi, visibility);
 
-    /// <inheritdoc />
-    public ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction() =>
-        ManagedEtabsVisibility.EnsureVisible(rawApi, visibility);
+    /// <summary>
+    /// DIAGNOSTIC BUILD ONLY - branch diagnostic/alpha-22-csi-unhide-no-show.
+    /// NOT FOR RELEASE.
+    ///
+    /// <para>Raw <c>cOAPI.Unhide()</c>, exactly once, UNCONDITIONALLY. Deliberately NOT
+    /// <c>ManagedEtabsVisibility.EnsureVisible</c>: that reads <c>Visible()</c> first and
+    /// skips the call when it believes the application is already visible. On ETABS 23.3
+    /// that flag is stuck true, so the production policy issues no <c>Unhide</c> at all -
+    /// which would make this experiment measure nothing.</para>
+    ///
+    /// <para>The return code is recorded, never gated on. Cardex documents
+    /// <c>Unhide()</c> as returning an error when the application is already visible, so
+    /// a nonzero value is not a verdict here. The exact-owned Windows census in
+    /// <c>ConfirmRevealed()</c> is the verdict, unchanged and un-softened.</para>
+    /// </summary>
+    public ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction()
+    {
+        try
+        {
+            var returnCode = rawApi.Unhide();
+            return new ManagedEtabsVisibilityOutcome(
+                ManagedEtabsVisibilityIntent.Visible,
+                Confirmed: returnCode == 0,
+                Changed: returnCode == 0,
+                Diagnostic: $"DIAG raw cOAPI.Unhide() issued once, unconditionally; " +
+                    $"returnCode={returnCode} (not a verdict - the Windows census decides)",
+                Reads: 0);
+        }
+        catch (Exception exception)
+        {
+            return new ManagedEtabsVisibilityOutcome(
+                ManagedEtabsVisibilityIntent.Visible,
+                Confirmed: false,
+                Changed: false,
+                Diagnostic: "DIAG raw cOAPI.Unhide() threw: " +
+                    EtabsApiDiagnosticFormatter.Exception("cOAPI.Unhide[diagnostic]", exception),
+                Reads: 0);
+        }
+    }
 
     /// <inheritdoc />
     public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressed() =>

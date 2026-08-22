@@ -629,7 +629,25 @@ internal sealed class Win32TopLevelWindows : ITopLevelWindows
         _ = SwHide;
     }
 
-    public void Show(nint handle) => _ = ShowWindow(handle, SwShow);
+    public void Show(nint handle)
+    {
+        // DIAGNOSTIC BUILD ONLY - branch diagnostic/alpha-22-csi-unhide-no-show.
+        // NOT FOR RELEASE. With Hide() already passive on the base commit, this removes
+        // the LAST out-of-process window actuation: ShowWindow is now issued in NEITHER
+        // direction, from nowhere in the process.
+        //
+        // That is the whole experiment. The production reveal restores our own hidden
+        // HWNDs because #20 found cOAPI.Visible() stuck true, which makes the CSI policy
+        // read "already visible" and issue no Unhide at all - so that restore, not CSI,
+        // is what actually reaches the screen today. If raw cOAPI.Unhide() can put the
+        // window back on its own, this actuator is unnecessary and the Windows layer can
+        // become purely observational.
+        //
+        // SwShow is still referenced so the constant does not become unused and the
+        // Release analyzer pile stays at zero.
+        _ = handle;
+        _ = SwShow;
+    }
 
     // Classic DllImport rather than the source-generated LibraryImport, for the reason
     // already recorded on WindowsFileIdentity: LibraryImport requires AllowUnsafeBlocks
