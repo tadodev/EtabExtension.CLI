@@ -524,6 +524,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             // blocking startup work the #20 live run measured a visible window through.
             windowGuard = ActivateWindowGuard(ownedProcess);
 
+            ProbeCsiHideBeforeApplicationStart(rawApi);
             StartApplication(rawApi);
             AskCsiToHide(rawApi);
             RequireWindowsSuppressed(windowGuard, "after cOAPI.ApplicationStart");
@@ -637,6 +638,48 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             "ℹ ETABS window suppression armed for owned " +
             $"pid={ownedProcess.Identity.Pid} (released only by an explicit open-model).");
         return guard;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC BUILD ONLY - branch diagnostic/alpha-22-prestart-csi-hide.
+    /// NOT FOR RELEASE.
+    ///
+    /// <para>Falsifies one architectural assumption: that the first usable visibility
+    /// transition is only available AFTER <c>cOAPI.ApplicationStart</c>. The
+    /// <c>cOAPI</c> object already exists here - <c>cHelper.CreateObject</c> returned it
+    /// and started the program - so the call is at least issuable. Whether it is legal
+    /// and whether it has any effect is exactly what this build measures.</para>
+    ///
+    /// <para>Raw <c>Hide()</c> only, deliberately NOT
+    /// <c>ManagedEtabsVisibility.EnsureHidden</c>: that reads <c>Visible()</c> first,
+    /// which would put a second CSI call inside the experiment and blur which call
+    /// produced any observed effect.</para>
+    ///
+    /// <para>Neither a nonzero return nor an exception aborts the launch. Cardex
+    /// documents <c>Hide()</c> as returning an error when the application is already
+    /// hidden, so the return code cannot be read as success/failure on its own - the
+    /// exact-owned HWND census over the whole startup interval is the oracle. A throw is
+    /// equally a RESULT here (it would answer "not legal before ApplicationStart"), so it
+    /// is recorded and startup continues exactly as it would have.</para>
+    /// </summary>
+    private void ProbeCsiHideBeforeApplicationStart(IEtabsRawApi rawApi)
+    {
+        try
+        {
+            var returnCode = rawApi.Hide();
+            _diagnostics.WriteLine(
+                $"DIAG pre-start cOAPI.Hide() returned {returnCode} " +
+                "(0 = accepted; nonzero may only mean ETABS already considered itself " +
+                "hidden - the HWND census decides, not this code).");
+        }
+        catch (Exception exception)
+        {
+            _diagnostics.WriteLine(
+                "DIAG pre-start cOAPI.Hide() threw: " +
+                EtabsApiDiagnosticFormatter.Exception(
+                    "cOAPI.Hide[pre-ApplicationStart]",
+                    exception));
+        }
     }
 
     /// <summary>
