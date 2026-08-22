@@ -48,16 +48,21 @@ public sealed class ManagedEtabsLauncherTests
                 "census-ownership",
                 "open-exact",
                 "window-guard-activate",
-                // And only then the blocking start, with suppression already holding.
+                // And only then the blocking start, with the observer already watching.
                 "application-start",
-                // CSI is asked to hide, once, and its answer is recorded — #20 proved
-                // cOAPI.Visible() never clears on ETABS 23.3, so it decides nothing.
-                "visible",
+                // CSI mutates. The hide is issued UNCONDITIONALLY - note there is no
+                // "visible" read before it. A read-first policy skipped the hide exactly
+                // when the flag was lying, which is the #20 measurement: stuck true for 94
+                // reads across 10.014 s while the windows were in fact hidden.
                 "hide",
+                // One telemetry read afterwards, recorded and obeyed by nothing.
                 "visible",
-                // THIS is the gate: the exact-owned Windows census must report no visible
-                // owned top-level window before startup goes any further.
+                // THIS is the gate: the exact-owned Windows census must report no
+                // materially visible owned top-level window before startup continues.
                 "window-guard-confirm-suppressed",
+                // Confirming it for the first time is what CLOSES the startup-consent
+                // interval. Exposure after this point is unconsented and sticky.
+                "window-guard-enter-background-hidden",
                 "sap-model",
                 "version-probe",
                 "oapi-version"
@@ -531,10 +536,14 @@ public sealed class ManagedEtabsLauncherTests
         // Exactly one Hide, and its disagreement is recorded rather than acted on.
         Assert.Equal(1, api.HideCalls);
         Assert.Contains(
-            "Windows window state is the authority",
+            "Windows state is the authority",
             diagnostics.ToString(),
             StringComparison.Ordinal);
         Assert.Equal(1, processes.Guards.Activated[0].SuppressionConfirmations);
+
+        // And the consent interval closed on the strength of the WINDOWS confirmation,
+        // not on anything CSI said about itself.
+        Assert.Equal(1, processes.Guards.Activated[0].EnterBackgroundHiddenCalls);
     }
 
     /// <summary>
@@ -569,12 +578,17 @@ public sealed class ManagedEtabsLauncherTests
     }
 
     /// <summary>
-    /// The CSI hint keeps its bounded budget rather than the old ten-second one. Spending
-    /// ten seconds waiting for a flag #20 proved never changes would add ten seconds to
-    /// every session start and alter no decision.
+    /// The CSI hide now costs NO waiting at all, on a build whose Visible() flag never
+    /// moves. There is nothing to converge on: the flag is not an oracle in either
+    /// direction, so the policy issues the call, records the answer and hands the question
+    /// to the Windows census.
+    ///
+    /// <para>The old policy spent a bounded budget re-reading that flag. Against ETABS 23.3
+    /// that budget was always spent in full and always changed nothing — this asserts the
+    /// clock is not advanced by the CSI step at all.</para>
     /// </summary>
     [Fact]
-    public void TheCsiHintIsGivenTheTelemetryBudgetAndNotTheOldTenSeconds()
+    public void TheCsiHideCostsNoConvergenceWaitingAtAll()
     {
         var api = new FakeRawApi { IgnoreHide = true };
         var processes = new FakeProcesses { AfterStart = [Identity] };
@@ -582,10 +596,9 @@ public sealed class ManagedEtabsLauncherTests
 
         _ = Build(api, processes, out _, clock).Launch();
 
-        Assert.Equal(ManagedEtabsVisibilityPolicy.Telemetry.ConvergenceDeadline, clock.Elapsed);
-        Assert.All(clock.Waits, wait => Assert.Equal(
-            ManagedEtabsVisibilityPolicy.Telemetry.PollInterval,
-            wait));
+        Assert.Equal(1, api.HideCalls);
+        Assert.Equal(TimeSpan.Zero, clock.Elapsed);
+        Assert.Empty(clock.Waits);
     }
 
     /// <summary>
@@ -867,6 +880,30 @@ public sealed class ManagedEtabsLauncherTests
         /// <summary>Windows the census keeps reporting visible, i.e. suppression failing.</summary>
         public nint[] StillVisible { get; set; } = [];
 
+        public ManagedEtabsVisibilityState State { get; private set; } =
+            ManagedEtabsVisibilityState.StartingVisibleByConsent;
+
+        public ManagedEtabsExposureEvidence Exposure { get; set; } =
+            ManagedEtabsExposureEvidence.None;
+
+        public int EnterBackgroundHiddenCalls { get; private set; }
+
+        public int EnterUserVisibleCalls { get; private set; }
+
+        public void EnterBackgroundHidden()
+        {
+            events.Add("window-guard-enter-background-hidden");
+            EnterBackgroundHiddenCalls++;
+            State = ManagedEtabsVisibilityState.BackgroundHidden;
+        }
+
+        public void EnterUserVisible()
+        {
+            events.Add("window-guard-enter-user-visible");
+            EnterUserVisibleCalls++;
+            State = ManagedEtabsVisibilityState.UserVisible;
+        }
+
         public ManagedEtabsWindowConfirmation ConfirmSuppressed()
         {
             events.Add("window-guard-confirm-suppressed");
@@ -916,7 +953,8 @@ public sealed class ManagedEtabsLauncherTests
                     HoldTheInstallOpen,
                     _ => Removed.Set(),
                     TimeSpan.FromMilliseconds(250),
-                    TimeSpan.FromMilliseconds(50)));
+                    TimeSpan.FromMilliseconds(50)),
+                new StatedDesktop());
 
         private nint HoldTheInstallOpen(
             int processId,
@@ -926,18 +964,16 @@ public sealed class ManagedEtabsLauncherTests
             return 0x5150;
         }
 
-        /// <summary>An empty window station: this launch never gets far enough to sweep.</summary>
+        /// <summary>An empty window station: this launch never gets far enough to observe.</summary>
         private sealed class NoWindows : ITopLevelWindows
         {
             public IReadOnlyList<TopLevelWindow> Enumerate() => [];
+        }
 
-            public void Hide(nint handle)
-            {
-            }
-
-            public void Show(nint handle)
-            {
-            }
+        /// <summary>A stated desktop, so nothing here reads the real screen.</summary>
+        private sealed class StatedDesktop : IVirtualDesktop
+        {
+            public WindowBounds Bounds => new(0, 0, 1920, 1080);
         }
     }
 

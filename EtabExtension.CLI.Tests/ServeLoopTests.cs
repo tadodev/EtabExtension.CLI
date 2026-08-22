@@ -43,8 +43,12 @@ public class ServeLoopTests
         new(
             dispatcher,
             ShutdownCoordinator.Completed(SuccessShutdown()),
+            Intents(),
             TestHandshake,
             TextWriter.Null);
+
+    private static IManagedEtabsStartIntentScope Intents() =>
+        new ManagedEtabsStartIntentScope();
 
     private static ServeHandshake TestHandshake(IReadOnlyList<string> capabilities) => new(
         "etab-cli-serve",
@@ -200,7 +204,7 @@ public class ServeLoopTests
             "{\"id\":41,\"command\":\"shutdown\"}",
             "{\"id\":42,\"command\":\"get-status\"}");
         await using var writer = new StringWriter();
-        var loop = new ServeLoop(dispatcher, coordinator, TestHandshake, TextWriter.Null);
+        var loop = new ServeLoop(dispatcher, coordinator, Intents(), TestHandshake, TextWriter.Null);
 
         var running = loop.RunAsync(reader, writer, TestContext.Current.CancellationToken);
         await coordinator.Called;
@@ -236,6 +240,7 @@ public class ServeLoopTests
         var loop = new ServeLoop(
             new FakeDispatcher(),
             coordinator,
+            Intents(),
             TestHandshake,
             TextWriter.Null);
         var failure = ShutdownFailure();
@@ -271,6 +276,7 @@ public class ServeLoopTests
         await new ServeLoop(
             new FakeDispatcher(),
             coordinator,
+            Intents(),
             TestHandshake,
             TextWriter.Null).RunAsync(reader, writer, TestContext.Current.CancellationToken);
 
@@ -288,6 +294,7 @@ public class ServeLoopTests
         var running = new ServeLoop(
             new FakeDispatcher(),
             coordinator,
+            Intents(),
             TestHandshake,
             TextWriter.Null).RunAsync(reader, writer, cancellation.Token);
         await reader.ReadStarted;
@@ -308,6 +315,7 @@ public class ServeLoopTests
         var loop = new ServeLoop(
             new FakeDispatcher(),
             coordinator,
+            Intents(),
             TestHandshake,
             diagnostics);
 
@@ -336,6 +344,7 @@ public class ServeLoopTests
         var loop = new ServeLoop(
             new FakeDispatcher(),
             coordinator,
+            Intents(),
             TestHandshake,
             diagnostics);
 
@@ -368,7 +377,7 @@ public class ServeLoopTests
         using var reader = new StringReader(
             $"{badRequest}\n{{\"id\":62,\"command\":\"get-status\"}}\n");
         await using var writer = new StringWriter();
-        var loop = new ServeLoop(dispatcher, coordinator, TestHandshake, TextWriter.Null);
+        var loop = new ServeLoop(dispatcher, coordinator, Intents(), TestHandshake, TextWriter.Null);
 
         await loop.RunAsync(reader, writer, TestContext.Current.CancellationToken);
 
@@ -403,6 +412,7 @@ public class ServeLoopTests
         var loop = new ServeLoop(
             new IsolationDispatcher(),
             coordinator,
+            Intents(),
             TestHandshake,
             TextWriter.Null);
 
@@ -436,6 +446,7 @@ public class ServeLoopTests
         var loop = new ServeLoop(
             new IsolationDispatcher(),
             coordinator,
+            Intents(),
             TestHandshake,
             TextWriter.Null);
 
@@ -456,7 +467,7 @@ public class ServeLoopTests
         using var reader = new StringReader(
             "{\"id\":64,\"command\":\"cancel\",\"request\":{}}\n{\"id\":65,\"command\":\"get-status\"}\n");
         await using var writer = new StringWriter();
-        var loop = new ServeLoop(dispatcher, coordinator, TestHandshake, TextWriter.Null);
+        var loop = new ServeLoop(dispatcher, coordinator, Intents(), TestHandshake, TextWriter.Null);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => loop.RunAsync(reader, writer, cancellation.Token));
@@ -476,6 +487,7 @@ public class ServeLoopTests
         var loop = new ServeLoop(
             new FakeDispatcher(),
             coordinator,
+            Intents(),
             TestHandshake,
             TextWriter.Null);
 

@@ -79,10 +79,10 @@ public sealed class EtabsVisibilityWiringTests
         $"{typeof(IEtabsSession).FullName}.{nameof(IEtabsSession.RevealForExplicitUserRequest)}",
         $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}",
         $"{typeof(IManagedEtabsApplication).FullName}." +
-            nameof(IManagedEtabsApplication.EnsureVisibleForExplicitUserAction),
+            nameof(IManagedEtabsApplication.ApplyCsiUnhideForExplicitUserAction),
         $"{typeof(ManagedEtabsApplication).FullName}." +
-            nameof(ManagedEtabsApplication.EnsureVisibleForExplicitUserAction),
-        $"{typeof(ManagedEtabsVisibility).FullName}.{nameof(ManagedEtabsVisibility.EnsureVisible)}"
+            nameof(ManagedEtabsApplication.ApplyCsiUnhideForExplicitUserAction),
+        $"{typeof(ManagedEtabsVisibility).FullName}.{nameof(ManagedEtabsVisibility.ApplyVisible)}"
     ];
 
     /// <summary>
@@ -93,10 +93,10 @@ public sealed class EtabsVisibilityWiringTests
     private static readonly string[] HideSeams =
     [
         $"{typeof(IManagedEtabsApplication).FullName}." +
-            nameof(IManagedEtabsApplication.EnsureHiddenForBackgroundWork),
+            nameof(IManagedEtabsApplication.ApplyCsiHideForBackgroundWork),
         $"{typeof(ManagedEtabsApplication).FullName}." +
-            nameof(ManagedEtabsApplication.EnsureHiddenForBackgroundWork),
-        $"{typeof(ManagedEtabsVisibility).FullName}.{nameof(ManagedEtabsVisibility.EnsureHidden)}"
+            nameof(ManagedEtabsApplication.ApplyCsiHideForBackgroundWork),
+        $"{typeof(ManagedEtabsVisibility).FullName}.{nameof(ManagedEtabsVisibility.ApplyHidden)}"
     ];
 
     /// <summary>
@@ -111,7 +111,7 @@ public sealed class EtabsVisibilityWiringTests
         // The chain it delegates through.
         $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}",
         $"{typeof(ManagedEtabsApplication).FullName}." +
-            nameof(ManagedEtabsApplication.EnsureVisibleForExplicitUserAction)
+            nameof(ManagedEtabsApplication.ApplyCsiUnhideForExplicitUserAction)
     ];
 
     /// <summary>
@@ -125,7 +125,7 @@ public sealed class EtabsVisibilityWiringTests
         // 23.3, so the CSI hide is recorded and the Windows census decides.
         "EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher.AskCsiToHide",
         $"{typeof(ManagedEtabsApplication).FullName}." +
-            nameof(ManagedEtabsApplication.EnsureHiddenForBackgroundWork)
+            nameof(ManagedEtabsApplication.ApplyCsiHideForBackgroundWork)
     ];
 
     /// <summary>
@@ -506,7 +506,7 @@ public sealed class EtabsVisibilityWiringTests
         var unhide = IndexOfCall(
             reveal,
             $"{typeof(IManagedEtabsApplication).FullName}." +
-            nameof(IManagedEtabsApplication.EnsureVisibleForExplicitUserAction));
+            nameof(IManagedEtabsApplication.ApplyCsiUnhideForExplicitUserAction));
 
         Assert.True(
             release < unhide,
@@ -677,9 +677,14 @@ public sealed class EtabsVisibilityWiringTests
     /// describing a deadline that no longer exists.
     /// </summary>
     [Theory]
-    [InlineData("EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsVisibility.Ensure")]
+    // The CSI visibility policy is deliberately absent: after CLI #22 it has no bounded
+    // wait at all. There is nothing to converge on when cOAPI.Visible() is not an oracle
+    // in either direction, so it issues the transition and hands the question to the
+    // Windows census rather than polling a flag that does not move.
     [InlineData("EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsLauncher" +
         ".CensusExactlyOneOwnedProcess")]
+    [InlineData("EtabExtension.CLI.Shared.Infrastructure.Etabs.Session.ManagedEtabsWindowGuard" +
+        ".Confirm")]
     public void EachBoundedWaitMeasuresItselfThroughTheMonotonicSeam(string site)
     {
         var calls = Calls(site);
@@ -695,31 +700,53 @@ public sealed class EtabsVisibilityWiringTests
     }
 
     /// <summary>
-    /// The reveal's restore re-proves ownership before it shows anything. Suppression
-    /// filters by owning pid, but the saved value is a raw HWND and the process handle does
-    /// not protect it — so the restore path must re-observe the census rather than trust the
-    /// list. Deleting that re-observation fails here as well as behaviourally.
+    /// The CLI #22 ruling, stated over the compiled assembly: NOTHING in production calls a
+    /// Windows window actuator, anywhere, by any route.
+    ///
+    /// <para>This replaced a test asserting the reveal restored our own hidden HWNDs before
+    /// showing them. That restore existed only because #20 found <c>cOAPI.Visible()</c>
+    /// stuck true, which made the CSI policy skip its <c>Unhide</c> — so <c>ShowWindow</c>
+    /// was what actually reached the screen. Diagnostic #4 removed the need for it: with
+    /// <c>ShowWindow</c> impossible in both directions, an unconditional raw <c>Unhide</c>
+    /// put the window back 14 ms later.</para>
+    ///
+    /// <para>And it was never safe. Four supervised runs with out-of-process
+    /// <c>ShowWindow(SW_HIDE)</c> active all killed ETABS with an unhandled
+    /// <c>NullReferenceException</c> inside its own <c>NativeWindow.Callback</c>; the
+    /// controlled arm without it survived and exported cleanly. So the actuator is not
+    /// merely unused — it is forbidden, and this is the assertion that keeps it that
+    /// way.</para>
     /// </summary>
     [Fact]
-    public void TheRestorePathReObservesOwnershipBeforeShowingAnything()
+    public void NoProductionMethodCallsAWindowsActuatorByAnyRoute()
     {
-        var restore = $"{typeof(ManagedEtabsWindowGuard).FullName}.RestoreStillOwned";
-        var calls = Calls(restore);
-        var enumerate = calls.ToList().IndexOf(
-            $"{typeof(ITopLevelWindows).FullName}.{nameof(ITopLevelWindows.Enumerate)}");
-        var show = calls.ToList().IndexOf(
-            $"{typeof(ITopLevelWindows).FullName}.{nameof(ITopLevelWindows.Show)}");
+        var offenders = ProductionCalls
+            .SelectMany(method => method.Value.Select(call => (Method: method.Key, Call: call)))
+            .Where(entry => entry.Call.Contains("ShowWindow", StringComparison.Ordinal)
+                || entry.Call.Contains("SetWindowPos", StringComparison.Ordinal)
+                || entry.Call.Contains("DwmSetWindowAttribute", StringComparison.Ordinal))
+            .Select(entry => $"{entry.Method} -> {entry.Call}")
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 
-        Assert.True(enumerate >= 0, "The restore no longer re-observes the window census.");
-        Assert.True(show >= 0, "The restore no longer shows anything.");
-        Assert.True(
-            enumerate < show,
-            "Ownership must be re-proven BEFORE a saved handle is shown; an HWND value can " +
-            "be reused by another window in another process once ETABS destroys ours.");
-        Assert.Contains(
-            $"{typeof(IOwnedEtabsProcess).FullName}.get_{nameof(IOwnedEtabsProcess.HasExited)}",
-            calls,
-            StringComparer.Ordinal);
+        Assert.Equal([], offenders);
+    }
+
+    /// <summary>
+    /// The Windows seam is read-only by construction, not merely unused. A Hide or Show
+    /// added back to the interface — the first move anyone would make to put a window
+    /// straight — fails here before any call site exists to catch.
+    /// </summary>
+    [Fact]
+    public void TheWindowsSeamHasNoActuatingMember()
+    {
+        var members = typeof(ITopLevelWindows)
+            .GetMembers(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .Select(member => member.Name)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal([nameof(ITopLevelWindows.Enumerate)], members);
     }
 
     /// <summary>
@@ -786,7 +813,7 @@ public sealed class EtabsVisibilityWiringTests
         var csi = IndexOfCall(
             reveal,
             $"{typeof(IManagedEtabsApplication).FullName}." +
-            nameof(IManagedEtabsApplication.EnsureVisibleForExplicitUserAction));
+            nameof(IManagedEtabsApplication.ApplyCsiUnhideForExplicitUserAction));
         var windows = IndexOfCall(
             reveal,
             $"{typeof(IManagedEtabsApplication).FullName}." +

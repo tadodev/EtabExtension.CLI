@@ -10,347 +10,230 @@ namespace EtabExtension.CLI.Tests;
 /// <summary>
 /// The CSI visibility contract, exercised without ETABS or COM.
 ///
-/// <para>Cardex (ETABS 23.3) is explicit that <c>cOAPI.Hide</c> and <c>cOAPI.Unhide</c>
-/// return an error when the application is already in the requested state, so a policy
-/// that called them unconditionally would manufacture failures. It is equally explicit
-/// that <c>cOAPI.ApplicationStart</c> takes no visibility argument, so nothing here may
-/// assume a starting state — every transition is read first and confirmed after.</para>
+/// <para><b>The contract inverted after CLI #22.</b> The previous policy read
+/// <c>cOAPI.Visible()</c> first and skipped the transition when the flag already matched
+/// the intent — defensible while the flag was believed, because Cardex documents
+/// <c>Hide</c>/<c>Unhide</c> returning an error when already in the requested state. Live
+/// certification destroyed that premise: #20 measured the flag stuck true for 94 reads
+/// across 10.014 s while the windows were in fact hidden, and Diagnostic #4 saw it wrong
+/// in the other direction. A read-first policy therefore declines to act at exactly the
+/// moment acting matters.</para>
+///
+/// <para>So both transitions are now issued UNCONDITIONALLY, the return code is telemetry
+/// rather than a verdict, and only a THROW counts as a failure — because a throw means the
+/// call never happened. The exact-owned Windows census decides what actually took
+/// effect.</para>
 /// </summary>
 public sealed class ManagedEtabsVisibilityTests
 {
-    [Fact]
-    public void HidingAVisibleApplicationIssuesHideAndConfirmsTheNewState()
+    // ── The transition is unconditional ──────────────────────────────────────
+
+    /// <summary>
+    /// The single most important property of this policy, and the one whose absence shipped
+    /// a rejected candidate: the hide is issued even when CSI insists the application is
+    /// already hidden.
+    ///
+    /// <para>This is not hypothetical. #20's supervised run had <c>Visible()</c> returning
+    /// true for 10 s after a successful hide — the flag simply does not track. A policy
+    /// that consults it first issues no hide on precisely the builds where the hide is
+    /// needed. Restoring the read-first guard fails here.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TheHideIsIssuedWhateverTheVisibleFlagClaims(bool flagSaysVisible)
     {
-        var api = new FakeVisibilityApi(visible: true);
+        var api = new FakeVisibilityApi(flagSaysVisible);
 
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
+        var outcome = ManagedEtabsVisibility.ApplyHidden(api);
 
-        Assert.Equal(ManagedEtabsVisibilityIntent.Hidden, outcome.Intent);
-        Assert.True(outcome.Confirmed);
-        Assert.True(outcome.Changed);
-        Assert.Null(outcome.Diagnostic);
         Assert.Equal(1, api.HideCalls);
         Assert.Equal(0, api.UnhideCalls);
-        // Read, transition, read again: the second read is what turns "the call was
-        // accepted" into "the application is hidden".
-        Assert.Equal(["visible", "hide", "visible"], api.Events);
+        Assert.True(outcome.Issued);
+        Assert.Equal(ManagedEtabsVisibilityIntent.Hidden, outcome.Intent);
     }
 
     /// <summary>
-    /// Cardex, <c>cOAPI.Hide</c>: "If the application is already hidden, calling this
-    /// function returns an error." Calling anyway would report a failure for the state
-    /// we wanted.
+    /// The same, in the other direction. The stuck flag is why the old reveal had to put
+    /// windows back with <c>ShowWindow</c> at all: the CSI policy read "already visible"
+    /// and issued nothing. Diagnostic #4 proved an unconditional <c>Unhide</c> is
+    /// sufficient on its own.
     /// </summary>
-    [Fact]
-    public void HidingAnAlreadyHiddenApplicationCallsNothingAndStillSucceeds()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TheUnhideIsIssuedWhateverTheVisibleFlagClaims(bool flagSaysVisible)
     {
-        var api = new FakeVisibilityApi(visible: false);
+        var api = new FakeVisibilityApi(flagSaysVisible);
 
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
+        var outcome = ManagedEtabsVisibility.ApplyVisible(api);
 
-        Assert.True(outcome.Confirmed);
-        Assert.False(outcome.Changed);
-        Assert.Equal(0, api.HideCalls);
-        Assert.Equal(["visible"], api.Events);
-    }
-
-    [Fact]
-    public void RevealingAHiddenApplicationIssuesUnhideAndConfirmsTheNewState()
-    {
-        var api = new FakeVisibilityApi(visible: false);
-
-        var outcome = ManagedEtabsVisibility.EnsureVisible(api, Converging());
-
-        Assert.Equal(ManagedEtabsVisibilityIntent.Visible, outcome.Intent);
-        Assert.True(outcome.Confirmed);
-        Assert.True(outcome.Changed);
         Assert.Equal(1, api.UnhideCalls);
         Assert.Equal(0, api.HideCalls);
-        Assert.Equal(["visible", "unhide", "visible"], api.Events);
+        Assert.True(outcome.Issued);
+        Assert.Equal(ManagedEtabsVisibilityIntent.Visible, outcome.Intent);
     }
 
     /// <summary>
-    /// Cardex, <c>cOAPI.Unhide</c>: "If the application is already visible (not hidden)
-    /// calling this function returns an error."
+    /// Exactly once. A retry loop here would be the old convergence policy creeping back in
+    /// through a different door, and Cardex is clear that a second call against a state
+    /// ETABS believes it is already in returns an error.
     /// </summary>
     [Fact]
-    public void RevealingAnAlreadyVisibleApplicationCallsNothingAndStillSucceeds()
+    public void TheTransitionIsIssuedExactlyOnceAndNeverRetried()
+    {
+        var api = new FakeVisibilityApi(visible: true) { TransitionReturnCode = 7 };
+
+        _ = ManagedEtabsVisibility.ApplyHidden(api);
+
+        Assert.Equal(1, api.HideCalls);
+        Assert.Single(api.Events.Where(e => string.Equals(e, "hide", StringComparison.Ordinal)));
+    }
+
+    /// <summary>
+    /// The flag is read for the record, not for a decision — and never before the call, so
+    /// it cannot influence one. One read, because there is nothing to poll.
+    /// </summary>
+    [Fact]
+    public void VisibleIsReadOnceAfterTheCallAndNeverBeforeIt()
     {
         var api = new FakeVisibilityApi(visible: true);
 
-        var outcome = ManagedEtabsVisibility.EnsureVisible(api, Converging());
+        var outcome = ManagedEtabsVisibility.ApplyHidden(api);
 
-        Assert.True(outcome.Confirmed);
-        Assert.False(outcome.Changed);
-        Assert.Equal(0, api.UnhideCalls);
-        Assert.Equal(["visible"], api.Events);
+        Assert.Equal(["hide", "visible"], api.Events);
+        Assert.NotNull(outcome.CsiVisibleAfter);
     }
 
-    [Theory]
-    [InlineData(true, "cOAPI.Hide")]
-    [InlineData(false, "cOAPI.Unhide")]
-    public void ANonZeroTransitionReturnIsReportedAgainstTheNamedCsiCall(
-        bool startVisible,
-        string expectedOperation)
+    // ── Return codes are telemetry, throws are failures ──────────────────────
+
+    /// <summary>
+    /// A non-zero return means ETABS considered the request and declined it — most often
+    /// because it believed it was already in that state. The call DID happen, so the census
+    /// still has something to certify and this is not a transition failure.
+    /// </summary>
+    [Fact]
+    public void ANonZeroReturnIsRecordedButIsStillAnIssuedTransition()
     {
-        var api = new FakeVisibilityApi(startVisible) { TransitionReturnCode = 7 };
+        var api = new FakeVisibilityApi(visible: true) { TransitionReturnCode = 42 };
 
-        var outcome = startVisible
-            ? ManagedEtabsVisibility.EnsureHidden(api, Converging())
-            : ManagedEtabsVisibility.EnsureVisible(api, Converging());
+        var outcome = ManagedEtabsVisibility.ApplyHidden(api);
 
+        Assert.True(outcome.Issued);
         Assert.False(outcome.Confirmed);
+        Assert.Equal(42, outcome.ReturnCode);
         Assert.NotNull(outcome.Diagnostic);
-        Assert.Contains(EtabsApiErrorCodes.ApiCallFailed, outcome.Diagnostic, StringComparison.Ordinal);
-        Assert.Contains($"operation={expectedOperation}", outcome.Diagnostic, StringComparison.Ordinal);
-        Assert.Contains("returnCode=7", outcome.Diagnostic, StringComparison.Ordinal);
+        Assert.Contains("returnCode=42", outcome.Diagnostic, StringComparison.Ordinal);
+        Assert.Contains(
+            ManagedEtabsVisibility.HideOperation,
+            outcome.Diagnostic,
+            StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// The same failure class <c>cFile.OpenFile</c> shipped with: a zero return that the
-    /// state contradicts. Reporting success here would be the whole defect back again,
-    /// because a background run would believe it was hidden while a window sat on screen.
+    /// A throw is categorically different: nothing was asked of ETABS. Diagnostic #3
+    /// measured exactly this — <c>cOAPI.Hide()</c> throwing a <c>NullReferenceException</c>
+    /// ~12 ms in when called before <c>ApplicationStart</c> returns, because the API object
+    /// exists before its WinForms control has a window handle. The caller must fail, not
+    /// wait for a census to confirm a transition that was never requested.
     /// </summary>
     [Fact]
-    public void AZeroReturnThatTheStateContradictsIsNotConfirmed()
+    public void AThrowingTransitionIsReportedAsNotIssuedAndNeverEscapes()
     {
-        var api = new FakeVisibilityApi(visible: true) { IgnoreTransition = true };
+        var api = new FakeVisibilityApi(visible: true)
+        {
+            TransitionException = new InvalidOperationException(
+                "Invoke or BeginInvoke cannot be called on a control until the window " +
+                "handle has been created.")
+        };
 
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
+        var outcome = ManagedEtabsVisibility.ApplyHidden(api);
 
+        Assert.False(outcome.Issued);
         Assert.False(outcome.Confirmed);
-        Assert.True(outcome.Changed);
+        Assert.NotNull(outcome.Diagnostic);
+        Assert.Contains(
+            ManagedEtabsVisibility.HideOperation,
+            outcome.Diagnostic,
+            StringComparison.Ordinal);
+
+        // The flag is not consulted after a call that did not happen.
+        Assert.Null(outcome.CsiVisibleAfter);
+    }
+
+    /// <summary>
+    /// The telemetry read failing does not fail the transition. The call was made; only the
+    /// commentary is missing.
+    /// </summary>
+    [Fact]
+    public void AThrowingVisibleReadDoesNotFailAnIssuedTransition()
+    {
+        var api = new FakeVisibilityApi(visible: true)
+        {
+            ReadException = new InvalidOperationException("COM read failed")
+        };
+
+        var outcome = ManagedEtabsVisibility.ApplyVisible(api);
+
+        Assert.True(outcome.Issued);
+        Assert.True(outcome.Confirmed);
+        Assert.Null(outcome.CsiVisibleAfter);
+        Assert.NotNull(outcome.Diagnostic);
+        Assert.Contains(
+            ManagedEtabsVisibility.ReadOperation,
+            outcome.Diagnostic,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The nominal case is quiet. A diagnostic on every successful hide would bury the ones
+    /// that matter in a daemon log.
+    /// </summary>
+    [Fact]
+    public void AnAcceptedTransitionThatCsiAgreesWithSaysNothing()
+    {
+        var api = new FakeVisibilityApi(visible: true) { TransitionLandsInFlag = true };
+
+        var outcome = ManagedEtabsVisibility.ApplyHidden(api);
+
+        Assert.True(outcome.Issued);
+        Assert.True(outcome.Confirmed);
+        Assert.False(outcome.CsiVisibleAfter);
+        Assert.Null(outcome.Diagnostic);
+    }
+
+    /// <summary>
+    /// And the #20 shape — accepted, but the flag keeps lying — is recorded rather than
+    /// hidden, because that is the build we actually ship against.
+    /// </summary>
+    [Fact]
+    public void AnAcceptedHideWhoseFlagKeepsLyingIsRecordedNotFailed()
+    {
+        var api = new FakeVisibilityApi(visible: true);
+
+        var outcome = ManagedEtabsVisibility.ApplyHidden(api);
+
+        Assert.True(outcome.Issued);
+        Assert.True(outcome.Confirmed);
+        Assert.True(outcome.CsiVisibleAfter);
         Assert.NotNull(outcome.Diagnostic);
         Assert.Contains(
             EtabsApiErrorCodes.VisibilityNotConfirmed,
             outcome.Diagnostic,
             StringComparison.Ordinal);
-        Assert.Contains("requested=hidden", outcome.Diagnostic, StringComparison.Ordinal);
-        Assert.Contains("observed=visible", outcome.Diagnostic, StringComparison.Ordinal);
-    }
-
-    /// <summary>
-    /// The #20 measurement, stated as the primitive's contract: <c>Hide()</c> returns
-    /// success and <c>Visible()</c> keeps saying visible for a while. The candidate called
-    /// that a failure on the first read. It is a deferred transition, and the only correct
-    /// answer is to keep observing to a bound.
-    /// </summary>
-    [Fact]
-    public void ASuccessfulHideThatTakesEffectLaterEventuallyConfirms()
-    {
-        var clock = new VirtualClock();
-        var api = new FakeVisibilityApi(visible: true) { VisibleReadsBeforeHideLands = 20 };
-
-        var outcome = ManagedEtabsVisibility.EnsureHidden(
-            api,
-            new(TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100), clock));
-
-        Assert.True(outcome.Confirmed);
-        Assert.True(outcome.Changed);
-        Assert.Null(outcome.Diagnostic);
-        // Twenty reads still said visible, one poll interval apart, and the twenty-first
-        // agreed. The candidate declared failure after the first of those.
-        Assert.Equal(22, outcome.Reads);
-        Assert.Equal(TimeSpan.FromMilliseconds(2000), outcome.Waited);
-        Assert.Equal(TimeSpan.FromMilliseconds(2000), clock.Elapsed);
-    }
-
-    /// <summary>
-    /// And the transition is issued ONCE. Cardex documents <c>Hide</c> erroring when the
-    /// application is already hidden, so re-issuing it while a first call is still landing
-    /// would manufacture exactly the failure the convergence exists to avoid.
-    /// </summary>
-    [Fact]
-    public void ConvergencePollsTheStateAndNeverReIssuesTheTransition()
-    {
-        var api = new FakeVisibilityApi(visible: true) { VisibleReadsBeforeHideLands = 30 };
-
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
-
-        Assert.True(outcome.Confirmed);
-        Assert.Equal(1, api.HideCalls);
-        Assert.Equal(0, api.UnhideCalls);
-        Assert.Equal(1, api.Events.Count(step => step == "hide"));
-        Assert.Equal(outcome.Reads, api.Events.Count(step => step == "visible"));
-    }
-
-    /// <summary>
-    /// The bound is a bound. A hide that never lands is still a refusal, and the diagnostic
-    /// carries the measurements — reads and waited — the supervised gate cannot otherwise
-    /// reconstruct.
-    /// </summary>
-    [Fact]
-    public void AHideThatNeverLandsFailsAtTheDeadlineWithItsMeasurements()
-    {
-        var clock = new VirtualClock();
-        var api = new FakeVisibilityApi(visible: true) { IgnoreTransition = true };
-
-        var outcome = ManagedEtabsVisibility.EnsureHidden(
-            api,
-            new(TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100), clock));
-
-        Assert.False(outcome.Confirmed);
-        Assert.Equal(1, api.HideCalls);
-        Assert.Equal(TimeSpan.FromSeconds(10), clock.Elapsed);
-        Assert.Contains(
-            EtabsApiErrorCodes.VisibilityNotConfirmed,
-            outcome.Diagnostic!,
-            StringComparison.Ordinal);
-        Assert.Contains($"reads={outcome.Reads}", outcome.Diagnostic!, StringComparison.Ordinal);
-        Assert.Contains("waitedMs=10000", outcome.Diagnostic!, StringComparison.Ordinal);
-    }
-
-    /// <summary>
-    /// A non-zero return does not get the convergence budget. Cardex's documented cause of
-    /// a non-zero <c>Hide</c> is "already hidden", so it is re-read once — the observation
-    /// decides — and a disagreeing observation reports the return code rather than waiting
-    /// out a call ETABS refused.
-    /// </summary>
-    [Fact]
-    public void ARejectedTransitionIsReadOnceAndNotWaitedOut()
-    {
-        var clock = new VirtualClock();
-        var api = new FakeVisibilityApi(visible: true) { TransitionReturnCode = 7 };
-
-        var outcome = ManagedEtabsVisibility.EnsureHidden(
-            api,
-            new(TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100), clock));
-
-        Assert.False(outcome.Confirmed);
-        Assert.Equal(TimeSpan.Zero, clock.Elapsed);
-        Assert.Empty(clock.Waits);
-        Assert.Equal(2, outcome.Reads);
-    }
-
-    /// <summary>
-    /// The same read, when the state agrees. A non-zero return whose documented meaning is
-    /// "already in the requested state" must not be reported as a failure to reach it.
-    /// </summary>
-    [Fact]
-    public void ARejectedTransitionThatTheStateAgreesWithIsConfirmed()
-    {
-        var api = new FakeVisibilityApi(visible: true)
-        {
-            TransitionReturnCode = 7,
-            HidesDespiteNonZeroReturn = true
-        };
-
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
-
-        Assert.True(outcome.Confirmed);
-        Assert.Null(outcome.Diagnostic);
-        Assert.Equal(1, api.HideCalls);
-    }
-
-    /// <summary>
-    /// The bound is monotonic. A machine whose wall clock jumps backwards — an NTP
-    /// correction, a manual change, a VM resume — must not gain extra convergence budget,
-    /// and one that jumps forwards must not lose it.
-    ///
-    /// <para>The clock here reports correct monotonic elapsed time while its own wall-clock
-    /// notion of "now" walks an hour backwards on every single poll. Convergence still ends
-    /// at exactly the deadline, because there is no wall clock left for it to consult:
-    /// <see cref="IManagedEtabsClock"/> deliberately has no <c>UtcNow</c>.
-    /// <see cref="EtabsVisibilityWiringTests"/> holds the other half of this, over the
-    /// production clock's compiled call graph.</para>
-    /// </summary>
-    [Fact]
-    public void AWallClockThatJumpsBackwardsCannotExtendTheConvergenceDeadline()
-    {
-        var clock = new WallClockRewindingClock();
-        var api = new FakeVisibilityApi(visible: true) { IgnoreTransition = true };
-
-        var outcome = ManagedEtabsVisibility.EnsureHidden(
-            api,
-            new(TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(100), clock));
-
-        Assert.False(outcome.Confirmed);
-        Assert.Equal(TimeSpan.FromSeconds(10), outcome.Waited);
-        Assert.Equal(100, clock.Waits.Count);
-
-        // The wall clock really did move backwards under the loop, by well beyond the
-        // deadline, and changed nothing.
-        Assert.True(clock.WallClockDrift <= TimeSpan.FromHours(-100));
+        Assert.Contains("census decides", outcome.Diagnostic, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void AThrowingVisibilityReadIsBoundedAndNeverThrowsOutOfThePolicy()
+    public void TheApiArgumentIsRequired()
     {
-        var api = new FakeVisibilityApi(visible: true)
-        {
-            ReadException = new InvalidOperationException("COM went away")
-        };
-
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
-
-        Assert.False(outcome.Confirmed);
-        Assert.False(outcome.Changed);
-        Assert.NotNull(outcome.Diagnostic);
-        Assert.Contains(
-            EtabsApiErrorCodes.ComOperationFailed,
-            outcome.Diagnostic,
-            StringComparison.Ordinal);
-        Assert.Contains(
-            $"operation={ManagedEtabsVisibility.ReadOperation}",
-            outcome.Diagnostic,
-            StringComparison.Ordinal);
-        Assert.True(outcome.Diagnostic!.Length <= EtabsApiDiagnosticFormatter.TotalLimit);
+        _ = Assert.Throws<ArgumentNullException>(
+            () => ManagedEtabsVisibility.ApplyHidden(null!));
+        _ = Assert.Throws<ArgumentNullException>(
+            () => ManagedEtabsVisibility.ApplyVisible(null!));
     }
 
-    [Fact]
-    public void AThrowingTransitionIsBoundedAndNeverThrowsOutOfThePolicy()
-    {
-        var api = new FakeVisibilityApi(visible: true)
-        {
-            TransitionException = new InvalidOperationException("RPC_E_DISCONNECTED")
-        };
-
-        var outcome = ManagedEtabsVisibility.EnsureHidden(api, Converging());
-
-        Assert.False(outcome.Confirmed);
-        Assert.NotNull(outcome.Diagnostic);
-        Assert.Contains(
-            $"operation={ManagedEtabsVisibility.HideOperation}",
-            outcome.Diagnostic,
-            StringComparison.Ordinal);
-    }
-
-    /// <summary>
-    /// The production convergence policy on virtual time: the same deadline and interval
-    /// the daemon ships with, and no real sleeping.
-    /// </summary>
-    private static ManagedEtabsVisibilityPolicy Converging() => new(
-        ManagedEtabsVisibilityPolicy.Default.ConvergenceDeadline,
-        ManagedEtabsVisibilityPolicy.Default.PollInterval,
-        new VirtualClock());
-
-    /// <summary>
-    /// Monotonic time that advances normally while the machine's wall clock walks backwards
-    /// underneath it — the discontinuity a deadline must be immune to.
-    /// </summary>
-    private sealed class WallClockRewindingClock : IManagedEtabsClock
-    {
-        private TimeSpan _monotonic;
-        private DateTimeOffset _wallClock = new(2026, 8, 21, 0, 0, 0, TimeSpan.Zero);
-        private readonly DateTimeOffset _wallClockOrigin =
-            new(2026, 8, 21, 0, 0, 0, TimeSpan.Zero);
-
-        public List<TimeSpan> Waits { get; } = [];
-
-        public TimeSpan WallClockDrift => _wallClock - _wallClockOrigin;
-
-        public long Timestamp => _monotonic.Ticks;
-
-        public TimeSpan ElapsedSince(long timestamp) =>
-            TimeSpan.FromTicks(_monotonic.Ticks - timestamp);
-
-        public void Wait(TimeSpan interval)
-        {
-            Waits.Add(interval);
-            _monotonic += interval;
-            _wallClock = _wallClock.AddHours(-1);
-        }
-    }
+    // ── Fixtures ─────────────────────────────────────────────────────────────
 
     internal sealed class VirtualClock : IManagedEtabsClock
     {
@@ -375,46 +258,34 @@ public sealed class ManagedEtabsVisibilityTests
         }
     }
 
+    /// <summary>
+    /// The three CSI calls under test control, with the ETABS 23.3 behaviour that matters
+    /// as the DEFAULT: the flag does not move when the transition is accepted. A fake that
+    /// helpfully updated it would quietly hide the very defect this policy exists for.
+    /// </summary>
     internal sealed class FakeVisibilityApi(bool visible) : IEtabsVisibilityApi
     {
         public List<string> Events { get; } = [];
+
         public int HideCalls { get; private set; }
+
         public int UnhideCalls { get; private set; }
+
         public int TransitionReturnCode { get; init; }
-        public bool IgnoreTransition { get; init; }
 
-        /// <summary>
-        /// Reads that keep reporting the OLD state after an accepted transition — the #20
-        /// measurement, where Hide() returned success and Visible() disagreed for seconds.
-        /// </summary>
-        public int VisibleReadsBeforeHideLands { get; init; }
+        /// <summary>Opt in to a build where CSI's flag actually tracks its own transition.</summary>
+        public bool TransitionLandsInFlag { get; init; }
 
-        /// <summary>A refused call that nevertheless left the state where it was wanted.</summary>
-        public bool HidesDespiteNonZeroReturn { get; init; }
-
-        private int _pendingDeferredReads;
         public Exception? ReadException { get; init; }
+
         public Exception? TransitionException { get; init; }
+
         public bool IsVisible { get; private set; } = visible;
 
         public bool Visible()
         {
             Events.Add("visible");
-            if (ReadException is not null)
-            {
-                throw ReadException;
-            }
-            if (_pendingDeferredReads > 0)
-            {
-                _pendingDeferredReads--;
-                if (_pendingDeferredReads == 0)
-                {
-                    IsVisible = false;
-                }
-                return true;
-            }
-
-            return IsVisible;
+            return ReadException is null ? IsVisible : throw ReadException;
         }
 
         public int Hide()
@@ -425,26 +296,12 @@ public sealed class ManagedEtabsVisibilityTests
             {
                 throw TransitionException;
             }
-            if (TransitionReturnCode != 0)
+
+            if (TransitionLandsInFlag)
             {
-                if (HidesDespiteNonZeroReturn)
-                {
-                    IsVisible = false;
-                }
-                return TransitionReturnCode;
+                IsVisible = false;
             }
 
-            if (IgnoreTransition)
-            {
-                return 0;
-            }
-            if (VisibleReadsBeforeHideLands > 0)
-            {
-                _pendingDeferredReads = VisibleReadsBeforeHideLands;
-                return 0;
-            }
-
-            IsVisible = false;
             return TransitionReturnCode;
         }
 
@@ -456,10 +313,12 @@ public sealed class ManagedEtabsVisibilityTests
             {
                 throw TransitionException;
             }
-            if (TransitionReturnCode == 0 && !IgnoreTransition)
+
+            if (TransitionLandsInFlag)
             {
                 IsVisible = true;
             }
+
             return TransitionReturnCode;
         }
     }
