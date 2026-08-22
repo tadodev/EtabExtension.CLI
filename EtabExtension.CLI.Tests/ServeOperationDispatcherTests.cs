@@ -576,6 +576,15 @@ public sealed class ServeOperationDispatcherTests : IDisposable
 
     private sealed class FakeSession(bool isStarted = true, int? processId = 42) : IEtabsSession
     {
+        /// <summary>CLI #24 certification the test can force to fail.</summary>
+        public Result ExposureCertification { get; set; } = Result.Ok();
+
+        public List<string> Stages { get; } = [];
+
+        public Result CertifyNoUnconsentedExposure() => ExposureCertification;
+
+        public void MarkVisibilityStage(string stage) => Stages.Add(stage);
+
         public int GetOrStartCalls { get; private set; }
         public int GetOrStartOwnedCalls { get; private set; }
         public int RevealCalls { get; private set; }

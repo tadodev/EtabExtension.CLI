@@ -139,10 +139,18 @@ public sealed class EtabsVisibilityWiringTests
             nameof(IManagedEtabsWindowGuard.ConfirmSuppressed),
         $"{typeof(ManagedEtabsWindowGuard).FullName}." +
             nameof(ManagedEtabsWindowGuard.ConfirmSuppressed),
+        $"{typeof(IManagedEtabsWindowGuard).FullName}." +
+            nameof(IManagedEtabsWindowGuard.ConfirmSuppressedAndCloseConsentInterval),
+        $"{typeof(ManagedEtabsWindowGuard).FullName}." +
+            nameof(ManagedEtabsWindowGuard.ConfirmSuppressedAndCloseConsentInterval),
         $"{typeof(IManagedEtabsApplication).FullName}." +
             nameof(IManagedEtabsApplication.ConfirmWindowsSuppressed),
         $"{typeof(ManagedEtabsApplication).FullName}." +
-            nameof(ManagedEtabsApplication.ConfirmWindowsSuppressed)
+            nameof(ManagedEtabsApplication.ConfirmWindowsSuppressed),
+        $"{typeof(IManagedEtabsApplication).FullName}." +
+            nameof(IManagedEtabsApplication.ConfirmWindowsSuppressedAndCloseConsentInterval),
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.ConfirmWindowsSuppressedAndCloseConsentInterval)
     ];
 
     /// <summary>The authoritative explicit-reveal gate, likewise.</summary>
@@ -168,7 +176,9 @@ public sealed class EtabsVisibilityWiringTests
             ".RequireWindowsSuppressed",
         $"{typeof(EtabsSession).FullName}.ConfirmHiddenForBackgroundWork",
         $"{typeof(ManagedEtabsApplication).FullName}." +
-            nameof(ManagedEtabsApplication.ConfirmWindowsSuppressed)
+            nameof(ManagedEtabsApplication.ConfirmWindowsSuppressed),
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.ConfirmWindowsSuppressedAndCloseConsentInterval)
     ];
 
     /// <summary>The reveal proof, and only the explicit reveal may reach it.</summary>
@@ -201,9 +211,9 @@ public sealed class EtabsVisibilityWiringTests
     private static readonly string[] GuardReleaseSeams =
     [
         $"{typeof(IManagedEtabsWindowGuard).FullName}." +
-            nameof(IManagedEtabsWindowGuard.ReleaseForExplicitUserAction),
+            nameof(IManagedEtabsWindowGuard.BeginExplicitReveal),
         $"{typeof(ManagedEtabsWindowGuard).FullName}." +
-            nameof(ManagedEtabsWindowGuard.ReleaseForExplicitUserAction),
+            nameof(ManagedEtabsWindowGuard.BeginExplicitReveal),
         $"{typeof(IManagedEtabsApplication).FullName}." +
             nameof(IManagedEtabsApplication.ReleaseWindowGuardForExplicitUserAction),
         $"{typeof(ManagedEtabsApplication).FullName}." +
@@ -222,7 +232,9 @@ public sealed class EtabsVisibilityWiringTests
     [
         $"{typeof(EtabsSession).FullName}.{nameof(EtabsSession.RevealForExplicitUserRequest)}",
         $"{typeof(ManagedEtabsApplication).FullName}." +
-            nameof(ManagedEtabsApplication.ReleaseWindowGuardForExplicitUserAction)
+            nameof(ManagedEtabsApplication.ReleaseWindowGuardForExplicitUserAction),
+        $"{typeof(ManagedEtabsApplication).FullName}." +
+            nameof(ManagedEtabsApplication.BeginExplicitReveal)
     ];
 
     /// <summary>
@@ -854,7 +866,7 @@ public sealed class EtabsVisibilityWiringTests
         // And the subscription is torn down with the guard, on both termination routes.
         Assert.Contains(
             "System.IDisposable.Dispose",
-            Calls($"{typeof(ManagedEtabsWindowGuard).FullName}.Terminate"),
+            Calls($"{typeof(ManagedEtabsWindowGuard).FullName}.DisposeMonitorOnce"),
             StringComparer.Ordinal);
     }
 

@@ -135,6 +135,18 @@ public enum ManagedEtabsVisibilityState
     BackgroundHidden,
 
     /// <summary>
+    /// An explicit reveal is in flight: the requested model is confirmed open and
+    /// <c>cOAPI.Unhide()</c> is about to be, or has just been, issued.
+    ///
+    /// <para>This state exists so the observer can stay ALIVE across the reveal without
+    /// recording the reveal itself as a violation. The previous shape retired the observer
+    /// before the CSI call, which left a failed reveal holding a still-reusable session
+    /// with no observation at all - exactly the uncertain session CLI #24 must not
+    /// tolerate.</para>
+    /// </summary>
+    RevealPending,
+
+    /// <summary>
     /// The engineer explicitly asked to see ETABS, the requested model was confirmed open,
     /// <c>cOAPI.Unhide()</c> was issued, and the census confirmed a materially visible
     /// owned window. Later background work must never silently take this away.
@@ -155,7 +167,8 @@ public enum ManagedEtabsVisibilityState
 public readonly record struct ManagedEtabsExposureObservation(
     nint Handle,
     WindowBounds Bounds,
-    long SinceProtectedMs);
+    long SinceProtectedMs,
+    string Stage);
 
 /// <summary>
 /// CLI&#160;#24's temporal evidence: whether the session was ever materially on screen
@@ -172,19 +185,47 @@ public readonly record struct ManagedEtabsExposureObservation(
 /// <param name="Observations">How many censuses saw material exposure.</param>
 /// <param name="First">The first such observation.</param>
 /// <param name="Last">The most recent such observation.</param>
+/// <param name="ObservedTotalVisibleMs">
+/// Summed length of the contiguous stretches in which exposure was seen. Named "observed"
+/// deliberately: it is derived from discrete censuses, so it is a LOWER bound on real
+/// exposure rather than a measurement of it. The external certification harness measures
+/// the true figure; this is what the daemon can honestly say for itself.
+/// </param>
+/// <param name="ObservedMaxContiguousVisibleMs">
+/// The longest single such stretch - the number that separates one scheduler-latency
+/// flicker from a window the engineer actually read.
+/// </param>
+/// <param name="ObservationDurationMs">
+/// How long the protected interval has been under observation. Without it the figures
+/// above have no denominator: 200 ms of exposure means something very different across
+/// one second than across ten minutes.
+/// </param>
 public sealed record ManagedEtabsExposureEvidence(
     bool Observed,
     int Observations,
     ManagedEtabsExposureObservation? First,
-    ManagedEtabsExposureObservation? Last)
+    ManagedEtabsExposureObservation? Last,
+    long ObservedTotalVisibleMs = 0,
+    long ObservedMaxContiguousVisibleMs = 0,
+    long ObservationDurationMs = 0)
 {
     public static readonly ManagedEtabsExposureEvidence None = new(false, 0, null, null);
 
     /// <summary>Bounded text naming the offending window, for a failure diagnostic.</summary>
     public string Describe() => Observed && First is { } first && Last is { } last
-        ? $"{ManagedEtabsWindowErrorCodes.UnconsentedExposure}; observations={Observations}; " +
-            $"firstHandle=0x{first.Handle:X}; firstBounds=[{first.Bounds}]; " +
-            $"firstAtMs={first.SinceProtectedMs}; lastAtMs={last.SinceProtectedMs}"
+        ? EtabsApiDiagnosticFormatter.Bounded(string.Join(
+            "; ",
+            ManagedEtabsWindowErrorCodes.UnconsentedExposure,
+            $"observations={Observations}",
+            $"firstHandle=0x{first.Handle:X}",
+            $"firstBounds=[{first.Bounds}]",
+            $"firstAtMs={first.SinceProtectedMs}",
+            $"firstStage={first.Stage}",
+            $"lastAtMs={last.SinceProtectedMs}",
+            $"lastStage={last.Stage}",
+            $"observedTotalVisibleMs={ObservedTotalVisibleMs}",
+            $"observedMaxContiguousVisibleMs={ObservedMaxContiguousVisibleMs}",
+            $"observationDurationMs={ObservationDurationMs}"))
         : "no unconsented exposure observed";
 }
 
@@ -338,11 +379,23 @@ public interface IManagedEtabsWindowGuard : IDisposable
     /// materially visible top-level window, or the bounded deadline is spent.
     ///
     /// <para>This is what "background UI suppression = CONFIRMED" means. It is an
-    /// observation of Windows, not a report of what CSI was asked for. Confirming it for
-    /// the first time is what ENDS the consent interval — see
-    /// <see cref="EnterBackgroundHidden"/>.</para>
+    /// observation of Windows, not a report of what CSI was asked for. Changes no state:
+    /// this is the RE-check used after the consent interval has already closed.</para>
     /// </summary>
     ManagedEtabsWindowConfirmation ConfirmSuppressed();
+
+    /// <summary>
+    /// The FIRST background-readiness gate, which both confirms and closes the
+    /// startup-consent interval - atomically.
+    ///
+    /// <para>These cannot be two calls. Confirming "hidden" and then flipping the state in
+    /// a separate step leaves a gap in which a WinEvent can fire, be evaluated against the
+    /// still-consented state, and be discarded as expected startup visibility. The census
+    /// that decides and the transition it justifies therefore happen under one lock in the
+    /// same instant, and there is deliberately no public way to make that transition on its
+    /// own.</para>
+    /// </summary>
+    ManagedEtabsWindowConfirmation ConfirmSuppressedAndCloseConsentInterval();
 
     /// <summary>
     /// The explicit-reveal gate: observes until the exact-owned census reports at least one
@@ -351,29 +404,27 @@ public interface IManagedEtabsWindowGuard : IDisposable
     ManagedEtabsWindowConfirmation ConfirmRevealed();
 
     /// <summary>
-    /// Closes the startup-consent interval. Called once, immediately after the first
-    /// successful <see cref="ConfirmSuppressed"/> following <c>cOAPI.Hide()</c>. From this
-    /// instant, material exposure is unconsented and is recorded stickily.
+    /// Marks an explicit reveal as in flight, BEFORE the CSI call is issued.
+    ///
+    /// <para>The observer stays ALIVE across this. A window appearing now is what the
+    /// engineer asked for, so it is not accumulated - but if the reveal fails, the session
+    /// is still being observed rather than left uncertain and unwatched.</para>
     /// </summary>
-    void EnterBackgroundHidden();
+    void BeginExplicitReveal();
 
     /// <summary>
-    /// Records that the engineer has explicitly been shown ETABS, after the requested model
-    /// was confirmed open and the reveal was confirmed by the census.
+    /// Labels what the session is doing, so an exposure observation says WHEN it happened
+    /// in product terms and not only in milliseconds.
+    /// </summary>
+    void MarkStage(string stage);
+
+    /// <summary>
+    /// Records that the engineer has been shown ETABS deliberately, after the requested
+    /// model was confirmed open and the reveal was confirmed by the census. This is what
+    /// finally retires the observer - there is nothing left to protect.
     /// </summary>
     void EnterUserVisible();
 
-    /// <summary>
-    /// Ends the protected interval because the USER asked to see ETABS.
-    ///
-    /// <para>It restores nothing. Under the old design this call put our own hidden HWNDs
-    /// back with <c>ShowWindow(SW_SHOW)</c>, and that restore was load bearing precisely
-    /// because the stuck <c>Visible()</c> flag made the CSI policy skip its
-    /// <c>Unhide</c>. Diagnostic&#160;#4 removed both halves of that workaround: the CSI
-    /// call is now issued unconditionally, and it was measured putting the window back on
-    /// screen 14&#160;ms later with <c>ShowWindow</c> impossible in either direction.</para>
-    /// </summary>
-    void ReleaseForExplicitUserAction();
 }
 
 /// <summary>
@@ -389,6 +440,9 @@ public interface IManagedEtabsWindowGuardFactory
 /// <inheritdoc cref="IManagedEtabsWindowGuard" />
 public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
 {
+    /// <summary>What a session is doing before anything more specific is declared.</summary>
+    internal const string StartupStage = "startup";
+
     private readonly IOwnedEtabsProcess _owned;
     private readonly ITopLevelWindows _windows;
     private readonly IVirtualDesktop _desktop;
@@ -397,19 +451,42 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
     private readonly object _gate = new();
 
     private ManagedEtabsVisibilityState _state = ManagedEtabsVisibilityState.StartingVisibleByConsent;
-    private bool _terminated;
+
+    /// <summary>
+    /// Whether evidence accumulation has stopped. Deliberately SEPARATE from
+    /// <see cref="_monitorDisposed"/>: conflating the two is what previously made
+    /// <c>EnterUserVisible</c> a silent no-op after the reveal retired the observer, and
+    /// what let an owned-process exit swallow the monitor's disposal.
+    /// </summary>
+    private bool _observerRetired;
+
+    /// <summary>
+    /// Independently idempotent. The hook and its pump must be torn down exactly once, on
+    /// every path, whatever the logical state did first.
+    /// </summary>
+    private bool _monitorDisposed;
+
+    /// <summary>
+    /// When the protected interval began. Paired with an explicit flag rather than using
+    /// zero as a sentinel: the monotonic clock legitimately reads zero at the start of a
+    /// run, so a zero-means-unset rule silently reported every exposure as happening at
+    /// t=0.
+    /// </summary>
     private long _protectedFrom;
+
+    private bool _protectedFromSet;
+    private string _stage = StartupStage;
+
+    // CLI #24 evidence.
     private bool _exposureObserved;
     private int _exposureObservations;
     private ManagedEtabsExposureObservation? _firstExposure;
     private ManagedEtabsExposureObservation? _lastExposure;
+    private long _totalVisibleMs;
+    private long _maxContiguousVisibleMs;
+    private long? _openRunStartMs;
+    private long _openRunLastMs;
 
-    /// <summary>
-    /// The desktop is always injected, never defaulted. A convenience overload that
-    /// reached for the real monitor layout would be a platform-bound call on an
-    /// unguarded path, and would also let a test silently measure exposure against the
-    /// developer machine's real screen instead of a stated one.
-    /// </summary>
     internal ManagedEtabsWindowGuard(
         IOwnedEtabsProcess owned,
         ITopLevelWindows windows,
@@ -444,7 +521,7 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
         {
             lock (_gate)
             {
-                return !_terminated;
+                return !_observerRetired;
             }
         }
     }
@@ -468,13 +545,22 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
         {
             lock (_gate)
             {
-                return _exposureObserved
-                    ? new ManagedEtabsExposureEvidence(
-                        true,
-                        _exposureObservations,
-                        _firstExposure,
-                        _lastExposure)
-                    : ManagedEtabsExposureEvidence.None;
+                if (!_exposureObserved)
+                {
+                    return ManagedEtabsExposureEvidence.None;
+                }
+
+                // A run that is still open at read time counts toward the totals without
+                // being closed — reading the evidence must not mutate it.
+                var openRun = _openRunStartMs is { } start ? _openRunLastMs - start : 0;
+                return new ManagedEtabsExposureEvidence(
+                    true,
+                    _exposureObservations,
+                    _firstExposure,
+                    _lastExposure,
+                    _totalVisibleMs + openRun,
+                    Math.Max(_maxContiguousVisibleMs, openRun),
+                    ObservationDurationMs());
             }
         }
     }
@@ -491,65 +577,94 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
     /// <summary>Whether the operating-system window subscription is installed.</summary>
     internal bool Subscribed => _monitor?.Subscribed ?? false;
 
+    /// <inheritdoc />
+    public void MarkStage(string stage)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(stage);
+        lock (_gate)
+        {
+            _stage = stage;
+        }
+    }
+
     /// <summary>
     /// One observation pass over the exact owned process's windows.
     ///
     /// <para>Every window that is not owned by <see cref="Identity"/> is skipped without
     /// being read further. That is the whole targeting rule, and it is stated once, here.
     /// Nothing is hidden, shown, moved or otherwise touched — the pass exists purely to
-    /// accumulate CLI&#160;#24's evidence.</para>
+    /// accumulate CLI #24's evidence.</para>
     /// </summary>
     internal void ObserveOnce()
     {
         lock (_gate)
         {
-            if (_terminated)
+            ObserveLocked();
+        }
+    }
+
+    /// <summary>The observation itself. Callers hold the gate.</summary>
+    private void ObserveLocked()
+    {
+        if (_observerRetired)
+        {
+            return;
+        }
+
+        // A pid is only provably ours while the authoritative handle keeps it from being
+        // recycled. After exit it is somebody else's pid in waiting, so the observer stops
+        // for good rather than reading it. Note this retires the OBSERVER only — the
+        // monitor's own teardown is independent and still owed.
+        if (_owned.HasExited)
+        {
+            _observerRetired = true;
+            _state = ManagedEtabsVisibilityState.Retired;
+            CloseOpenRunLocked();
+            return;
+        }
+
+        // Exposure counts only while the session is meant to be hidden. Visibility during
+        // the consented startup is what the engineer agreed to, and visibility during or
+        // after an explicit reveal is what they asked for.
+        if (_state != ManagedEtabsVisibilityState.BackgroundHidden)
+        {
+            return;
+        }
+
+        var desktop = _desktop.Bounds;
+        var sawExposure = false;
+        foreach (var window in _windows.Enumerate())
+        {
+            if (window.ProcessId != _owned.Identity.Pid
+                || !ManagedEtabsWindowExposure.IsMaterial(window, desktop))
             {
-                return;
+                continue;
             }
 
-            // A pid is only provably ours while the authoritative handle keeps it from
-            // being recycled. After exit it is somebody else's pid in waiting, so the
-            // observer stops for good rather than reading it.
-            if (_owned.HasExited)
-            {
-                _terminated = true;
-                _state = ManagedEtabsVisibilityState.Retired;
-                return;
-            }
+            sawExposure = true;
+            RecordExposureLocked(window);
+        }
 
-            // Exposure only counts once the consent interval has closed. Visibility during
-            // StartingVisibleByConsent is exactly what the engineer agreed to.
-            if (_state != ManagedEtabsVisibilityState.BackgroundHidden)
-            {
-                return;
-            }
-
-            var desktop = _desktop.Bounds;
-            foreach (var window in _windows.Enumerate())
-            {
-                if (window.ProcessId != _owned.Identity.Pid)
-                {
-                    continue;
-                }
-
-                if (!ManagedEtabsWindowExposure.IsMaterial(window, desktop))
-                {
-                    continue;
-                }
-
-                RecordExposure(window);
-            }
+        if (sawExposure)
+        {
+            var now = ObservationDurationMs();
+            _openRunStartMs ??= now;
+            _openRunLastMs = now;
+        }
+        else
+        {
+            CloseOpenRunLocked();
         }
     }
 
     /// <summary>Accumulates the sticky evidence. Callers hold the gate.</summary>
-    private void RecordExposure(TopLevelWindow window)
+    private void RecordExposureLocked(TopLevelWindow window)
     {
         var observation = new ManagedEtabsExposureObservation(
             window.Handle,
             window.Bounds,
-            (long)_policy.Clock.ElapsedSince(_protectedFrom).TotalMilliseconds);
+            ObservationDurationMs(),
+            _stage);
 
         _exposureObservations++;
         _lastExposure = observation;
@@ -560,21 +675,41 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
         }
     }
 
+    /// <summary>
+    /// Ends a contiguous visible stretch and folds it into the totals. Nothing here ever
+    /// clears <c>_exposureObserved</c>: a stretch ending is not the exposure un-happening.
+    /// </summary>
+    private void CloseOpenRunLocked()
+    {
+        if (_openRunStartMs is not { } start)
+        {
+            return;
+        }
+
+        var duration = _openRunLastMs - start;
+        _totalVisibleMs += duration;
+        _maxContiguousVisibleMs = Math.Max(_maxContiguousVisibleMs, duration);
+        _openRunStartMs = null;
+    }
+
+    private long ObservationDurationMs() => _protectedFromSet
+        ? (long)_policy.Clock.ElapsedSince(_protectedFrom).TotalMilliseconds
+        : 0;
+
     /// <inheritdoc />
-    public void EnterBackgroundHidden()
+    public void BeginExplicitReveal()
     {
         lock (_gate)
         {
-            // Only ever from the consented startup. A session the engineer has explicitly
-            // been shown must never be walked back into a hidden state by later background
-            // work, so UserVisible is deliberately absorbing.
-            if (_state != ManagedEtabsVisibilityState.StartingVisibleByConsent)
+            if (_observerRetired || _state == ManagedEtabsVisibilityState.UserVisible)
             {
                 return;
             }
 
-            _state = ManagedEtabsVisibilityState.BackgroundHidden;
-            _protectedFrom = _policy.Clock.Timestamp;
+            // The observer stays alive. Only accumulation stops, because a window appearing
+            // from here on is the thing that was asked for.
+            CloseOpenRunLocked();
+            _state = ManagedEtabsVisibilityState.RevealPending;
         }
     }
 
@@ -583,24 +718,38 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
     {
         lock (_gate)
         {
-            if (_terminated)
+            if (_state == ManagedEtabsVisibilityState.Retired)
             {
                 return;
             }
 
             _state = ManagedEtabsVisibilityState.UserVisible;
+            _observerRetired = true;
+            CloseOpenRunLocked();
         }
+
+        // Nothing left to protect: the engineer is looking at ETABS on purpose.
+        DisposeMonitorOnce();
     }
 
     /// <inheritdoc />
     public ManagedEtabsWindowConfirmation ConfirmSuppressed() => Confirm(
         wantVisible: false,
+        closeConsentInterval: false,
+        ManagedEtabsWindowErrorCodes.SuppressionNotConfirmed,
+        "an owned ETABS top-level window is still materially on screen");
+
+    /// <inheritdoc />
+    public ManagedEtabsWindowConfirmation ConfirmSuppressedAndCloseConsentInterval() => Confirm(
+        wantVisible: false,
+        closeConsentInterval: true,
         ManagedEtabsWindowErrorCodes.SuppressionNotConfirmed,
         "an owned ETABS top-level window is still materially on screen");
 
     /// <inheritdoc />
     public ManagedEtabsWindowConfirmation ConfirmRevealed() => Confirm(
         wantVisible: true,
+        closeConsentInterval: false,
         ManagedEtabsWindowErrorCodes.RevealNotConfirmed,
         "no owned ETABS top-level window became materially visible");
 
@@ -612,9 +761,15 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
     /// has finished, so an immediate re-read proves nothing either way. Each iteration also
     /// takes an observation pass, so evidence keeps accumulating while we wait — and if the
     /// wait fails, the offending handles are named in the diagnostic.</para>
+    ///
+    /// <para>When <paramref name="closeConsentInterval"/> is set, the census that confirms
+    /// and the state transition it justifies happen in the SAME lock acquisition. That is
+    /// the whole point: between a separate confirm and a separate transition, a WinEvent
+    /// could fire and be judged against the state the transition was about to leave.</para>
     /// </summary>
     private ManagedEtabsWindowConfirmation Confirm(
         bool wantVisible,
+        bool closeConsentInterval,
         string errorCode,
         string summary)
     {
@@ -636,14 +791,25 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
                         "the owned ETABS process exited before its window state could be confirmed")));
             }
 
-            SafeObserve();
-
             List<nint> visible;
+            var latched = false;
             try
             {
                 lock (_gate)
                 {
-                    visible = OwnedMaterialHandles();
+                    // Observe and decide under ONE lock, so nothing can slip between them.
+                    ObserveLocked();
+                    visible = OwnedMaterialHandlesLocked();
+
+                    if (closeConsentInterval
+                        && visible.Count == 0
+                        && _state == ManagedEtabsVisibilityState.StartingVisibleByConsent)
+                    {
+                        _state = ManagedEtabsVisibilityState.BackgroundHidden;
+                        _protectedFrom = _policy.Clock.Timestamp;
+                        _protectedFromSet = true;
+                        latched = true;
+                    }
                 }
             }
             catch (Exception exception)
@@ -663,6 +829,14 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
             var waited = _policy.Clock.ElapsedSince(started);
             if (visible.Count > 0 == wantVisible)
             {
+                return new(Confirmed: true, observations, waited, visible, Diagnostic: null);
+            }
+
+            if (latched)
+            {
+                // Unreachable in practice — latching requires an empty census, which is a
+                // confirmed suppression — but stated so the transition can never outlive a
+                // failed confirmation if this loop is ever restructured.
                 return new(Confirmed: true, observations, waited, visible, Diagnostic: null);
             }
 
@@ -692,7 +866,7 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
     /// The exact-owned census: the handles of top-level windows that belong to the
     /// proven-owned process AND are MATERIALLY on screen. Callers hold the gate.
     /// </summary>
-    private List<nint> OwnedMaterialHandles()
+    private List<nint> OwnedMaterialHandlesLocked()
     {
         var desktop = _desktop.Bounds;
         return
@@ -704,28 +878,38 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
         ];
     }
 
-    /// <inheritdoc />
-    public void ReleaseForExplicitUserAction() => Terminate();
-
-    /// <summary>Deterministic teardown. Restores nothing; there is nothing to restore.</summary>
-    public void Dispose() => Terminate();
-
-    private void Terminate()
+    /// <summary>
+    /// Deterministic teardown. Restores nothing; there is nothing to restore.
+    ///
+    /// <para>Disposal is idempotent INDEPENDENTLY of the logical state. An owned process
+    /// that exits retires the observer from inside an observation pass; if that also
+    /// short-circuited disposal, the hook and its pump would outlive the session — which is
+    /// precisely the teardown contract the monitor was repaired for.</para>
+    /// </summary>
+    public void Dispose()
     {
         lock (_gate)
         {
-            if (_terminated)
+            _observerRetired = true;
+            _state = ManagedEtabsVisibilityState.Retired;
+            CloseOpenRunLocked();
+        }
+
+        DisposeMonitorOnce();
+    }
+
+    private void DisposeMonitorOnce()
+    {
+        lock (_gate)
+        {
+            if (_monitorDisposed)
             {
-                // Already latched. A second call — reveal then shutdown, or two shutdown
-                // paths — must never re-arm anything.
                 return;
             }
 
-            _terminated = true;
+            _monitorDisposed = true;
         }
 
-        // Delivery stops with the interval, so no in-flight event can record an exposure
-        // against a session that is no longer protected, and no thread outlives it.
         _monitor?.Dispose();
     }
 

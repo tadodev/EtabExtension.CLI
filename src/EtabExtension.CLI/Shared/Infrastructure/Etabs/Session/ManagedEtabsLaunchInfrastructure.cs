@@ -444,18 +444,24 @@ public interface IManagedEtabsApplication
     /// </summary>
     ManagedEtabsExposureEvidence Exposure { get; }
 
-    /// <summary>
-    /// Closes the startup-consent interval, immediately after the first confirmed hidden
-    /// census. From this instant, material exposure is unconsented and recorded stickily.
-    /// </summary>
-    void EnterBackgroundHidden();
+    /// <summary>Marks an explicit reveal as in flight, before the CSI call is issued.</summary>
+    void BeginExplicitReveal();
 
     /// <summary>Records that the engineer has been shown ETABS deliberately.</summary>
     void EnterUserVisible();
 
+    /// <summary>Labels what the session is doing, for CLI #24's exposure evidence.</summary>
+    void MarkVisibilityStage(string stage);
+
     /// <summary>
-    /// THE background-readiness gate: proves from the exact-owned Windows census that no
-    /// owned top-level window is materially on screen.
+    /// The FIRST background-readiness gate: proves from the exact-owned Windows census
+    /// that no owned top-level window is materially on screen, and closes the
+    /// startup-consent interval in the same instant.
+    /// </summary>
+    ManagedEtabsWindowConfirmation ConfirmWindowsSuppressedAndCloseConsentInterval();
+
+    /// <summary>
+    /// The RE-check, after the consent interval has already closed. Changes no state.
     ///
     /// <para>This replaced <c>cOAPI.Visible()</c> as the acceptance authority after #20
     /// measured that flag staying true through 94 reads while the real windows were
@@ -532,14 +538,21 @@ public sealed class ManagedEtabsApplication(
     public ManagedEtabsExposureEvidence Exposure => windowGuard.Exposure;
 
     /// <inheritdoc />
-    public void EnterBackgroundHidden() => windowGuard.EnterBackgroundHidden();
+    public void BeginExplicitReveal() => windowGuard.BeginExplicitReveal();
 
     /// <inheritdoc />
     public void EnterUserVisible() => windowGuard.EnterUserVisible();
 
     /// <inheritdoc />
+    public void MarkVisibilityStage(string stage) => windowGuard.MarkStage(stage);
+
+    /// <inheritdoc />
     public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressed() =>
         windowGuard.ConfirmSuppressed();
+
+    /// <inheritdoc />
+    public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressedAndCloseConsentInterval() =>
+        windowGuard.ConfirmSuppressedAndCloseConsentInterval();
 
     /// <inheritdoc />
     public ManagedEtabsWindowConfirmation ConfirmWindowsRevealed() =>
@@ -547,7 +560,7 @@ public sealed class ManagedEtabsApplication(
 
     /// <inheritdoc />
     public void ReleaseWindowGuardForExplicitUserAction() =>
-        windowGuard.ReleaseForExplicitUserAction();
+        windowGuard.BeginExplicitReveal();
 
     /// <inheritdoc />
     public void DisposeWindowGuard() => windowGuard.Dispose();

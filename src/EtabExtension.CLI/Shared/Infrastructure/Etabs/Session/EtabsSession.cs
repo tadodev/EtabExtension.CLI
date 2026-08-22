@@ -21,6 +21,17 @@ public interface IEtabsSession : IDisposable
     /// </summary>
     Result RevealForExplicitUserRequest();
 
+    /// <summary>
+    /// CLI #24: fails the CURRENT request if the session was materially on screen during
+    /// background work. Called after every ETABS-backed command and before its response is
+    /// written, because a sticky exposure that only surfaced at session creation would let
+    /// the very request that caused it answer success.
+    /// </summary>
+    Result CertifyNoUnconsentedExposure();
+
+    /// <summary>Labels what the session is doing, for CLI #24's exposure evidence.</summary>
+    void MarkVisibilityStage(string stage);
+
     ManagedEtabsShutdownResult Shutdown();
 }
 
@@ -161,6 +172,7 @@ public sealed class EtabsSession : IEtabsSession
                 // builds the (Untitled) model behind its frame, so this second census is
                 // where a window that surfaced during initialization has to be accounted
                 // for — the guard will already have taken it down on the window event.
+                launched.MarkVisibilityStage("cSapModel.InitializeNewModel");
                 var creationFailure = Initialize(launched)
                     ?? CompleteReadiness(launched)
                     ?? ConfirmHiddenForBackgroundWork(launched);
@@ -210,6 +222,30 @@ public sealed class EtabsSession : IEtabsSession
     }
 
     /// <summary>
+    /// Ends the session because an explicit reveal could not be completed.
+    ///
+    /// <para><b>Why terminal.</b> By this point <c>cOAPI.Unhide()</c> has been issued or
+    /// attempted and the protected interval has already been left, so the session's
+    /// on-screen state is genuinely unknown: ETABS may be visible, may not be, and the
+    /// observer is no longer accumulating evidence for it. Returning a failure while
+    /// keeping the session reusable would leave later background work running against an
+    /// unwatched session that might be sitting in front of the engineer - which is the
+    /// uncertain-session case CLI #24 exists to refuse.</para>
+    /// </summary>
+    private Result FailRevealTerminally(IManagedEtabsApplication owned, string diagnostic)
+    {
+        var cleanup = _shutdownMachine.Shutdown(owned);
+        _shutdownResult = cleanup;
+        if (cleanup.Data.ProcessExitConfirmed)
+        {
+            _owned = null;
+        }
+
+        _ready = false;
+        return Result.Fail(WithTerminalFacts(diagnostic, cleanup));
+    }
+
+    /// <summary>
     /// Refuses a cold start that nobody declared an intent for.
     ///
     /// <para>Fails BEFORE <c>cHelper.CreateObject</c>, which is the only useful place: once
@@ -230,7 +266,14 @@ public sealed class EtabsSession : IEtabsSession
             return;
         }
 
-        _launchFailure = new EtabsLaunchException(
+        // Thrown WITHOUT populating _launchFailure. That latch is for failures which
+        // leave the world in a state this session can no longer reason about - a started
+        // process it could not resolve, a recovery record it could not write. A refusal is
+        // the opposite: nothing happened at all, and the very next request may legitimately
+        // arrive with consent after the desktop has prompted. Caching it here would make
+        // the intended flow - request, refusal, prompt, retry - impossible without
+        // restarting the daemon.
+        throw new EtabsLaunchException(
             EtabsLaunchErrorCodes.VisibleStartConsentMissing,
             EtabsApiDiagnosticFormatter.Bounded(string.Join(
                 "; ",
@@ -238,8 +281,8 @@ public sealed class EtabsSession : IEtabsSession
                 $"expected={ManagedEtabsStartIntents.VisibleByConsent}",
                 "starting ETABS puts it on screen for several seconds and that cannot be " +
                 "prevented on this ETABS build, so a cold start requires the caller to " +
-                "declare that the engineer was told and agreed. No process was created.")));
-        throw _launchFailure;
+                "declare that the engineer was told and agreed. No process was created, " +
+                "and this refusal does not persist: retry with the intent declared.")));
     }
 
     /// <summary>
@@ -401,6 +444,75 @@ public sealed class EtabsSession : IEtabsSession
     }
 
     /// <inheritdoc />
+    public void MarkVisibilityStage(string stage)
+    {
+        lock (_gate)
+        {
+            if (_owned is not null && _ready)
+            {
+                _owned.MarkVisibilityStage(stage);
+            }
+        }
+    }
+
+    /// <summary>
+    /// CLI #24's per-request certification. A background command that put ETABS on screen
+    /// must not be able to return success just because ETABS hid itself again before the
+    /// response was written.
+    ///
+    /// <para>The readiness gate cannot cover this: it runs once, while the session is being
+    /// created. Everything after that - every export, every extraction - runs against an
+    /// already-ready session, and without this the daemon would observe the exposure,
+    /// record it faithfully, and still answer <c>success:true</c> to the very request that
+    /// caused it.</para>
+    ///
+    /// <para>The session is then TERMINATED rather than left running. The evidence is
+    /// sticky by design, so every later request would fail this same check anyway; ending
+    /// it cleanly turns a permanently-failing zombie into a fresh start that will ask the
+    /// engineer for consent again.</para>
+    /// </summary>
+    public Result CertifyNoUnconsentedExposure()
+    {
+        lock (_gate)
+        {
+            if (_owned is null || !_ready)
+            {
+                return Result.Ok();
+            }
+
+            // Visibility the engineer asked for, or is in the act of asking for, is not a
+            // breach. Only the protected background interval is certified.
+            if (_owned.VisibilityState != ManagedEtabsVisibilityState.BackgroundHidden)
+            {
+                return Result.Ok();
+            }
+
+            var exposure = _owned.Exposure;
+            if (!exposure.Observed)
+            {
+                return Result.Ok();
+            }
+
+            var owned = _owned;
+            var cleanup = _shutdownMachine.Shutdown(owned);
+            _shutdownResult = cleanup;
+            if (cleanup.Data.ProcessExitConfirmed)
+            {
+                _owned = null;
+            }
+
+            _ready = false;
+            return Result.Fail(WithTerminalFacts(
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    exposure.Describe(),
+                    "the managed ETABS session was materially on screen during background " +
+                    "work the engineer did not ask to see; this request is failed and the " +
+                    "session has been ended"),
+                cleanup));
+        }
+    }
+
+    /// <inheritdoc />
     public Result RevealForExplicitUserRequest()
     {
         lock (_gate)
@@ -427,9 +539,11 @@ public sealed class EtabsSession : IEtabsSession
             var csi = owned.ApplyCsiUnhideForExplicitUserAction();
             if (!csi.Issued)
             {
-                return Result.Fail(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
-                    csi.Diagnostic ?? "cOAPI.Unhide could not be issued.",
-                    "csiTransitionIssued=false"));
+                return FailRevealTerminally(
+                    owned,
+                    EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        csi.Diagnostic ?? "cOAPI.Unhide could not be issued.",
+                        "csiTransitionIssued=false"));
             }
 
             // THE gate: Windows itself must report an owned top-level ETABS window
@@ -438,10 +552,12 @@ public sealed class EtabsSession : IEtabsSession
             var windows = owned.ConfirmWindowsRevealed();
             if (!windows.Confirmed)
             {
-                return Result.Fail(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
-                    windows.Diagnostic
-                        ?? "No owned ETABS window could be confirmed visible.",
-                    $"csiReturnCode={csi.ReturnCode}; csiConfirmed={csi.Confirmed}"));
+                return FailRevealTerminally(
+                    owned,
+                    EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        windows.Diagnostic
+                            ?? "No owned ETABS window could be confirmed visible.",
+                        $"csiReturnCode={csi.ReturnCode}; csiConfirmed={csi.Confirmed}"));
             }
 
             // Only now is the session UserVisible. Later background work reuses it as-is

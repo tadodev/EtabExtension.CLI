@@ -153,10 +153,10 @@ public sealed class ManagedEtabsWindowGuardTests
     [Fact]
     public void AnExitedOwnedProcessRetiresTheObserverInsteadOfReadingItsPid()
     {
-        var windows = new FakeWindows(
-            new TopLevelWindow((nint)0x20, Owned.Pid, true, FullScreen));
+        var windows = new FakeWindows();
         using var guard = Guard(windows, out var owned, out _);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+        windows.Surface((nint)0x20, Owned.Pid, FullScreen);
 
         owned.Exit();
         guard.ObserveOnce();
@@ -298,7 +298,7 @@ public sealed class ManagedEtabsWindowGuardTests
         using var guard = Guard(windows, out _, out _);
 
         // t0: the consent interval closes.
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
         Assert.False(guard.Exposure.Observed);
 
         // t1: an owned window is materially on screen.
@@ -347,7 +347,7 @@ public sealed class ManagedEtabsWindowGuardTests
     {
         var windows = new FakeWindows();
         using var guard = Guard(windows, out _, out _);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
 
         windows.Surface((nint)0x42, Owned.Pid, OffScreen);
         guard.ObserveOnce();
@@ -362,7 +362,7 @@ public sealed class ManagedEtabsWindowGuardTests
     {
         var windows = new FakeWindows();
         using var guard = Guard(windows, out _, out var clock);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
 
         windows.Surface((nint)0x43, Owned.Pid, FullScreen);
         guard.ObserveOnce();
@@ -387,7 +387,7 @@ public sealed class ManagedEtabsWindowGuardTests
     {
         var windows = new FakeWindows();
         using var guard = Guard(windows, out _, out _);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
 
         windows.Surface((nint)0x44, ForeignPid, FullScreen);
         guard.ObserveOnce();
@@ -418,10 +418,10 @@ public sealed class ManagedEtabsWindowGuardTests
     public void AUserVisibleSessionCannotBeWalkedBackIntoBackgroundHidden()
     {
         using var guard = Guard(new FakeWindows(), out _, out _);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
         guard.EnterUserVisible();
 
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
 
         Assert.Equal(ManagedEtabsVisibilityState.UserVisible, guard.State);
     }
@@ -435,7 +435,7 @@ public sealed class ManagedEtabsWindowGuardTests
     {
         var windows = new FakeWindows();
         using var guard = Guard(windows, out _, out _);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
         guard.EnterUserVisible();
 
         windows.Surface((nint)0x50, Owned.Pid, FullScreen);
@@ -467,7 +467,7 @@ public sealed class ManagedEtabsWindowGuardTests
     {
         var windows = new FakeWindows();
         using var guard = Guard(windows, out _, out _, out var monitor);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
 
         windows.Surface((nint)0x60, Owned.Pid, FullScreen);
         monitor.RaiseSurfaced();
@@ -483,7 +483,7 @@ public sealed class ManagedEtabsWindowGuardTests
     {
         var windows = new FakeWindows();
         using var guard = Guard(windows, out _, out _, out var monitor);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
 
         windows.Surface((nint)0x61, Owned.Pid, FullScreen);
         monitor.RaiseBackstopTick();
@@ -502,7 +502,7 @@ public sealed class ManagedEtabsWindowGuardTests
     {
         var windows = new FakeWindows();
         using var guard = Guard(windows, out _, out _);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
 
         windows.Surface((nint)0x70, Owned.Pid, new WindowBounds(413, 206, 1507, 825));
         guard.ObserveOnce();
@@ -519,10 +519,14 @@ public sealed class ManagedEtabsWindowGuardTests
     [Fact]
     public void AnObservationFailureIsRecordedAndReportedRatherThanThrownOrIgnored()
     {
-        var windows = new FakeWindows { EnumerateException = new InvalidOperationException("boom") };
+        var windows = new FakeWindows();
         using var guard = Guard(windows, out _, out _, out var monitor);
-        guard.EnterBackgroundHidden();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
 
+        // The window station starts failing only once the session is under observation,
+        // which is the case that matters: a transient failure DURING protected background
+        // work must be recorded, not swallowed.
+        windows.EnumerateException = new InvalidOperationException("boom");
         monitor.RaiseBackstopTick();
 
         Assert.NotNull(guard.LastSweepError);
@@ -537,22 +541,53 @@ public sealed class ManagedEtabsWindowGuardTests
 
     // ── The latch ────────────────────────────────────────────────────────────
 
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void TerminatingTheObserverDisposesTheSubscription(bool forUser)
+    /// <summary>
+    /// Disposal tears the subscription down deterministically.
+    /// </summary>
+    [Fact]
+    public void DisposingTheObserverDisposesTheSubscription()
     {
         var guard = Guard(new FakeWindows(), out _, out _, out var monitor);
 
-        if (forUser)
-        {
-            guard.ReleaseForExplicitUserAction();
-        }
-        else
-        {
-            guard.Dispose();
-        }
+        guard.Dispose();
 
+        Assert.Equal(1, monitor.DisposeCalls);
+        Assert.False(guard.IsActive);
+    }
+
+    /// <summary>
+    /// But BEGINNING a reveal must NOT. The observer has to survive the CSI call, because
+    /// a reveal that fails leaves the session in an unknown on-screen state — and the
+    /// previous shape retired the observer first, so a failed reveal produced a still-ready
+    /// session with nothing watching it at all.
+    /// </summary>
+    [Fact]
+    public void BeginningARevealKeepsTheSubscriptionAlive()
+    {
+        var guard = Guard(new FakeWindows(), out _, out _, out var monitor);
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+
+        guard.BeginExplicitReveal();
+
+        Assert.Equal(0, monitor.DisposeCalls);
+        Assert.True(guard.IsActive);
+        Assert.Equal(ManagedEtabsVisibilityState.RevealPending, guard.State);
+    }
+
+    /// <summary>
+    /// And a CONFIRMED reveal is what finally retires it: the engineer is looking at ETABS
+    /// deliberately, so there is nothing left to protect.
+    /// </summary>
+    [Fact]
+    public void AConfirmedRevealRetiresTheObserverAndDisposesTheSubscription()
+    {
+        var guard = Guard(new FakeWindows(), out _, out _, out var monitor);
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+        guard.BeginExplicitReveal();
+
+        guard.EnterUserVisible();
+
+        Assert.Equal(ManagedEtabsVisibilityState.UserVisible, guard.State);
         Assert.Equal(1, monitor.DisposeCalls);
         Assert.False(guard.IsActive);
     }
@@ -566,7 +601,7 @@ public sealed class ManagedEtabsWindowGuardTests
     {
         var guard = Guard(new FakeWindows(), out _, out _, out var monitor);
 
-        guard.ReleaseForExplicitUserAction();
+        guard.BeginExplicitReveal();
         guard.Dispose();
 
         Assert.Equal(1, monitor.DisposeCalls);
@@ -582,8 +617,8 @@ public sealed class ManagedEtabsWindowGuardTests
     {
         var windows = new FakeWindows();
         var guard = Guard(windows, out _, out _);
-        guard.EnterBackgroundHidden();
-        guard.ReleaseForExplicitUserAction();
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+        guard.BeginExplicitReveal();
 
         windows.Surface((nint)0x80, Owned.Pid, FullScreen);
         guard.ObserveOnce();
@@ -615,6 +650,178 @@ public sealed class ManagedEtabsWindowGuardTests
 
         Assert.Equal(owned.Identity, guard.Identity);
         Assert.Equal(Owned, guard.Identity);
+    }
+
+
+    // ── Repairs found in exact-head review ───────────────────────────────────
+
+    /// <summary>
+    /// DEFECT 2. The complete production reveal sequence, against a REAL guard.
+    ///
+    /// <para>The session drives retire → CSI Unhide → Windows confirm → EnterUserVisible.
+    /// The previous shape made the first step set the same flag the last step checked, so
+    /// <c>EnterUserVisible</c> returned immediately and a successful reveal could never
+    /// actually reach <c>UserVisible</c>. Every session-level test missed it, because the
+    /// fake application simply assigned the state.</para>
+    /// </summary>
+    [Fact]
+    public void TheFullProductionRevealSequenceReachesUserVisibleOnARealGuard()
+    {
+        var windows = new FakeWindows();
+        var guard = Guard(windows, out _, out _);
+        Assert.True(guard.ConfirmSuppressedAndCloseConsentInterval().Confirmed);
+
+        // 1. the observer stops accumulating, but stays alive
+        guard.BeginExplicitReveal();
+
+        // 2. CSI puts the window back (modelled: ETABS shows it)
+        windows.Surface((nint)0x90, Owned.Pid, FullScreen);
+
+        // 3. Windows certifies
+        Assert.True(guard.ConfirmRevealed().Confirmed);
+
+        // 4. and only now is the session UserVisible
+        guard.EnterUserVisible();
+
+        Assert.Equal(ManagedEtabsVisibilityState.UserVisible, guard.State);
+        Assert.False(guard.Exposure.Observed);
+    }
+
+    /// <summary>
+    /// DEFECT 4, structurally. The consent interval can ONLY be closed by the census that
+    /// justifies it — there is no separate member to call, so the gap in which a WinEvent
+    /// could be judged against the state we were about to leave cannot be reintroduced by
+    /// re-ordering two calls.
+    /// </summary>
+    [Fact]
+    public void TheConsentIntervalCannotBeClosedSeparatelyFromTheCensusThatJustifiesIt()
+    {
+        var members = typeof(IManagedEtabsWindowGuard)
+            .GetMembers(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .Select(member => member.Name)
+            .ToArray();
+
+        Assert.DoesNotContain("EnterBackgroundHidden", members);
+        Assert.Contains(
+            nameof(IManagedEtabsWindowGuard.ConfirmSuppressedAndCloseConsentInterval),
+            members);
+    }
+
+    /// <summary>
+    /// DEFECT 4, behaviourally. The transition is already in force the instant the
+    /// confirmation returns — the caller never has to make a second call, so there is no
+    /// window between them for an exposure to be discarded in.
+    /// </summary>
+    [Fact]
+    public void TheConsentIntervalIsAlreadyClosedWhenTheConfirmationReturns()
+    {
+        var windows = new FakeWindows();
+        using var guard = Guard(windows, out _, out _);
+
+        var confirmation = guard.ConfirmSuppressedAndCloseConsentInterval();
+
+        Assert.True(confirmation.Confirmed);
+        Assert.Equal(ManagedEtabsVisibilityState.BackgroundHidden, guard.State);
+
+        // An exposure landing immediately afterwards is therefore already accumulating.
+        windows.Surface((nint)0x91, Owned.Pid, FullScreen);
+        guard.ObserveOnce();
+        Assert.True(guard.Exposure.Observed);
+    }
+
+    /// <summary>A census that never goes clean does not close the interval either.</summary>
+    [Fact]
+    public void AFailedConfirmationLeavesTheConsentIntervalOpen()
+    {
+        var windows = new FakeWindows(
+            new TopLevelWindow((nint)0x92, Owned.Pid, true, FullScreen));
+        using var guard = Guard(windows, out _, out _);
+
+        Assert.False(guard.ConfirmSuppressedAndCloseConsentInterval().Confirmed);
+        Assert.Equal(ManagedEtabsVisibilityState.StartingVisibleByConsent, guard.State);
+    }
+
+    /// <summary>
+    /// DEFECT 6. An owned process that exits retires the observer from inside an
+    /// observation pass. Disposal is owed regardless, and exactly once.
+    ///
+    /// <para>The previous shape shared one flag between "logically retired" and "monitor
+    /// disposed", so the exit swallowed the disposal and the hook and its pump outlived the
+    /// session — defeating the deterministic teardown contract the monitor was repaired
+    /// for.</para>
+    /// </summary>
+    [Fact]
+    public void AProcessExitStillLeavesTheSubscriptionOwedAndDisposedExactlyOnce()
+    {
+        var windows = new FakeWindows();
+        var guard = Guard(windows, out var owned, out _, out var monitor);
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+
+        owned.Exit();
+        guard.ObserveOnce();
+        Assert.False(guard.IsActive);
+        Assert.Equal(0, monitor.DisposeCalls);
+
+        guard.Dispose();
+        Assert.Equal(1, monitor.DisposeCalls);
+
+        // And a second disposal is still exactly once.
+        guard.Dispose();
+        Assert.Equal(1, monitor.DisposeCalls);
+    }
+
+    /// <summary>
+    /// The #24 bounded metrics: a stretch that ends is folded into the totals, and a run
+    /// still open when the evidence is read is counted without being closed by the read.
+    /// </summary>
+    [Fact]
+    public void TheEvidenceMeasuresTotalAndLongestContiguousExposure()
+    {
+        var windows = new FakeWindows();
+        using var guard = Guard(windows, out _, out var clock);
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+
+        // a 100 ms stretch
+        windows.Surface((nint)0xA0, Owned.Pid, FullScreen);
+        guard.ObserveOnce();
+        clock.Wait(TimeSpan.FromMilliseconds(100));
+        guard.ObserveOnce();
+
+        // then it goes away
+        windows.SetVisible((nint)0xA0, visible: false);
+        clock.Wait(TimeSpan.FromMilliseconds(50));
+        guard.ObserveOnce();
+
+        // then a longer 300 ms stretch
+        windows.SetVisible((nint)0xA0, visible: true);
+        guard.ObserveOnce();
+        clock.Wait(TimeSpan.FromMilliseconds(300));
+        guard.ObserveOnce();
+
+        var evidence = guard.Exposure;
+        Assert.True(evidence.Observed);
+        Assert.Equal(400, evidence.ObservedTotalVisibleMs);
+        Assert.Equal(300, evidence.ObservedMaxContiguousVisibleMs);
+        Assert.Equal(450, evidence.ObservationDurationMs);
+    }
+
+    /// <summary>An observation carries the stage it happened in, not only a timestamp.</summary>
+    [Fact]
+    public void AnExposureRecordsWhichStageItHappenedIn()
+    {
+        var windows = new FakeWindows();
+        using var guard = Guard(windows, out _, out _);
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+        guard.MarkStage("snapshot-export");
+
+        windows.Surface((nint)0xA1, Owned.Pid, FullScreen);
+        guard.ObserveOnce();
+
+        Assert.Equal("snapshot-export", guard.Exposure.First!.Value.Stage);
+        Assert.Contains(
+            "firstStage=snapshot-export",
+            guard.Exposure.Describe(),
+            StringComparison.Ordinal);
     }
 
     // ── The real Win32 subscription ──────────────────────────────────────────
@@ -1409,7 +1616,7 @@ public sealed class ManagedEtabsWindowGuardTests
         /// </summary>
         public int GoesHiddenAfterEnumerations { get; init; }
 
-        public Exception? EnumerateException { get; init; }
+        public Exception? EnumerateException { get; set; }
 
         public int Enumerations => _enumerations;
 

@@ -124,6 +124,16 @@ public sealed class ServeDispatcher : IServeDispatcher
         JsonElement? request,
         CancellationToken ct)
     {
+        // Label the interval for CLI #24 evidence, so an exposure observation says which
+        // command was running and not only how many milliseconds in it happened.
+        //
+        // Recorded here but APPLIED on the COM worker below. The protocol thread must never
+        // touch the session: while an async operation is running the worker holds the
+        // session lock for the whole operation, and a protocol thread that blocked on it
+        // would stop answering get-operation-status - which is the one thing that must keep
+        // working during a long run.
+        _dispatchingCommand = command;
+
         return _handlers.TryGetValue(command, out var handler)
             ? handler(request, ct)
             : Task.FromResult<object>(Result.Fail(
@@ -414,11 +424,37 @@ public sealed class ServeDispatcher : IServeDispatcher
     private static JsonElement RequirePayload(JsonElement? request) => request
         ?? throw new InvalidOperationException("Missing 'request' payload for this command");
 
+    /// <summary>
+    /// The command currently being dispatched, for CLI #24 stage labelling only.
+    ///
+    /// <para>Written on the protocol thread and read on the COM worker without a lock,
+    /// which is safe because the serve loop dispatches strictly one request at a time. It
+    /// is evidence LABELLING: a stale value could at worst mis-name a stage in a
+    /// diagnostic, and can never change a decision.</para>
+    /// </summary>
+    private volatile string _dispatchingCommand = "unknown";
+
+    /// <summary>
+    /// Every ETABS-backed command runs through here, which makes it the one place a
+    /// CLI #24 certification can cover them all.
+    ///
+    /// <para>The check runs AFTER the work and BEFORE the response leaves: a background
+    /// command that put ETABS on screen must not answer success just because ETABS hid
+    /// itself again first. A failed certification replaces the result outright rather than
+    /// annotating it - a partially-successful export whose session breached the visibility
+    /// contract is not a success the desktop should act on.</para>
+    /// </summary>
     private Task<object> ExecuteComAsync(Func<Task<object>> action) =>
         _operations.HasActiveOperation
             ? Task.FromResult<object>(Result.Fail(
                 "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"))
-            : _operations.ExecuteSynchronousAsync(action);
+            : _operations.ExecuteSynchronousAsync(async () =>
+            {
+                _session.MarkVisibilityStage(_dispatchingCommand);
+                var result = await action();
+                var certified = _session.CertifyNoUnconsentedExposure();
+                return certified.Success ? result : certified;
+            });
 
     private Result<GetStatusData> ReadActiveStatus()
     {

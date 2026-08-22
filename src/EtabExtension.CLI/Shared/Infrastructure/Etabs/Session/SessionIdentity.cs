@@ -518,6 +518,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             // Then, and only then, hold that exact process's windows down — before the
             // blocking startup work the #20 live run measured a visible window through.
             windowGuard = ActivateWindowGuard(ownedProcess);
+            windowGuard.MarkStage("cOAPI.ApplicationStart");
 
             // ApplicationStart() returning is the ONE proven readiness boundary on this
             // API path. Diagnostic #3 measured cOAPI.Hide() throwing a
@@ -530,10 +531,11 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             // CSI mutates. Unconditionally, exactly once, and a throw is fatal.
             AskCsiToHide(rawApi);
 
-            // Windows certifies. Confirming this for the first time is what ENDS the
-            // startup-consent interval: from here, any material exposure is unconsented.
+            // Windows certifies AND the startup-consent interval closes, in one
+            // indivisible step. Splitting them left a gap in which a WinEvent could fire,
+            // be judged against the still-consented state, and be discarded as expected
+            // startup visibility - which is the exposure CLI #24 exists to catch.
             RequireWindowsSuppressed(windowGuard, "after cOAPI.ApplicationStart");
-            windowGuard.EnterBackgroundHidden();
 
             RequireSapModel(rawApi);
 
@@ -691,7 +693,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     /// </summary>
     private void RequireWindowsSuppressed(IManagedEtabsWindowGuard guard, string stage)
     {
-        var confirmation = guard.ConfirmSuppressed();
+        var confirmation = guard.ConfirmSuppressedAndCloseConsentInterval();
         if (!confirmation.Confirmed)
         {
             throw new EtabsLaunchException(

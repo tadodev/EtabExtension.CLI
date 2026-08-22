@@ -225,6 +225,15 @@ public sealed class ServeShutdownCoordinatorTests
         ManagedEtabsShutdownResult terminal,
         List<string> events) : IEtabsSession
     {
+        /// <summary>CLI #24 certification the test can force to fail.</summary>
+        public Result ExposureCertification { get; set; } = Result.Ok();
+
+        public List<string> Stages { get; } = [];
+
+        public Result CertifyNoUnconsentedExposure() => ExposureCertification;
+
+        public void MarkVisibilityStage(string stage) => Stages.Add(stage);
+
         public int ShutdownCount { get; private set; }
         public bool IsStarted => true;
         public int? ProcessId => terminal.Data.OwnedPid;

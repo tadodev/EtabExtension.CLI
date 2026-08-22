@@ -890,11 +890,15 @@ public sealed class ManagedEtabsLauncherTests
 
         public int EnterUserVisibleCalls { get; private set; }
 
-        public void EnterBackgroundHidden()
+        public List<string> Stages { get; } = [];
+
+        public void MarkStage(string stage) => Stages.Add(stage);
+
+        public void BeginExplicitReveal()
         {
-            events.Add("window-guard-enter-background-hidden");
-            EnterBackgroundHiddenCalls++;
-            State = ManagedEtabsVisibilityState.BackgroundHidden;
+            events.Add("window-guard-begin-explicit-reveal");
+            ReleasedForUser = true;
+            State = ManagedEtabsVisibilityState.RevealPending;
         }
 
         public void EnterUserVisible()
@@ -902,6 +906,24 @@ public sealed class ManagedEtabsLauncherTests
             events.Add("window-guard-enter-user-visible");
             EnterUserVisibleCalls++;
             State = ManagedEtabsVisibilityState.UserVisible;
+        }
+
+        /// <summary>
+        /// The atomic first gate. The fake makes the transition INSIDE the confirmation,
+        /// exactly as production does, so a test cannot accidentally pass against a
+        /// two-step sequence the real guard no longer offers.
+        /// </summary>
+        public ManagedEtabsWindowConfirmation ConfirmSuppressedAndCloseConsentInterval()
+        {
+            var confirmation = ConfirmSuppressed();
+            if (confirmation.Confirmed)
+            {
+                events.Add("window-guard-enter-background-hidden");
+                EnterBackgroundHiddenCalls++;
+                State = ManagedEtabsVisibilityState.BackgroundHidden;
+            }
+
+            return confirmation;
         }
 
         public ManagedEtabsWindowConfirmation ConfirmSuppressed()
@@ -925,7 +947,6 @@ public sealed class ManagedEtabsLauncherTests
             return new(true, 1, TimeSpan.Zero, [(nint)1], null);
         }
 
-        public void ReleaseForExplicitUserAction() => ReleasedForUser = true;
 
         public void Dispose() => Disposed = true;
     }
