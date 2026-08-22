@@ -13,6 +13,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.Versioning;
+using System.Security.Cryptography;
 using System.Text.Json;
 using ETABSv1;
 
@@ -27,11 +28,36 @@ internal static class Program
     private static readonly TimeSpan AttachDeadline = TimeSpan.FromSeconds(120);
     private static readonly TimeSpan AttachInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan OwnershipInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan WatchdogJoinDeadline = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan ExitDeadline = TimeSpan.FromSeconds(60);
 
     private static readonly Stopwatch Clock = Stopwatch.StartNew();
+
+    /// <summary>
+    /// The exact process this spike owns. Published ONCE, synchronously, before the
+    /// watchdog starts and before ETABS is resumed — so every later reader, on any
+    /// thread, sees a fully initialised identity. The watchdog OBSERVES this; it never
+    /// initialises it. (Fix 1: the previous shape let the attach loop reach a
+    /// still-zero pid and falsely call the correct process foreign.)
+    /// </summary>
+    private sealed record OwnedIdentity(int Pid, DateTime StartUtc, string ExecutablePath);
+
+    private static OwnedIdentity? _owned;
+
     private static volatile bool _ownershipViolated;
     private static string _ownershipViolation = string.Empty;
+
+    /// <summary>
+    /// Retirement boundary for the observer. Ownership violations are preserved for the
+    /// whole experiment, then the watchdog is stopped and joined BEFORE we intentionally
+    /// make ETABS exit — otherwise the deliberate disappearance of the sole owned process
+    /// would be recorded as a violation and would invalidate a run that actually
+    /// succeeded. (Fix 2.)
+    /// </summary>
+    private static readonly ManualResetEventSlim WatchdogStop = new(false);
+
+    private static Thread? _watchdogThread;
+    private static volatile bool _watchdogRetired;
 
     private static int Main(string[] args)
     {
@@ -39,6 +65,8 @@ internal static class Program
             ?? @"C:\Program Files\Computers and Structures\ETABS 23\ETABS.exe";
         var model = Arg(args, "--model");
         var waitForResume = !args.Contains("--no-handshake", StringComparer.Ordinal);
+
+        EmitRuntimeIdentity();
 
         Emit("spike-start", new
         {
@@ -48,9 +76,27 @@ internal static class Program
             note = "throwaway process-control spike; no window is ever manipulated"
         });
 
+        // Fix 3: the model-open proof is part of the strong-positive predicate, so a run
+        // without a model cannot produce the result we agreed to measure.
+        if (string.IsNullOrWhiteSpace(model))
+        {
+            Emit("fail-closed", new
+            {
+                stage = "arguments",
+                reason = "--model is required; the sanctioned run must prove an exact model open"
+            });
+            return 8;
+        }
+
         if (!File.Exists(etabs))
         {
             Emit("fail-closed", new { stage = "preflight", reason = $"ETABS not found at '{etabs}'" });
+            return 2;
+        }
+
+        if (!File.Exists(model))
+        {
+            Emit("fail-closed", new { stage = "preflight", reason = $"model not found at '{model}'" });
             return 2;
         }
 
@@ -77,17 +123,24 @@ internal static class Program
             owned = NativeProcessLaunch.CreateSuspendedHidden(etabs);
 
             // Identity is captured while the process is still frozen, so the triple is
-            // established before ETABS can have done anything at all.
+            // established before ETABS can have done anything at all, and it is PUBLISHED
+            // before anything can read it.
             var identity = Process.GetProcessById(owned.ProcessId);
-            var startUtc = identity.StartTime.ToUniversalTime();
+            var published = new OwnedIdentity(
+                owned.ProcessId,
+                identity.StartTime.ToUniversalTime(),
+                etabs);
+            Volatile.Write(ref _owned, published);
+
             Emit("created-suspended", new
             {
-                pid = owned.ProcessId,
+                pid = published.Pid,
                 threadId = owned.ThreadId,
-                startUtc = startUtc.ToString("o", CultureInfo.InvariantCulture),
-                executablePath = etabs,
+                startUtc = published.StartUtc.ToString("o", CultureInfo.InvariantCulture),
+                executablePath = published.ExecutablePath,
                 showWindow = "SW_HIDE via STARTF_USESHOWWINDOW",
-                creationFlags = "CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT"
+                creationFlags = "CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT",
+                identityPublished = true
             });
 
             // ---- handshake: the observer is armed before ETABS runs -----------
@@ -102,17 +155,28 @@ internal static class Program
                 }
             }
 
-            StartOwnershipWatchdog(owned.ProcessId, startUtc);
+            // Identity is already published, so the watchdog starts as a pure observer
+            // and the attach loop cannot race it.
+            StartOwnershipWatchdog();
+
+            if (!RequireOwnership("before-resume"))
+            {
+                return 5;
+            }
 
             // ---- gate 3: first instruction of ETABS ---------------------------
             NativeProcessLaunch.Resume(owned);
-            Emit("resumed", new { pid = owned.ProcessId });
+            Emit("resumed", new { pid = published.Pid });
 
             // ---- gate 4: attach to THAT pid, not "an ETABS" -------------------
-            api = AttachToOwnedProcess(owned.ProcessId);
+            api = AttachToOwnedProcess(published.Pid);
             if (api is null)
             {
-                Emit("fail-closed", new { stage = "attach", reason = _ownershipViolated ? _ownershipViolation : "attach deadline expired" });
+                Emit("fail-closed", new
+                {
+                    stage = "attach",
+                    reason = _ownershipViolated ? _ownershipViolation : "attach deadline expired"
+                });
                 return 4;
             }
 
@@ -127,10 +191,20 @@ internal static class Program
                 return 5;
             }
 
-            // ---- optional: does a real model open work over this attach? ------
-            if (!string.IsNullOrWhiteSpace(model))
+            // ---- gate 5: the model-open proof is HARD -------------------------
+            if (!OpenModelProven(api, model))
             {
-                OpenModel(api, model);
+                Emit("fail-closed", new
+                {
+                    stage = "model-open-proof",
+                    reason = "exact model open was not proven; stopping BEFORE explicit reveal"
+                });
+                return 9;
+            }
+
+            if (!RequireOwnership("after-model-open"))
+            {
+                return 5;
             }
 
             // ---- explicit user intent leg: CSI reveal, never ShowWindow -------
@@ -154,6 +228,63 @@ internal static class Program
             // The spike never leaves ETABS behind, on any path.
             Teardown(api, owned);
         }
+    }
+
+    /// <summary>
+    /// Which code is actually running. This project is framework-dependent, so no single
+    /// EXE hash describes it — the interop assembly that really loads is recorded here,
+    /// by path, version and content hash, and matched against the staged file set before
+    /// the live run.
+    /// </summary>
+    private static void EmitRuntimeIdentity()
+    {
+        var spike = typeof(Program).Assembly;
+        var interop = typeof(cHelper).Assembly;
+
+        Emit("runtime-identity", new
+        {
+            spikeAssembly = Describe(spike),
+            interopAssembly = Describe(interop),
+            processPath = Environment.ProcessPath,
+            runtime = Environment.Version.ToString(),
+            note = "interopAssembly.location settles WHICH ETABSv1 was loaded at run time"
+        });
+    }
+
+    private static object Describe(System.Reflection.Assembly assembly)
+    {
+        var location = assembly.Location;
+        string? fileVersion = null;
+        string? sha256 = null;
+        long? size = null;
+        try
+        {
+            if (!string.IsNullOrEmpty(location) && File.Exists(location))
+            {
+                fileVersion = FileVersionInfo.GetVersionInfo(location).FileVersion;
+                size = new FileInfo(location).Length;
+                sha256 = HashFile(location);
+            }
+        }
+        catch (Exception exception)
+        {
+            fileVersion = $"unreadable: {exception.Message}";
+        }
+
+        return new
+        {
+            fullName = assembly.FullName,
+            location,
+            fileVersion,
+            sizeBytes = size,
+            sha256
+        };
+    }
+
+    private static string HashFile(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(stream));
     }
 
     /// <summary>
@@ -259,30 +390,40 @@ internal static class Program
         });
     }
 
-    private static void OpenModel(cOAPI api, string model)
+    /// <summary>
+    /// The model-open proof, as a hard gate. Returns true ONLY when <c>OpenFile</c>
+    /// returned zero AND the model ETABS reports open is exactly the file requested.
+    /// A logged-but-tolerated failure here would let a broken attach path exit
+    /// successfully, which is the opposite of what this experiment is for.
+    /// </summary>
+    private static bool OpenModelProven(cOAPI api, string model)
     {
-        if (!File.Exists(model))
-        {
-            Emit("model-open-skipped", new { model, reason = "file not found" });
-            return;
-        }
-
         var started = Clock.Elapsed;
         try
         {
             var returnCode = api.SapModel.File.OpenFile(model);
             var openedName = api.SapModel.GetModelFilename(true);
+
+            var exactMatch =
+                !string.IsNullOrWhiteSpace(openedName)
+                && string.Equals(
+                    Path.GetFullPath(openedName),
+                    Path.GetFullPath(model),
+                    StringComparison.OrdinalIgnoreCase);
+
+            var proven = returnCode == 0 && exactMatch;
+
             Emit("model-open", new
             {
                 requested = model,
                 returnCode,
                 openedFilename = openedName,
-                exactMatch = string.Equals(
-                    Path.GetFullPath(openedName ?? string.Empty),
-                    Path.GetFullPath(model),
-                    StringComparison.OrdinalIgnoreCase),
+                exactMatch,
+                proven,
                 elapsedMs = (Clock.Elapsed - started).TotalMilliseconds
             });
+
+            return proven;
         }
         catch (Exception exception)
         {
@@ -292,6 +433,7 @@ internal static class Program
                 exceptionType = exception.GetType().Name,
                 message = exception.Message
             });
+            return false;
         }
     }
 
@@ -325,42 +467,80 @@ internal static class Program
     /// <summary>
     /// Continuous ownership proof. Exactly one ETABS, and it is ours by pid AND by
     /// process start time. Anything else invalidates the experiment rather than being
-    /// worked around.
+    /// worked around. Pure observer: the identity it checks was published synchronously
+    /// before this thread existed.
     /// </summary>
-    private static void StartOwnershipWatchdog(int pid, DateTime startUtc)
+    private static void StartOwnershipWatchdog()
     {
-        var thread = new Thread(() =>
+        var identity = Volatile.Read(ref _owned)
+            ?? throw new InvalidOperationException(
+                "the owned identity must be published before the watchdog starts");
+
+        _watchdogThread = new Thread(() =>
         {
-            while (!_ownershipViolated)
+            while (!WatchdogStop.IsSet && !_ownershipViolated)
             {
-                _ = RequireOwnership("watchdog", pid, startUtc);
-                Thread.Sleep(OwnershipInterval);
+                _ = RequireOwnership("watchdog");
+                _ = WatchdogStop.Wait(OwnershipInterval);
             }
         })
         {
             IsBackground = true,
             Name = "spike-ownership-watchdog"
         };
-        thread.Start();
-        Emit("ownership-watchdog-armed", new { pid, intervalMs = OwnershipInterval.TotalMilliseconds });
+        _watchdogThread.Start();
+
+        Emit("ownership-watchdog-armed", new
+        {
+            identity.Pid,
+            startUtc = identity.StartUtc.ToString("o", CultureInfo.InvariantCulture),
+            intervalMs = OwnershipInterval.TotalMilliseconds
+        });
     }
 
-    private static int _ownedPid;
-    private static DateTime _ownedStartUtc;
-
-    private static bool RequireOwnership(string stage) =>
-        RequireOwnership(stage, _ownedPid, _ownedStartUtc);
-
-    private static bool RequireOwnership(string stage, int pid, DateTime startUtc)
+    /// <summary>
+    /// Stops and joins the observer before any intentional ETABS shutdown, so a deliberate
+    /// exit can never be recorded as an ownership violation. Violations observed BEFORE
+    /// this point are preserved — retirement does not clear them.
+    /// </summary>
+    private static void RetireOwnershipWatchdog(string reason)
     {
-        if (pid != 0)
+        if (_watchdogRetired)
         {
-            _ownedPid = pid;
-            _ownedStartUtc = startUtc;
+            return;
         }
 
+        _watchdogRetired = true;
+        WatchdogStop.Set();
+        var joined = _watchdogThread is null || _watchdogThread.Join(WatchdogJoinDeadline);
+
+        Emit("ownership-watchdog-retired", new
+        {
+            reason,
+            joined,
+            violationsPreserved = _ownershipViolated,
+            violation = _ownershipViolated ? _ownershipViolation : null
+        });
+    }
+
+    private static bool RequireOwnership(string stage)
+    {
         if (_ownershipViolated)
         {
+            return false;
+        }
+
+        // After retirement the sole owned process is expected to disappear, so this is
+        // no longer a meaningful question.
+        if (_watchdogRetired)
+        {
+            return true;
+        }
+
+        var identity = Volatile.Read(ref _owned);
+        if (identity is null)
+        {
+            Violate(stage, "the owned identity was not published before this check");
             return false;
         }
 
@@ -371,15 +551,15 @@ internal static class Program
             return false;
         }
 
-        if (live[0].Id != _ownedPid)
+        if (live[0].Id != identity.Pid)
         {
-            Violate(stage, $"the single ETABS process is pid {live[0].Id}, not the owned pid {_ownedPid}");
+            Violate(stage, $"the single ETABS process is pid {live[0].Id}, not the owned pid {identity.Pid}");
             return false;
         }
 
         try
         {
-            if (live[0].StartTime.ToUniversalTime() != _ownedStartUtc)
+            if (live[0].StartTime.ToUniversalTime() != identity.StartUtc)
             {
                 Violate(stage, "pid matches but process start time does not — the pid was recycled");
                 return false;
@@ -405,8 +585,12 @@ internal static class Program
     {
         if (owned is null)
         {
+            RetireOwnershipWatchdog("teardown-without-process");
             return;
         }
+
+        // Fix 2: retire the observer BEFORE we intentionally remove the sole owned ETABS.
+        RetireOwnershipWatchdog("intentional-teardown");
 
         var graceful = false;
         if (api is not null)
@@ -427,12 +611,12 @@ internal static class Program
             }
         }
 
-        var exited = WaitForOwnedExit();
+        var exited = WaitForOwnedExit(owned.ProcessId);
         if (!exited)
         {
             Emit("forcing-exit", new { pid = owned.ProcessId, reason = "did not exit within the deadline" });
             NativeProcessLaunch.TerminateOwned(owned);
-            exited = WaitForOwnedExit();
+            exited = WaitForOwnedExit(owned.ProcessId);
         }
 
         NativeProcessLaunch.CloseHandles(owned);
@@ -441,18 +625,19 @@ internal static class Program
             pid = owned.ProcessId,
             graceful,
             processExitConfirmed = exited,
-            etabsProcessesRemaining = Process.GetProcessesByName(EtabsProcessName).Length
+            etabsProcessesRemaining = Process.GetProcessesByName(EtabsProcessName).Length,
+            ownershipViolatedDuringExperiment = _ownershipViolated
         });
     }
 
-    private static bool WaitForOwnedExit()
+    private static bool WaitForOwnedExit(int pid)
     {
         var deadline = Clock.Elapsed + ExitDeadline;
         while (Clock.Elapsed < deadline)
         {
             try
             {
-                var p = Process.GetProcessById(_ownedPid);
+                var p = Process.GetProcessById(pid);
                 if (p.HasExited)
                 {
                     return true;

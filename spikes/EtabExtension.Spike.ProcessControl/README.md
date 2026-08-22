@@ -62,8 +62,67 @@ teardown                                       -> ApplicationExit(false), confir
   exactly one ETABS, pid matches, process-start-time matches. Any violation aborts the
   run and invalidates the experiment rather than being worked around.
 - Attach deadline expiry → abort.
+- `--model` is required, and the open must be **proven** → abort before reveal otherwise.
 - Any unexpected exception → abort.
 - A `finally` guarantees the created process is dead on every path.
+
+## Evidence defects found in review, and how they are fixed
+
+Three ways the first draft could have falsely invalidated itself or falsely reported
+success. All three are evidence-integrity bugs, not feature gaps.
+
+1. **Ownership initialisation race.** The watchdog thread used to *initialise*
+   `_ownedPid`/`_ownedStartUtc` on its first tick, while the main thread resumed ETABS and
+   entered the attach loop immediately. If the main thread checked first, the owned pid
+   was still `0` and the spike would declare the correct process foreign.
+   **Fix:** the identity is a single immutable `OwnedIdentity` record, published once with
+   `Volatile.Write` *before* the watchdog starts and *before* `ResumeThread`. The watchdog
+   now only observes. A check that finds no published identity is itself a violation.
+
+2. **Teardown manufacturing a violation.** The watchdog had no stop path, so when
+   `ApplicationExit(false)` deliberately removed the sole owned ETABS, the watchdog could
+   observe zero processes and set `_ownershipViolated` — invalidating a run that had
+   actually succeeded.
+   **Fix:** an explicit retirement boundary. `RetireOwnershipWatchdog()` sets a stop event
+   and joins the thread *before* any intentional shutdown. Violations observed before that
+   point are preserved and reported; retirement never clears them.
+
+3. **A broken attach path could exit `0`.** `OpenModel` logged a non-zero `OpenFile`, a
+   filename mismatch or an exception, then fell through to `Unhide()` and `spike-complete`.
+   Since "the model opens" is part of the strong-positive predicate, that could report
+   success over a broken run.
+   **Fix:** `--model` is mandatory, and `OpenModelProven()` returns true only when
+   `OpenFile == 0` **and** `GetModelFilename(true)` matches the requested path exactly.
+   A failed proof stops the run *before* the explicit reveal, with a distinct exit code.
+
+## Runtime identity
+
+This project is framework-dependent, so no single EXE hash describes the running code. On
+startup the spike emits a `runtime-identity` event recording, for both its own assembly and
+the **interop assembly that actually loaded**, the full name, location, file version, size
+and SHA-256 — `typeof(cHelper).Assembly.Location` settles which `ETABSv1` was bound rather
+than leaving it to inference. The staged file set is hashed separately before the run and
+the two are compared.
+
+Note the staging rule here differs from the production sidecar deliberately: the shipped
+`etab-cli.exe` is staged with **no** neighbouring `ETABSv1.dll` so that runtime resolution
+of the customer's installed ETABS 23 API is exercised. This spike is a throwaway research
+tool, not a shipped artifact — it carries its interop locally, and the `runtime-identity`
+event is what makes that a matter of record instead of an assumption.
+
+## Exit codes
+
+| code | meaning |
+| --- | --- |
+| 0 | completed, ownership never violated |
+| 2 | preflight failed (ETABS already running, or a required path missing) |
+| 3 | resume handshake failed |
+| 4 | attach failed or deadline expired |
+| 5 | ownership violated |
+| 6 | completed, but ownership was violated during the experiment |
+| 7 | unexpected exception |
+| 8 | `--model` not supplied |
+| 9 | exact model-open proof failed (stopped before reveal) |
 
 ## What this spike must never do
 
