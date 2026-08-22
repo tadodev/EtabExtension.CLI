@@ -609,7 +609,25 @@ internal sealed class Win32TopLevelWindows : ITopLevelWindows
         return windows;
     }
 
-    public void Hide(nint handle) => _ = ShowWindow(handle, SwHide);
+    public void Hide(nint handle)
+    {
+        // DIAGNOSTIC BUILD ONLY - branch diagnostic/alpha-22-passive-windows-actuation.
+        // NOT FOR RELEASE. ShowWindow(SW_HIDE) is now issued from NOWHERE: the event
+        // callback already does not actuate (inherited from the previous diagnostic) and
+        // this removes the backstop and confirmation actuation as well.
+        //
+        // Everything else is deliberately intact - the hook still registers and filters
+        // to the owned pid, the pump still runs, SweepOnce still identifies the exact
+        // owned visible HWNDs, and ConfirmSuppressed still observes real Windows state.
+        // ConfirmSuppressed is EXPECTED to fail honestly here, because nothing is ever
+        // hidden; the causal question this build answers is decided earlier, at
+        // cOAPI.ApplicationStart.
+        //
+        // SwHide is still referenced so the constant does not become unused and the
+        // Release analyzer pile stays at zero.
+        _ = handle;
+        _ = SwHide;
+    }
 
     public void Show(nint handle) => _ = ShowWindow(handle, SwShow);
 
