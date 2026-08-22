@@ -1093,7 +1093,14 @@ internal sealed class Win32OwnedWindowSurfaceMonitor : IOwnedWindowSurfaceMonito
                 && idChild == ChildIdSelf
                 && (eventType == EventObjectCreate || eventType == EventObjectShow))
             {
-                onSurfaced();
+                // DIAGNOSTIC BUILD ONLY - branch diagnostic/alpha-22-no-event-actuation.
+                // NOT FOR RELEASE. The subscription still installs, still filters to the
+                // owned pid, and still receives this event; only the ACTUATION is cut, so
+                // no ShowWindow(SW_HIDE) is issued from the event edge. That is what
+                // separates "hook registration" from "immediate edge-triggered hide during
+                // ETABS window creation" as the crash actuator. The backstop sweep, the
+                // activation handshake and the retirement/custody rules are untouched.
+                _ = onSurfaced;
             }
         };
 
