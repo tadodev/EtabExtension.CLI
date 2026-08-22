@@ -20,6 +20,18 @@ public static class EtabsLaunchErrorCodes
     public const string ModelInitializationFailed = "ETABS_MODEL_INITIALIZATION_FAILED";
 
     /// <summary>
+    /// A cold ETABS start was requested without a declared visible-start intent, so no
+    /// process was created.
+    ///
+    /// <para>CLI #22 made startup visibility an explicit, consented state because it
+    /// cannot be prevented on this API path. The CLI cannot manufacture that consent after
+    /// the fact — by the time a window is on screen it is too late to ask — so a cold
+    /// start without it fails BEFORE cHelper.CreateObject rather than surprising the
+    /// engineer and apologising afterwards.</para>
+    /// </summary>
+    public const string VisibleStartConsentMissing = "ETABS_VISIBLE_START_CONSENT_MISSING";
+
+    /// <summary>
     /// The exact-owned Windows census could not prove that no owned ETABS window is on
     /// screen, so the session must not be handed to a background command at all.
     ///
@@ -410,21 +422,40 @@ public interface IManagedEtabsApplication
     void CompleteApiReadiness();
 
     /// <summary>
-    /// Puts this managed application into the background-work state: not on screen, not
-    /// in the taskbar. Called only while the session is being created, before any
-    /// command can have run against it.
+    /// Asks CSI to take this application off screen, unconditionally. Called once, after
+    /// <c>ApplicationStart()</c> has returned and before any command can have run against
+    /// it. CSI owns the mutation; the Windows census owns the verdict.
     /// </summary>
-    ManagedEtabsVisibilityOutcome EnsureHiddenForBackgroundWork();
+    ManagedEtabsVisibilityOutcome ApplyCsiHideForBackgroundWork();
 
     /// <summary>
-    /// Puts this managed application on screen because the user explicitly asked for it.
-    /// Called only after the requested model has been confirmed open.
+    /// Asks CSI to put this application back on screen, unconditionally, because the
+    /// engineer explicitly asked for it. Called only after the requested model has been
+    /// confirmed open.
     /// </summary>
-    ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction();
+    ManagedEtabsVisibilityOutcome ApplyCsiUnhideForExplicitUserAction();
+
+    /// <summary>Where this session sits in the Closed-Alpha visibility contract.</summary>
+    ManagedEtabsVisibilityState VisibilityState { get; }
+
+    /// <summary>
+    /// CLI #24's accumulated evidence: whether an owned window was ever materially on
+    /// screen after the session was confirmed hidden. Sticky.
+    /// </summary>
+    ManagedEtabsExposureEvidence Exposure { get; }
+
+    /// <summary>
+    /// Closes the startup-consent interval, immediately after the first confirmed hidden
+    /// census. From this instant, material exposure is unconsented and recorded stickily.
+    /// </summary>
+    void EnterBackgroundHidden();
+
+    /// <summary>Records that the engineer has been shown ETABS deliberately.</summary>
+    void EnterUserVisible();
 
     /// <summary>
     /// THE background-readiness gate: proves from the exact-owned Windows census that no
-    /// owned top-level window is on screen.
+    /// owned top-level window is materially on screen.
     ///
     /// <para>This replaced <c>cOAPI.Visible()</c> as the acceptance authority after #20
     /// measured that flag staying true through 94 reads while the real windows were
@@ -475,7 +506,6 @@ public sealed class ManagedEtabsApplication(
     Guid launchRecordId,
     IOwnedEtabsProcess ownedProcess,
     IManagedEtabsWindowGuard windowGuard,
-    ManagedEtabsVisibilityPolicy visibility,
     ManagedEtabsApiVersion version) : IManagedEtabsApplication
 {
     public ETABSApplication Application => rawApi.Application;
@@ -488,12 +518,24 @@ public sealed class ManagedEtabsApplication(
     public int ExitWithoutSaving() => rawApi.ApplicationExit(false);
 
     /// <inheritdoc />
-    public ManagedEtabsVisibilityOutcome EnsureHiddenForBackgroundWork() =>
-        ManagedEtabsVisibility.EnsureHidden(rawApi, visibility);
+    public ManagedEtabsVisibilityOutcome ApplyCsiHideForBackgroundWork() =>
+        ManagedEtabsVisibility.ApplyHidden(rawApi);
 
     /// <inheritdoc />
-    public ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction() =>
-        ManagedEtabsVisibility.EnsureVisible(rawApi, visibility);
+    public ManagedEtabsVisibilityOutcome ApplyCsiUnhideForExplicitUserAction() =>
+        ManagedEtabsVisibility.ApplyVisible(rawApi);
+
+    /// <inheritdoc />
+    public ManagedEtabsVisibilityState VisibilityState => windowGuard.State;
+
+    /// <inheritdoc />
+    public ManagedEtabsExposureEvidence Exposure => windowGuard.Exposure;
+
+    /// <inheritdoc />
+    public void EnterBackgroundHidden() => windowGuard.EnterBackgroundHidden();
+
+    /// <inheritdoc />
+    public void EnterUserVisible() => windowGuard.EnterUserVisible();
 
     /// <inheritdoc />
     public ManagedEtabsWindowConfirmation ConfirmWindowsSuppressed() =>

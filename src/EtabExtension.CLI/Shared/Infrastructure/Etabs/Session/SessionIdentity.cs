@@ -443,7 +443,6 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     private readonly TextWriter _diagnostics;
     private readonly IManagedEtabsWindowGuardFactory _windowGuards;
     private readonly IManagedEtabsClock _clock;
-    private readonly ManagedEtabsVisibilityPolicy _visibility;
 
     public ManagedEtabsLauncher(
         IProcessInspector processes,
@@ -488,11 +487,7 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
         _diagnostics = diagnostics;
         _windowGuards = windowGuards;
         _clock = clock;
-        _visibility = ManagedEtabsVisibilityPolicy.Telemetry with { Clock = clock };
     }
-
-    /// <summary>The convergence policy this launcher hands to the session it creates.</summary>
-    internal ManagedEtabsVisibilityPolicy VisibilityPolicy => _visibility;
 
     public IManagedEtabsApplication Launch()
     {
@@ -524,9 +519,22 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
             // blocking startup work the #20 live run measured a visible window through.
             windowGuard = ActivateWindowGuard(ownedProcess);
 
+            // ApplicationStart() returning is the ONE proven readiness boundary on this
+            // API path. Diagnostic #3 measured cOAPI.Hide() throwing a
+            // NullReferenceException ~12 ms in when called before it, and the
+            // process-control spike measured SapModel non-null while the first real call
+            // still threw "the window handle has not been created" - so neither is a
+            // substitute, and neither is a sleep.
             StartApplication(rawApi);
+
+            // CSI mutates. Unconditionally, exactly once, and a throw is fatal.
             AskCsiToHide(rawApi);
+
+            // Windows certifies. Confirming this for the first time is what ENDS the
+            // startup-consent interval: from here, any material exposure is unconsented.
             RequireWindowsSuppressed(windowGuard, "after cOAPI.ApplicationStart");
+            windowGuard.EnterBackgroundHidden();
+
             RequireSapModel(rawApi);
 
             var version = ReadVersion(identity.ExecutablePath);
@@ -536,7 +544,6 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
                 Guid.NewGuid(),
                 ownedProcess,
                 windowGuard,
-                _visibility,
                 new ManagedEtabsApiVersion(
                     version.MajorVersion,
                     ReadApiVersion(rawApi),
@@ -640,24 +647,37 @@ public sealed class ManagedEtabsLauncher : IManagedEtabsLauncher
     }
 
     /// <summary>
-    /// Asks CSI to hide the application it just started, once, and records what it said.
+    /// Asks CSI to take the application it just started off screen. Once, unconditionally.
     ///
-    /// <para><b>Telemetry, not a gate.</b> #20 measured <c>cOAPI.Hide()</c> returning
-    /// success and <c>cOAPI.Visible()</c> then holding true for 94 reads across 10.014 s,
-    /// while the exact-owned window census showed the windows being suppressed the whole
-    /// time. Failing a session on that flag refused sessions that were, in fact, hidden —
-    /// which is how a working candidate came back from certification with
-    /// <c>snapshot-export success=false</c>. The call is still made because it costs one
-    /// CSI round trip and would be the cheaper mechanism on a build where it works; the
-    /// decision belongs to <see cref="RequireWindowsSuppressed"/>.</para>
+    /// <para><b>Why unconditionally.</b> The old policy read <c>cOAPI.Visible()</c> first
+    /// and skipped the call when the flag already said "hidden". #20 measured that flag
+    /// stuck true for 94 reads across 10.014 s while the windows were in fact hidden — so
+    /// a read-first policy is exactly wrong: it declines to hide precisely when the flag
+    /// is lying. The call is now always issued and the return code is recorded, not
+    /// obeyed.</para>
+    ///
+    /// <para><b>Why a throw is fatal but a non-zero return is not.</b> A non-zero return
+    /// means ETABS considered the request and declined it, most often because it believed
+    /// it was already hidden; the census below settles who was right. A throw means the
+    /// call never happened, so there is nothing for the census to confirm and continuing
+    /// would be pretending.</para>
     /// </summary>
     private void AskCsiToHide(IEtabsRawApi rawApi)
     {
-        var outcome = ManagedEtabsVisibility.EnsureHidden(rawApi, _visibility);
-        _diagnostics.WriteLine(outcome.Confirmed
-            ? $"ℹ cOAPI.Hide agreed (changed={outcome.Changed}, reads={outcome.Reads})."
-            : "ℹ cOAPI.Hide did not agree; Windows window state is the authority. " +
-                outcome.Diagnostic);
+        var outcome = ManagedEtabsVisibility.ApplyHidden(rawApi);
+        if (!outcome.Issued)
+        {
+            throw new EtabsLaunchException(
+                EtabsLaunchErrorCodes.HiddenStateNotEstablished,
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    outcome.Diagnostic ?? "cOAPI.Hide could not be issued.",
+                    "stage=after cOAPI.ApplicationStart; csiTransitionIssued=false"));
+        }
+
+        _diagnostics.WriteLine(outcome.Diagnostic is null
+            ? $"ℹ cOAPI.Hide issued (returnCode={outcome.ReturnCode})."
+            : $"ℹ cOAPI.Hide issued (returnCode={outcome.ReturnCode}); " +
+                $"Windows state is the authority. {outcome.Diagnostic}");
     }
 
     /// <summary>

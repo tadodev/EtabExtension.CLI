@@ -39,6 +39,7 @@ public static class ServeCommand
             var orphanCleaner = provider.GetRequiredService<IOrphanSessionCleaner>();
             var shutdown = provider.GetRequiredService<IServeShutdownCoordinator>();
             var records = provider.GetRequiredService<ISessionRecordStore>();
+            var startIntent = provider.GetRequiredService<IManagedEtabsStartIntentScope>();
 
             // Program.cs redirects Console.Out to stderr — write the protocol to the
             // REAL stdout. "\n" line endings keep framing clean for the Rust reader.
@@ -52,7 +53,7 @@ public static class ServeCommand
             var outcome = await RunLifecycleAsync(
                 orphanCleaner,
                 shutdown,
-                () => new ServeLoop(dispatcher, shutdown).RunAsync(stdin, stdout),
+                () => new ServeLoop(dispatcher, shutdown, startIntent).RunAsync(stdin, stdout),
                 stdout,
                 Console.Error,
                 recovery => ServeStartupRefusal.Current(recovery, records.FilePath));

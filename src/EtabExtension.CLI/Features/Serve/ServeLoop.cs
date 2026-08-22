@@ -23,14 +23,17 @@ public sealed class ServeLoop
 
     private readonly IServeDispatcher _dispatcher;
     private readonly IServeShutdownCoordinator _shutdown;
+    private readonly IManagedEtabsStartIntentScope _startIntent;
     private readonly ServeHandshake _handshake;
     private readonly TextWriter _diagnostics;
 
     public ServeLoop(
         IServeDispatcher dispatcher,
-        IServeShutdownCoordinator shutdown) : this(
+        IServeShutdownCoordinator shutdown,
+        IManagedEtabsStartIntentScope startIntent) : this(
             dispatcher,
             shutdown,
+            startIntent,
             ServeHandshake.Current,
             Console.Error)
     {
@@ -39,11 +42,13 @@ public sealed class ServeLoop
     internal ServeLoop(
         IServeDispatcher dispatcher,
         IServeShutdownCoordinator shutdown,
+        IManagedEtabsStartIntentScope startIntent,
         Func<IReadOnlyList<string>, ServeHandshake> handshakeFactory,
         TextWriter diagnostics)
     {
         _dispatcher = dispatcher;
         _shutdown = shutdown;
+        _startIntent = startIntent;
         _diagnostics = diagnostics;
         var capabilities = dispatcher.Capabilities
             .Append(ShutdownCommand)
@@ -160,6 +165,10 @@ public sealed class ServeLoop
     {
         try
         {
+            // Scoped to THIS request and cleared on the way out, so a consented cold start
+            // can never be inherited by the next request that did not declare one.
+            using var intent = _startIntent.Publish(
+                ManagedEtabsStartIntents.Parse(request.StartIntent));
             return await _dispatcher.DispatchAsync(request.Command, request.Request, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

@@ -59,92 +59,42 @@ public sealed class SystemManagedEtabsClock : IManagedEtabsClock
 /// </summary>
 public enum ManagedEtabsVisibilityIntent
 {
-    /// <summary>Background work: ETABS must not appear on screen or in the taskbar.</summary>
+    /// <summary>ETABS must not be on screen or in the taskbar.</summary>
     Hidden,
 
-    /// <summary>An explicit user action asked to see ETABS.</summary>
+    /// <summary>The engineer asked to see ETABS, and the requested model is open.</summary>
     Visible
 }
 
 /// <summary>
-/// How long the CSI application is given to actually reach a state it already accepted a
-/// transition to.
-///
-/// <para>The #20 live certification is the evidence: <c>cOAPI.Hide()</c> returned success
-/// and the very next <c>cOAPI.Visible()</c> read still said visible, while independent
-/// HWND telemetry agreed with <c>Visible()</c>. The oracle was right and the actuator was
-/// late — the window went away 5.19 s after it appeared. A policy that declares failure on
-/// the first read has no model of a deferred CSI transition at all, which is why the
-/// candidate reported "not confirmed" twice for a hide that did, eventually, land.</para>
-/// </summary>
-/// <param name="ConvergenceDeadline">
-/// The ceiling on that wait. Ten seconds is roughly twice the residual the supervised run
-/// measured, and it is a ceiling rather than a delay: convergence normally returns on the
-/// first read.
-/// </param>
-/// <param name="PollInterval">How often <c>cOAPI.Visible()</c> is re-read while converging.</param>
-/// <param name="Clock">The bounded-wait seam.</param>
-public sealed record ManagedEtabsVisibilityPolicy(
-    TimeSpan ConvergenceDeadline,
-    TimeSpan PollInterval,
-    IManagedEtabsClock Clock)
-{
-    public static ManagedEtabsVisibilityPolicy Default { get; } = new(
-        TimeSpan.FromSeconds(10),
-        TimeSpan.FromMilliseconds(100),
-        SystemManagedEtabsClock.Instance);
-
-    /// <summary>
-    /// The policy the managed session actually ships with, now that CSI is telemetry
-    /// rather than an acceptance gate.
-    ///
-    /// <para>#20 measured <c>cOAPI.Visible()</c> holding true for 94 reads across 10.014 s
-    /// after a successful <c>Hide()</c> — on ETABS 23.3 that flag does not track the hide
-    /// at all. Spending the full ten-second budget waiting for a transition that never
-    /// happens would add ten seconds to every session start and change no decision, because
-    /// the exact-owned HWND census is what gates readiness. A short budget still records
-    /// the answer honestly on a build where CSI does converge, and costs half a second on
-    /// one where it does not.</para>
-    /// </summary>
-    public static ManagedEtabsVisibilityPolicy Telemetry { get; } = new(
-        TimeSpan.FromMilliseconds(500),
-        TimeSpan.FromMilliseconds(50),
-        SystemManagedEtabsClock.Instance);
-
-    /// <summary>A zero or negative interval would make the convergence loop unbounded.</summary>
-    public TimeSpan PollInterval { get; } = PollInterval > TimeSpan.Zero
-        ? PollInterval
-        : throw new ArgumentOutOfRangeException(nameof(PollInterval));
-}
-
-/// <summary>
-/// What a visibility transition actually established.
+/// What a CSI visibility transition reported. Telemetry — never a verdict.
 /// </summary>
 /// <param name="Intent">The state that was requested.</param>
+/// <param name="Issued">
+/// Whether the CSI call completed at all. FALSE means it threw, which is an explicit
+/// transition failure the caller must treat as fatal: nothing was asked of ETABS and no
+/// amount of observing will change that.
+/// </param>
 /// <param name="Confirmed">
-/// Whether ETABS was re-read afterwards and agreed. A zero return code is NOT enough:
-/// the same "returned success but the state says otherwise" class of defect that
-/// <c>cFile.OpenFile</c> shipped with applies here too.
+/// Whether the call returned zero. This is NOT a claim about the resulting state. Cardex
+/// documents a non-zero return for "already in the requested state", and #20 measured
+/// <c>Visible()</c> disagreeing with reality in one direction while Diagnostic&#160;#4
+/// measured it disagreeing in the other. The exact-owned Windows census decides.
 /// </param>
-/// <param name="Changed">
-/// Whether a CSI transition call was actually issued. False means the application was
-/// already in the requested state, which is not an error and must not be one — see
-/// <see cref="ManagedEtabsVisibility"/> for why calling anyway would be.
+/// <param name="ReturnCode">The raw CSI return code, recorded verbatim.</param>
+/// <param name="CsiVisibleAfter">
+/// What <c>cOAPI.Visible()</c> claimed immediately afterwards, or null if the read failed
+/// or was not reached. Logged so a build where CSI does track its own state can be
+/// recognised later; it gates nothing.
 /// </param>
-/// <param name="Diagnostic">Bounded failure text when <paramref name="Confirmed"/> is false.</param>
-/// <param name="Reads">
-/// How many <c>cOAPI.Visible()</c> reads the outcome rests on. Exactly the measurement the
-/// #20 run could not reconstruct afterwards: it says whether the hide landed instantly or
-/// had to be waited out.
-/// </param>
-/// <param name="Waited">How long convergence took, or ran for before giving up.</param>
+/// <param name="Diagnostic">Bounded text whenever anything was not plainly nominal.</param>
 public sealed record ManagedEtabsVisibilityOutcome(
     ManagedEtabsVisibilityIntent Intent,
+    bool Issued,
     bool Confirmed,
-    bool Changed,
-    string? Diagnostic,
-    int Reads = 0,
-    TimeSpan Waited = default);
+    int ReturnCode,
+    bool? CsiVisibleAfter,
+    string? Diagnostic);
 
 /// <summary>
 /// The three CSI application-visibility calls behind one named seam, so the whole
@@ -156,49 +106,50 @@ public sealed record ManagedEtabsVisibilityOutcome(
 /// </summary>
 public interface IEtabsVisibilityApi
 {
-    /// <summary>Raw <c>cOAPI.Visible()</c>. True when ETABS is on screen and in the taskbar.</summary>
+    /// <summary>Raw <c>cOAPI.Visible()</c>. Telemetry only — never an authority.</summary>
     bool Visible();
 
-    /// <summary>Raw <c>cOAPI.Hide()</c>. Zero means hidden.</summary>
+    /// <summary>Raw <c>cOAPI.Hide()</c>. Zero means the call was accepted.</summary>
     int Hide();
 
-    /// <summary>Raw <c>cOAPI.Unhide()</c>. Zero means visible.</summary>
+    /// <summary>Raw <c>cOAPI.Unhide()</c>. Zero means the call was accepted.</summary>
     int Unhide();
 }
 
 /// <summary>
-/// The one place the managed ETABS session decides whether the application is on
-/// screen, and the only place that reasons about the CSI visibility contract.
+/// The one place the managed session ASKS ETABS to change its visibility — and, after
+/// CLI&#160;#22, the only thing anywhere that mutates it at all.
 ///
-/// <para><b>Why check before acting.</b> Cardex is explicit that these calls are not
-/// idempotent: <c>cOAPI.Hide</c> — "If the application is already hidden, calling this
-/// function returns an error"; <c>cOAPI.Unhide</c> — "If the application is already
-/// visible (not hidden) calling this function returns an error." So a policy that just
-/// called <c>Hide()</c> would manufacture a failure every time it was already right.
-/// Every transition therefore reads <c>cOAPI.Visible()</c> first and calls nothing when
-/// the application is already in the requested state.</para>
+/// <para><b>Why the transition is always issued.</b> The previous policy read
+/// <c>Visible()</c> first and skipped the call when the flag already matched the intent.
+/// That was defensible while the flag was believed: Cardex says calling <c>Hide</c> on an
+/// already-hidden application returns an error. It is not defensible now. #20 measured the
+/// flag stuck true for 94 reads across 10.014&#160;s while the windows were in fact
+/// hidden, so a read-first policy issues NO hide exactly when the hide is most needed; and
+/// on the reveal path the same stuck flag made the policy issue no <c>Unhide</c> at all,
+/// which is why the old design had to put the windows back with <c>ShowWindow</c> instead.
+/// Both transitions are therefore unconditional, and the return code is recorded rather
+/// than obeyed.</para>
 ///
-/// <para><b>Why exactly one transition.</b> The same non-idempotency is why convergence
-/// polls the STATE and never re-issues the transition. Hammering <c>Hide()</c> while a
-/// first <c>Hide()</c> is still landing would turn a slow success into a manufactured
-/// error, which is precisely the failure the #20 candidate reported.</para>
+/// <para><b>Why a throw is different from a non-zero return.</b> A non-zero return means
+/// ETABS considered the request and declined it — most often because it believed it was
+/// already in that state — and the census will settle who was right. A throw means the
+/// call did not happen: Diagnostic&#160;#3 measured exactly this before
+/// <c>ApplicationStart</c> returns, where the API object exists but its WinForms control
+/// has no window handle yet. Nothing was asked of ETABS, so the caller must fail rather
+/// than wait.</para>
 ///
-/// <para><b>Why re-read afterwards, and more than once.</b> A zero return proves the call
-/// was accepted, not that the state changed. The supervised #20 run proved the gap is real
-/// and measured in seconds, so the primitive re-reads <c>Visible()</c> to a bounded
-/// deadline and reports <see cref="ManagedEtabsVisibilityOutcome.Confirmed"/> from the
-/// observed state — "hidden" is something this process saw, not something it asked
-/// for.</para>
-///
-/// <para><b>Why the state outranks the return code.</b> A non-zero return is re-read once
-/// rather than trusted: Cardex's own documented cause of a non-zero <c>Hide</c> is "already
-/// hidden", which is the state the caller wanted. The observation decides; the return code
-/// only supplies the diagnostic when the observation disagrees.</para>
+/// <para><b>Why nothing converges here any more.</b> There is no polling and no deadline,
+/// because there is nothing to poll: <c>Visible()</c> is not an oracle in either
+/// direction. The single read after the call is recorded as telemetry so a future ETABS
+/// build that does track its own state can be recognised. Actual convergence is observed
+/// where it can be trusted — in the exact-owned HWND census.</para>
 ///
 /// <para><b>What Cardex does not say.</b> ETABS 23.3 documents exactly one overload,
 /// <c>int ApplicationStart()</c> — no visibility argument and no second overload — and
 /// it does not state what the application's visibility is after it returns. That is why
-/// nothing here assumes a starting state.</para>
+/// nothing here assumes a starting state, and why a strictly hidden cold start is not
+/// available on this API path at all.</para>
 /// </summary>
 public static class ManagedEtabsVisibility
 {
@@ -207,157 +158,105 @@ public static class ManagedEtabsVisibility
     public const string UnhideOperation = "cOAPI.Unhide";
 
     /// <summary>
-    /// Background-work state: ETABS must not appear on screen or in the Windows taskbar.
-    ///
-    /// <para>The convergence policy is always passed explicitly. A convenience overload
-    /// that supplied the default would call this one, and the whole-assembly wiring guard
-    /// reads the call graph — a seam that calls itself is a seam whose callers can no
-    /// longer be enumerated.</para>
+    /// Background-work state: asks ETABS to leave the screen and the taskbar. Issued once,
+    /// unconditionally, after <c>ApplicationStart()</c> has returned — the only readiness
+    /// boundary this API path actually provides.
     /// </summary>
-    public static ManagedEtabsVisibilityOutcome EnsureHidden(
-        IEtabsVisibilityApi api,
-        ManagedEtabsVisibilityPolicy policy) =>
-        Ensure(api, ManagedEtabsVisibilityIntent.Hidden, policy);
+    public static ManagedEtabsVisibilityOutcome ApplyHidden(IEtabsVisibilityApi api) =>
+        Apply(api, ManagedEtabsVisibilityIntent.Hidden);
 
     /// <summary>
-    /// Explicit-user-action state: ETABS is shown normally. Only ever called once the
-    /// requested model has been confirmed open — an empty window is the symptom, not the
-    /// goal.
+    /// Explicit-user-action state: asks ETABS to come back on screen. Issued once,
+    /// unconditionally, and only after the requested model has been confirmed open — an
+    /// empty window is the symptom, not the goal.
     /// </summary>
-    public static ManagedEtabsVisibilityOutcome EnsureVisible(
-        IEtabsVisibilityApi api,
-        ManagedEtabsVisibilityPolicy policy) =>
-        Ensure(api, ManagedEtabsVisibilityIntent.Visible, policy);
+    public static ManagedEtabsVisibilityOutcome ApplyVisible(IEtabsVisibilityApi api) =>
+        Apply(api, ManagedEtabsVisibilityIntent.Visible);
 
-    private static ManagedEtabsVisibilityOutcome Ensure(
+    private static ManagedEtabsVisibilityOutcome Apply(
         IEtabsVisibilityApi api,
-        ManagedEtabsVisibilityIntent intent,
-        ManagedEtabsVisibilityPolicy policy)
+        ManagedEtabsVisibilityIntent intent)
     {
         ArgumentNullException.ThrowIfNull(api);
-        ArgumentNullException.ThrowIfNull(policy);
+
         var wantVisible = intent == ManagedEtabsVisibilityIntent.Visible;
-
-        var reads = 1;
-        bool before;
-        try
-        {
-            before = api.Visible();
-        }
-        catch (Exception exception)
-        {
-            return NotConfirmed(
-                intent,
-                changed: false,
-                EtabsApiDiagnosticFormatter.Exception(ReadOperation, exception),
-                reads,
-                TimeSpan.Zero);
-        }
-
-        if (before == wantVisible)
-        {
-            // Already right. Calling the transition anyway would return an error for the
-            // state we wanted, per the Cardex remarks on Hide and Unhide.
-            return new(
-                intent,
-                Confirmed: true,
-                Changed: false,
-                Diagnostic: null,
-                reads,
-                TimeSpan.Zero);
-        }
-
         var operation = wantVisible ? UnhideOperation : HideOperation;
+
         int returnCode;
         try
         {
-            // The ONE and only transition this call issues. Everything below observes.
+            // THE transition. No read guards it, and nothing below can undo it.
             returnCode = wantVisible ? api.Unhide() : api.Hide();
         }
         catch (Exception exception)
         {
-            return NotConfirmed(
+            return new(
                 intent,
-                changed: true,
-                EtabsApiDiagnosticFormatter.Exception(operation, exception),
-                reads,
-                TimeSpan.Zero);
+                Issued: false,
+                Confirmed: false,
+                ReturnCode: 0,
+                CsiVisibleAfter: null,
+                EtabsApiDiagnosticFormatter.Exception(operation, exception));
         }
 
-        // An accepted transition gets the full convergence budget; a rejected one gets a
-        // single confirming read, because a non-zero return is most often "already in the
-        // requested state" and waiting on a call ETABS refused would only delay the truth.
-        var budget = returnCode == 0 ? policy.ConvergenceDeadline : TimeSpan.Zero;
-        var started = policy.Clock.Timestamp;
-        while (true)
+        // One telemetry read. Recorded, never obeyed. A failure to read is not a failure
+        // of the transition, so it only colours the diagnostic.
+        bool? visibleAfter = null;
+        string? readError = null;
+        try
         {
-            bool observed;
-            reads++;
-            try
-            {
-                observed = api.Visible();
-            }
-            catch (Exception exception)
-            {
-                return NotConfirmed(
-                    intent,
-                    changed: true,
-                    EtabsApiDiagnosticFormatter.Exception(ReadOperation, exception),
-                    reads,
-                    policy.Clock.ElapsedSince(started));
-            }
-
-            var waited = policy.Clock.ElapsedSince(started);
-            if (observed == wantVisible)
-            {
-                return new(
-                    intent,
-                    Confirmed: true,
-                    Changed: true,
-                    Diagnostic: null,
-                    reads,
-                    waited);
-            }
-
-            if (waited >= budget)
-            {
-                return NotConfirmed(
-                    intent,
-                    changed: true,
-                    returnCode != 0
-                        ? EtabsApiDiagnosticFormatter.ApiReturn(operation, returnCode)
-                        : Contradicted(operation, wantVisible, observed, reads, waited),
-                    reads,
-                    waited);
-            }
-
-            policy.Clock.Wait(policy.PollInterval);
+            visibleAfter = api.Visible();
         }
+        catch (Exception exception)
+        {
+            readError = EtabsApiDiagnosticFormatter.Exception(ReadOperation, exception);
+        }
+
+        return new(
+            intent,
+            Issued: true,
+            Confirmed: returnCode == 0,
+            returnCode,
+            visibleAfter,
+            Describe(operation, wantVisible, returnCode, visibleAfter, readError));
     }
 
-    private static ManagedEtabsVisibilityOutcome NotConfirmed(
-        ManagedEtabsVisibilityIntent intent,
-        bool changed,
-        string diagnostic,
-        int reads,
-        TimeSpan waited) => new(intent, Confirmed: false, changed, diagnostic, reads, waited);
-
-    private static string Contradicted(
+    /// <summary>
+    /// Bounded telemetry text, or null when the call was accepted and CSI's own flag
+    /// happened to agree — the only combination with nothing worth saying.
+    /// </summary>
+    private static string? Describe(
         string operation,
         bool wantVisible,
-        bool observed,
-        int reads,
-        TimeSpan waited) =>
-        EtabsApiDiagnosticFormatter.Bounded(string.Join(
-            "; ",
+        int returnCode,
+        bool? visibleAfter,
+        string? readError)
+    {
+        if (returnCode == 0 && readError is null && visibleAfter == wantVisible)
+        {
+            return null;
+        }
+
+        var fields = new List<string>
+        {
             EtabsApiErrorCodes.VisibilityNotConfirmed,
             $"operation={operation}",
-            $"requested={Describe(wantVisible)}",
-            $"observed={Describe(observed)}",
-            $"reads={reads}",
-            $"waitedMs={(long)waited.TotalMilliseconds}",
-            "ETABS accepted the transition but never reached the requested application " +
-            "visibility within the bounded convergence deadline."));
+            $"requested={State(wantVisible)}",
+            $"returnCode={returnCode}",
+            $"csiVisibleAfter={(visibleAfter is null ? "unreadable" : State(visibleAfter.Value))}"
+        };
 
-    private static string Describe(bool visible) => visible ? "visible" : "hidden";
+        if (readError is not null)
+        {
+            fields.Add(readError);
+        }
+
+        fields.Add(
+            "CSI telemetry only - the exact-owned Windows census decides whether this " +
+            "transition actually took effect.");
+
+        return EtabsApiDiagnosticFormatter.Bounded(string.Join("; ", fields));
+    }
+
+    private static string State(bool visible) => visible ? "visible" : "hidden";
 }

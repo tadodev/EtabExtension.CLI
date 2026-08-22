@@ -30,6 +30,7 @@ public sealed class EtabsSession : IEtabsSession
     private readonly IProcessInspector _processes;
     private readonly ISessionRecordStore _records;
     private readonly IManagedEtabsShutdownMachine _shutdownMachine;
+    private readonly IManagedEtabsStartIntentScope _startIntent;
 
     // Borrowed, never owned: this is Console.Error in production and a test's buffer under
     // test, so the session must not close it when it disposes.
@@ -47,17 +48,9 @@ public sealed class EtabsSession : IEtabsSession
     public EtabsSession(
         IManagedEtabsLauncher launcher,
         IProcessInspector processes,
-        ISessionRecordStore records)
-        : this(launcher, processes, records, new ManagedEtabsShutdownMachine(records))
-    {
-    }
-
-    internal EtabsSession(
-        IManagedEtabsLauncher launcher,
-        IProcessInspector processes,
         ISessionRecordStore records,
-        IManagedEtabsShutdownMachine shutdownMachine)
-        : this(launcher, processes, records, shutdownMachine, Console.Error)
+        IManagedEtabsStartIntentScope startIntent)
+        : this(launcher, processes, records, new ManagedEtabsShutdownMachine(records), startIntent)
     {
     }
 
@@ -66,12 +59,24 @@ public sealed class EtabsSession : IEtabsSession
         IProcessInspector processes,
         ISessionRecordStore records,
         IManagedEtabsShutdownMachine shutdownMachine,
+        IManagedEtabsStartIntentScope startIntent)
+        : this(launcher, processes, records, shutdownMachine, startIntent, Console.Error)
+    {
+    }
+
+    internal EtabsSession(
+        IManagedEtabsLauncher launcher,
+        IProcessInspector processes,
+        ISessionRecordStore records,
+        IManagedEtabsShutdownMachine shutdownMachine,
+        IManagedEtabsStartIntentScope startIntent,
         TextWriter diagnostics)
     {
         _launcher = launcher;
         _processes = processes;
         _records = records;
         _shutdownMachine = shutdownMachine;
+        _startIntent = startIntent;
         _diagnostics = diagnostics;
     }
 
@@ -106,7 +111,18 @@ public sealed class EtabsSession : IEtabsSession
 
             if (_owned is null)
             {
-                _diagnostics.WriteLine("ℹ Starting ETABS (shared serve session)...");
+                // THE consent gate. Before CreateObject, before anything is started, and
+                // before any diagnostic claims a start is under way.
+                //
+                // It guards a COLD start only. A session that already exists — hidden, or
+                // deliberately shown to the engineer — serves later background work without
+                // asking again, because nothing about reusing it puts a new window on
+                // screen. It is process CREATION that the engineer had to agree to.
+                RequireVisibleStartConsent();
+
+                _diagnostics.WriteLine(
+                    "ℹ Starting ETABS (shared serve session; the engineer consented to a " +
+                    "visible start)...");
                 var launched = Launch();
                 _owned = launched;
                 try
@@ -191,6 +207,39 @@ public sealed class EtabsSession : IEtabsSession
                 throw;
             }
         }
+    }
+
+    /// <summary>
+    /// Refuses a cold start that nobody declared an intent for.
+    ///
+    /// <para>Fails BEFORE <c>cHelper.CreateObject</c>, which is the only useful place: once
+    /// that call returns, ETABS is already starting and already heading for the screen.
+    /// The refusal is typed so the desktop can tell "you must ask the engineer first" apart
+    /// from every other launch failure and show the consent prompt rather than an error.</para>
+    ///
+    /// <para>The intent is never inferred from the command name. A command called
+    /// <c>snapshot-export</c> tells us what work was asked for, not whether anyone warned
+    /// the engineer that a window is about to appear — and inferring the second from the
+    /// first is exactly how an unconsented exposure would get rationalised as expected.</para>
+    /// </summary>
+    private void RequireVisibleStartConsent()
+    {
+        var intent = _startIntent.Current;
+        if (intent == ManagedEtabsStartIntent.VisibleByConsent)
+        {
+            return;
+        }
+
+        _launchFailure = new EtabsLaunchException(
+            EtabsLaunchErrorCodes.VisibleStartConsentMissing,
+            EtabsApiDiagnosticFormatter.Bounded(string.Join(
+                "; ",
+                $"declaredIntent={intent}",
+                $"expected={ManagedEtabsStartIntents.VisibleByConsent}",
+                "starting ETABS puts it on screen for several seconds and that cannot be " +
+                "prevented on this ETABS build, so a cold start requires the caller to " +
+                "declare that the engineer was told and agreed. No process was created.")));
+        throw _launchFailure;
     }
 
     /// <summary>
@@ -326,10 +375,28 @@ public sealed class EtabsSession : IEtabsSession
                 (Exception?)null);
         }
 
+        // CLI #24. "Hidden now" is not the question the product asks. An earlier candidate
+        // logged "started hidden" truthfully seconds after putting a full-screen ETABS
+        // window in front of the engineer, because a point-in-time census cannot see what
+        // already happened. Readiness therefore needs BOTH: currently hidden, AND never
+        // materially on screen since the consent interval closed.
+        var exposure = owned.Exposure;
+        if (exposure.Observed)
+        {
+            return (
+                EtabsLaunchErrorCodes.HiddenStateNotEstablished,
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    exposure.Describe(),
+                    "stage=after cSapModel.InitializeNewModel; " +
+                    "a later hidden census cannot clear an exposure that already happened"),
+                (Exception?)null);
+        }
+
         _diagnostics.WriteLine(
             "✓ ETABS background UI suppression confirmed before use " +
             $"(observations={confirmation.Observations}, " +
-            $"waitedMs={(long)confirmation.Waited.TotalMilliseconds}).");
+            $"waitedMs={(long)confirmation.Waited.TotalMilliseconds}, " +
+            $"state={owned.VisibilityState}, unconsentedExposure=false).");
         return null;
     }
 
@@ -342,36 +409,51 @@ public sealed class EtabsSession : IEtabsSession
 
             // Order is the contract, and every step of it is load bearing.
             //
-            // The caller has already confirmed the requested model is open. Background
-            // suppression is retired FIRST — permanently, and putting back the windows it
-            // hid that are still its own. That restore is what actually reaches the screen:
-            // with cOAPI.Visible() stuck true, the CSI policy below reads "already visible"
-            // and issues no Unhide at all, so a reveal that leaned on CSI would leave the
-            // engineer with nothing. Retiring after the transition would instead leave the
-            // guard free to take the window straight back down, and nothing re-arms it.
+            // The caller has already confirmed the requested model is open. The protected
+            // interval is retired FIRST so that the observer cannot record the reveal
+            // itself as an unconsented exposure, and so nothing re-arms behind it.
+            //
+            // What changed with CLI #22: this step used to also put our own hidden HWNDs
+            // back with ShowWindow(SW_SHOW), and that restore was what actually reached
+            // the screen, because the stuck cOAPI.Visible() flag made the CSI policy skip
+            // its Unhide entirely. Diagnostic #4 removed both halves of that workaround and
+            // measured the result: with ShowWindow impossible in either direction, an
+            // unconditional raw Unhide put the window back 14 ms later. Windows observes;
+            // CSI acts.
             owned.ReleaseWindowGuardForExplicitUserAction();
 
-            // Best-effort hint. Its answer is logged, never gated on.
-            var csi = owned.EnsureVisibleForExplicitUserAction();
+            // CSI mutates, unconditionally. A throw means the call never happened, so
+            // there is nothing for the census to certify.
+            var csi = owned.ApplyCsiUnhideForExplicitUserAction();
+            if (!csi.Issued)
+            {
+                return Result.Fail(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    csi.Diagnostic ?? "cOAPI.Unhide could not be issued.",
+                    "csiTransitionIssued=false"));
+            }
 
-            // THE gate: Windows itself must report an owned top-level ETABS window on
-            // screen. "Open in ETABS" that shows nothing has not done what was asked,
-            // whatever CSI says about it.
+            // THE gate: Windows itself must report an owned top-level ETABS window
+            // materially on screen. "Open in ETABS" that shows nothing has not done what
+            // was asked, whatever CSI says about it.
             var windows = owned.ConfirmWindowsRevealed();
             if (!windows.Confirmed)
             {
                 return Result.Fail(EtabsApiDiagnosticFormatter.AppendTerminalFacts(
                     windows.Diagnostic
                         ?? "No owned ETABS window could be confirmed visible.",
-                    $"csiConfirmed={csi.Confirmed}; csiChanged={csi.Changed}"));
+                    $"csiReturnCode={csi.ReturnCode}; csiConfirmed={csi.Confirmed}"));
             }
+
+            // Only now is the session UserVisible. Later background work reuses it as-is
+            // and must never quietly take the screen back.
+            owned.EnterUserVisible();
 
             _diagnostics.WriteLine(
                 $"✓ ETABS shown (PID {owned.Identity.Pid}; " +
                 $"visibleOwnedWindows={windows.ObservedWindows.Count}, " +
-                $"csiConfirmed={csi.Confirmed})");
+                $"csiReturnCode={csi.ReturnCode}, state={owned.VisibilityState})");
 
-            return Result.Ok();
+                        return Result.Ok();
         }
     }
 

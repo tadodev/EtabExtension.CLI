@@ -17,6 +17,7 @@ public static class ServeExtensions
         services.AddScoped<IProcessInspector, WindowsProcessInspector>();
         services.AddScoped<IManagedEtabsLauncher, ManagedEtabsLauncher>();
         services.AddScoped<IOrphanSessionCleaner, OrphanSessionCleaner>();
+        services.AddScoped<IManagedEtabsStartIntentScope, ManagedEtabsStartIntentScope>();
         services.AddScoped<IEtabsSession, EtabsSession>();
         services.AddScoped<IStaExecutionWorker, StaExecutionWorker>();
         services.AddScoped<IServeShutdownCoordinator, ServeShutdownCoordinator>();

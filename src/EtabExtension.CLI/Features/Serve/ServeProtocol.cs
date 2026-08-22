@@ -27,6 +27,20 @@ public sealed class ServeRequest
 {
     [JsonPropertyName("id")] public long Id { get; init; }
     [JsonPropertyName("command")] public string Command { get; init; } = string.Empty;
+
+    /// <summary>
+    /// The caller's declared intent for a COLD ETABS start, e.g.
+    /// <c>"visible-start-consented"</c>.
+    ///
+    /// <para>It lives on the ENVELOPE rather than in any command's payload because it
+    /// describes the request, not the work. Putting it in each payload would duplicate it
+    /// across every command and make each new command a fresh chance to forget it.</para>
+    ///
+    /// <para>Absent or unrecognised means no consent, and a cold start is refused before
+    /// any process is created. Requests that reuse an existing session ignore it.</para>
+    /// </summary>
+    [JsonPropertyName("startIntent")] public string? StartIntent { get; init; }
+
     [JsonPropertyName("request")] public JsonElement? Request { get; init; }
 }
 
