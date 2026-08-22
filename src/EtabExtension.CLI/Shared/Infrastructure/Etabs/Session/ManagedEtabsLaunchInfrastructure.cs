@@ -508,9 +508,22 @@ public sealed class ManagedEtabsApplication(
     /// </summary>
     public ManagedEtabsVisibilityOutcome EnsureVisibleForExplicitUserAction()
     {
+        // The return code and an explicit begin/end boundary go to stderr, not only into
+        // the outcome record. The caller surfaces that record's Diagnostic ONLY on a
+        // FAILED reveal, so on the success path the return code would otherwise be
+        // discarded - and without a timestamped boundary there is nothing to correlate
+        // the external HWND transition against.
+        var watch = Stopwatch.StartNew();
+        Console.Error.WriteLine($"DIAG cOAPI.Unhide BEGIN utc={DateTime.UtcNow:o}");
+
         try
         {
             var returnCode = rawApi.Unhide();
+            watch.Stop();
+            Console.Error.WriteLine(
+                $"DIAG cOAPI.Unhide END utc={DateTime.UtcNow:o} " +
+                $"returnCode={returnCode} elapsedMs={watch.Elapsed.TotalMilliseconds:0.###}");
+
             return new ManagedEtabsVisibilityOutcome(
                 ManagedEtabsVisibilityIntent.Visible,
                 Confirmed: returnCode == 0,
@@ -521,12 +534,19 @@ public sealed class ManagedEtabsApplication(
         }
         catch (Exception exception)
         {
+            watch.Stop();
+            var typed = EtabsApiDiagnosticFormatter.Exception(
+                "cOAPI.Unhide[diagnostic]",
+                exception);
+            Console.Error.WriteLine(
+                $"DIAG cOAPI.Unhide EXCEPTION utc={DateTime.UtcNow:o} " +
+                $"elapsedMs={watch.Elapsed.TotalMilliseconds:0.###} {typed}");
+
             return new ManagedEtabsVisibilityOutcome(
                 ManagedEtabsVisibilityIntent.Visible,
                 Confirmed: false,
                 Changed: false,
-                Diagnostic: "DIAG raw cOAPI.Unhide() threw: " +
-                    EtabsApiDiagnosticFormatter.Exception("cOAPI.Unhide[diagnostic]", exception),
+                Diagnostic: "DIAG raw cOAPI.Unhide() threw: " + typed,
                 Reads: 0);
         }
     }
