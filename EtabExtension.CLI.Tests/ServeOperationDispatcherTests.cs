@@ -502,6 +502,81 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.DoesNotContain("reveal", session.Events);
     }
 
+    /// <summary>
+    /// CLI #24, at the seam where it actually has to bite: the RESPONSE.
+    ///
+    /// <para>A background command can succeed at its own job and still have put ETABS in
+    /// front of the engineer while doing it. The readiness gate cannot catch that - it runs
+    /// once, at session creation - so without a per-request certification the daemon would
+    /// observe the exposure, record it faithfully, and still answer success to the very
+    /// request that caused it.</para>
+    ///
+    /// <para>The successful result is REPLACED, not annotated: a partially-successful
+    /// export whose session breached the visibility contract is not a success the desktop
+    /// should act on.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(
+        "snapshot-export",
+        """{"filePath":"C:\\v1\\sample_v2.edb","outputDir":"C:\\v1\\snapshot","tables":{}}""")]
+    [InlineData(
+        "run-analysis",
+        """{"filePath":"C:\\v1\\sample_v2.edb","cases":["DEAD"],"units":"SI_kN_m_C"}""")]
+    public async Task ABackgroundCommandThatExposedEtabsCannotReturnSuccess(
+        string command,
+        string payload)
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession
+        {
+            ExposureCertification = Result.Fail(
+                "ETABS_WINDOW_UNCONSENTED_EXPOSURE; observations=3; firstHandle=0x2A4")
+        };
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            runAnalysis: new FakeRunAnalysisService(),
+            snapshot: new FakeSnapshotExportService(),
+            open: new FakeOpenModelService());
+
+        var response = await dispatcher.DispatchAsync(
+            command,
+            Json(payload),
+            TestContext.Current.CancellationToken);
+
+        var result = Assert.IsType<Result>(response, exactMatch: false);
+        Assert.False(result.Success);
+        Assert.Contains(
+            "ETABS_WINDOW_UNCONSENTED_EXPOSURE",
+            result.Error,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>And a clean session is not interfered with.</summary>
+    [Fact]
+    public async Task ACleanBackgroundCommandKeepsItsOwnSuccessfulResult()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())));
+        var session = new FakeSession();
+        var dispatcher = CreateDispatcher(
+            _manager,
+            session,
+            runAnalysis: new FakeRunAnalysisService(),
+            snapshot: new FakeSnapshotExportService(),
+            open: new FakeOpenModelService());
+
+        var response = await dispatcher.DispatchAsync(
+            "snapshot-export",
+            Json("""{"filePath":"C:\\v1\\sample_v2.edb","outputDir":"C:\\v1\\snapshot","tables":{}}"""),
+            TestContext.Current.CancellationToken);
+
+        var result = Assert.IsType<Result>(response, exactMatch: false);
+        Assert.True(result.Success);
+
+        // And the command was labelled for CLI #24 evidence.
+        Assert.Contains("snapshot-export", session.Stages);
+    }
+
     private OperationManager CreateManager(IOperationDefinition definition) => new(
         new StaExecutionWorker(),
         new OperationEventJournalFactory(_directory, memoryCapacity: 4),
