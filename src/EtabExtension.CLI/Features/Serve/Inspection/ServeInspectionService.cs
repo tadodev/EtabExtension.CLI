@@ -53,12 +53,43 @@ public sealed class ServeInspectionService : IServeInspectionService
                 identity.ManagedLaunchRecordId));
     });
 
+    /// <summary>
+    /// The wall properties of the model - and nothing else.
+    ///
+    /// <para><b>CLI #28.</b> This used to return whatever
+    /// <c>cPropArea.GetNameList(PropType=1)</c> gave it and call the result "wall
+    /// properties". PropType 1 is SHELL in the ETABS API (0=All, 1=Shell, 2=Plane,
+    /// 3=Asolid); there is no wall value, so walls, slabs, mats and decks all came back
+    /// together. In the sanctioned model that was 17 names of which only 7 were walls, and
+    /// the other 10 failed the moment a caller passed them to
+    /// <see cref="InspectWallProperty"/> - the paired command they were listed for.</para>
+    ///
+    /// <para><b>How wallness is decided.</b> ETABS has no call that labels a shell property
+    /// as wall, slab or deck; the classification is expressed by WHICH typed accessor
+    /// accepts the name. So the filter is <c>cPropArea.GetWall</c> itself - the API's own
+    /// wall accessor, and the exact predicate the inspector uses. Listing and inspecting
+    /// cannot disagree, because they are the same question asked once each.</para>
+    ///
+    /// <para>Deliberately NOT inferred from names. "W..." and "S..." are one project's
+    /// convention, not a property of ETABS, and a model that names its walls differently
+    /// would silently lose them.</para>
+    /// </summary>
     public Result<ListWallPropertiesData> ListWallProperties(IEtabsInspectionApi api) =>
         Execute(api, units =>
         {
-            var ret = api.GetWallPropertyNames(out var names);
-            RequireSuccess("cPropArea.GetNameList(PropType=1)", ret);
-            return new ListWallPropertiesData(names, units.Original, units.Execution);
+            var ret = api.GetShellPropertyNames(out var shellNames);
+            RequireSuccess("cPropArea.GetNameList(PropType=1 Shell)", ret);
+
+            var walls = new List<string>(shellNames.Length);
+            foreach (var name in shellNames)
+            {
+                if (api.GetWall(name, out _) == 0)
+                {
+                    walls.Add(name);
+                }
+            }
+
+            return new ListWallPropertiesData(walls, units.Original, units.Execution);
         });
 
     public Result<InspectWallPropertyData> InspectWallProperty(
@@ -68,7 +99,14 @@ public sealed class ServeInspectionService : IServeInspectionService
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
         var ret = api.GetWall(name, out var wall);
-        RequireSuccess("cPropArea.GetWall", ret);
+        if (ret != 0)
+        {
+            // CLI #28: say WHICH way it went wrong. "cPropArea.GetWall failed (ret=1)" is a
+            // CSI return code, and a caller cannot tell from it whether it typed the name
+            // wrong or asked about a slab. Those need different fixes, so they get
+            // different answers.
+            throw NotAWall(api, name);
+        }
 
         ret = api.GetModifiers(name, out var modifiers);
         RequireSuccess("cPropArea.GetModifiers", ret);
@@ -183,6 +221,28 @@ public sealed class ServeInspectionService : IServeInspectionService
     }
 
     private static InspectionUnitData ToUnitData(eUnits units) => new(units.ToString(), (int)units);
+
+    /// <summary>
+    /// Turns a refused <c>GetWall</c> into the specific reason it was refused, using
+    /// <c>GetTypeOAPI</c> purely as an existence probe.
+    /// </summary>
+    private static InvalidOperationException NotAWall(IEtabsInspectionApi api, string name)
+    {
+        var exists = api.GetAreaPropertyType(name, out _) == 0;
+        return new InvalidOperationException(exists
+            ? string.Join(
+                "; ",
+                InspectionErrorCodes.AreaPropertyNotAWall,
+                $"name={name}",
+                "the model defines this area property but it is not a wall (ETABS classifies " +
+                "shell properties by which typed accessor accepts them, and cPropArea.GetWall " +
+                "refused this one); list-wall-properties returns only the names that are")
+            : string.Join(
+                "; ",
+                InspectionErrorCodes.AreaPropertyNotFound,
+                $"name={name}",
+                "the model defines no area property with this name"));
+    }
 
     private static void RequireSuccess(string member, int returnCode)
     {

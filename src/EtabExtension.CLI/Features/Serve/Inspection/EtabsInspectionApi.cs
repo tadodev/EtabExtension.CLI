@@ -30,7 +30,23 @@ public interface IEtabsInspectionApi
     int GetWall(string name, out RawWallProperty property);
     int GetModifiers(string name, out double[] modifiers);
     int GetShellDesign(string name, out RawShellDesign shellDesign);
-    int GetWallPropertyNames(out string[] names);
+    /// <summary>
+    /// Every SHELL area property in the model - walls, slabs, decks and mats alike.
+    ///
+    /// <para>Named for what <c>cPropArea.GetNameList(PropType=1)</c> actually returns. It
+    /// was previously called <c>GetWallPropertyNames</c>, which is where CLI #28 came from:
+    /// PropType 1 is "Shell" in the ETABS API (0=All, 1=Shell, 2=Plane, 3=Asolid) and there
+    /// is no wall value at all, so the name promised a filter the API cannot perform.</para>
+    /// </summary>
+    int GetShellPropertyNames(out string[] names);
+
+    /// <summary>
+    /// <c>cPropArea.GetTypeOAPI</c>. Used only as an EXISTENCE probe: it reports Shell,
+    /// Plane or Asolid, so it cannot tell a wall from a slab, but it returns nonzero for a
+    /// name the model does not define. That is what separates "no such property" from
+    /// "exists, but is not a wall".
+    /// </summary>
+    int GetAreaPropertyType(string name, out int propertyType);
     int GetAreaNames(out string[] names);
     int GetAreaProperty(string name, out string propertyName);
     int GetAreaLabelAndStory(string name, out string label, out string story);
@@ -135,13 +151,20 @@ internal sealed class EtabsInspectionApi(ETABSApplication application) : IEtabsI
         return ret;
     }
 
-    public int GetWallPropertyNames(out string[] names)
+    public int GetShellPropertyNames(out string[] names)
     {
         var count = 0;
         names = [];
+        // PropType 1 = Shell. Not wall - the enum has no wall value.
         var ret = Model.PropArea.GetNameList(ref count, ref names, 1);
         names ??= [];
         return ret;
+    }
+
+    public int GetAreaPropertyType(string name, out int propertyType)
+    {
+        propertyType = 0;
+        return Model.PropArea.GetTypeOAPI(name, ref propertyType);
     }
 
     public int GetAreaNames(out string[] names)

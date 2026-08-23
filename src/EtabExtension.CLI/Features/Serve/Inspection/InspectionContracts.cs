@@ -2,6 +2,19 @@ using System.Text.Json.Serialization;
 
 namespace EtabExtension.CLI.Features.Serve.Inspection;
 
+/// <summary>
+/// Coded reasons an inspection request is refused, so a caller can branch on the cause
+/// rather than parse a CSI return code. CLI #28.
+/// </summary>
+public static class InspectionErrorCodes
+{
+    /// <summary>The model defines the area property, but it is not a wall.</summary>
+    public const string AreaPropertyNotAWall = "ETABS_AREA_PROPERTY_NOT_A_WALL";
+
+    /// <summary>The model defines no area property with that name at all.</summary>
+    public const string AreaPropertyNotFound = "ETABS_AREA_PROPERTY_NOT_FOUND";
+}
+
 public sealed class InspectWallPropertyRequest
 {
     [JsonPropertyName("name")]

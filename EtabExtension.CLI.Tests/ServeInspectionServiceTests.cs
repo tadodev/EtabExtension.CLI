@@ -90,8 +90,14 @@ public sealed class ServeInspectionServiceTests : IDisposable
         Assert.Equal("kN_m_C", json.RootElement.GetProperty("executionUnits").GetProperty("name").GetString());
     }
 
+    /// <summary>
+    /// A refused GetWall still restores the caller's units and still skips the rest of the
+    /// read - that half is unchanged. What changed with CLI #28 is the ANSWER: the raw
+    /// CSI return code is gone, replaced by a coded reason. A caller could not act on
+    /// "ret=17"; it can act on "that name is not a wall".
+    /// </summary>
     [Fact]
-    public void NonzeroGetWallIsFailureWithReturnCodeAndUnitsAreRestored()
+    public void ARefusedGetWallIsReportedByCodeAndUnitsAreStillRestored()
     {
         var api = new FakeInspectionApi
         {
@@ -102,22 +108,144 @@ public sealed class ServeInspectionServiceTests : IDisposable
         var result = _service.InspectWallProperty(api, "MissingOrBroken");
 
         Assert.False(result.Success);
-        Assert.Contains("cPropArea.GetWall failed (ret=17)", result.Error, StringComparison.Ordinal);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyNotAWall,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("ret=17", result.Error, StringComparison.Ordinal);
         Assert.Equal([eUnits.kN_m_C, eUnits.lb_in_F], api.SetUnitsCalls);
         Assert.Equal(eUnits.lb_in_F, api.CurrentUnits);
         Assert.Equal(0, api.GetModifiersCalls);
     }
 
+    /// <summary>
+    /// CLI #28. The shell list is not the wall list.
+    ///
+    /// <para>ETABS returns walls, slabs, mats and decks from
+    /// <c>GetNameList(PropType=1)</c> because PropType 1 means SHELL - the enum has no wall
+    /// value. Advertising all of them as wall properties is what made 10 of the sanctioned
+    /// model's 17 listed names unusable.</para>
+    /// </summary>
     [Fact]
-    public void ListWallPropertiesUsesTheShellPropertyProbe()
+    public void ListWallPropertiesReturnsOnlyGenuineWalls()
     {
-        var api = new FakeInspectionApi { WallPropertyNames = ["W1500", "W1800"] };
+        var api = new FakeInspectionApi
+        {
+            ShellPropertyNames = ["S8_C5.75-PT", "W20_C6", "Deck1", "M6ft_C5.0", "W40_C8"],
+            WallNames = new(StringComparer.Ordinal) { "W20_C6", "W40_C8" }
+        };
 
         var result = _service.ListWallProperties(api);
 
         Assert.True(result.Success);
-        Assert.Equal(["W1500", "W1800"], result.Data!.Names);
-        Assert.Equal(1, api.GetWallPropertyNamesCalls);
+        Assert.Equal(["W20_C6", "W40_C8"], result.Data!.Names);
+        Assert.Equal(1, api.GetShellPropertyNamesCalls);
+    }
+
+    /// <summary>
+    /// THE property the pair exists for, stated as an executable assertion: everything the
+    /// listing advertises can actually be inspected.
+    ///
+    /// <para>This is the test that would have failed on the shipped candidate. It walks the
+    /// listing's own output through the paired command, so the two cannot drift apart again
+    /// without a red test - whatever the filter is later reimplemented as.</para>
+    /// </summary>
+    [Fact]
+    public void EveryListedWallPropertyCanBeInspected()
+    {
+        var api = new FakeInspectionApi
+        {
+            ShellPropertyNames =
+            [
+                "S8_C5.75-PT", "S12_C5.75_RC", "M12ft_C5.0", "Deck1",
+                "W20_C6", "W40_C8", "W30_C8", "FNW12_C5"
+            ],
+            WallNames = new(StringComparer.Ordinal)
+            {
+                "W20_C6", "W40_C8", "W30_C8", "FNW12_C5"
+            }
+        };
+
+        var listed = _service.ListWallProperties(api);
+        Assert.True(listed.Success);
+        Assert.NotEmpty(listed.Data!.Names);
+
+        foreach (var name in listed.Data.Names)
+        {
+            var inspected = _service.InspectWallProperty(api, name);
+            Assert.True(
+                inspected.Success,
+                $"listed '{name}' but could not inspect it: {inspected.Error}");
+            Assert.Equal(name, inspected.Data!.Name);
+        }
+    }
+
+    /// <summary>
+    /// A property the model really has, which simply is not a wall. The caller needs to know
+    /// that is what happened - not a CSI return code, which cannot be acted on.
+    /// </summary>
+    [Fact]
+    public void InspectingANonWallAreaPropertySaysSoInsteadOfLeakingAReturnCode()
+    {
+        var api = new FakeInspectionApi
+        {
+            ShellPropertyNames = ["S8_C5.75-PT", "W20_C6"],
+            WallNames = new(StringComparer.Ordinal) { "W20_C6" },
+            DefinedAreaProperties = new(StringComparer.Ordinal) { "S8_C5.75-PT", "W20_C6" }
+        };
+
+        var result = _service.InspectWallProperty(api, "S8_C5.75-PT");
+
+        Assert.False(result.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyNotAWall,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("name=S8_C5.75-PT", result.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("ret=", result.Error, StringComparison.Ordinal);
+    }
+
+    /// <summary>And a name the model does not define at all is a different answer.</summary>
+    [Fact]
+    public void InspectingAnUnknownAreaPropertyIsDistinctFromInspectingANonWall()
+    {
+        var api = new FakeInspectionApi
+        {
+            ShellPropertyNames = ["W20_C6"],
+            WallNames = new(StringComparer.Ordinal) { "W20_C6" },
+            DefinedAreaProperties = new(StringComparer.Ordinal) { "W20_C6" }
+        };
+
+        var result = _service.InspectWallProperty(api, "W20_C7");
+
+        Assert.False(result.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyNotFound,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            InspectionErrorCodes.AreaPropertyNotAWall,
+            result.Error,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The filter is ETABS's own accessor, never the name. A model whose walls are not
+    /// called "W..." must still get its walls listed.
+    /// </summary>
+    [Fact]
+    public void WallnessIsDecidedByTheApiAndNotByNamingConvention()
+    {
+        var api = new FakeInspectionApi
+        {
+            ShellPropertyNames = ["CoreShaft-300", "W20_C6", "Podium_Perimeter"],
+            WallNames = new(StringComparer.Ordinal) { "CoreShaft-300", "Podium_Perimeter" }
+        };
+
+        var result = _service.ListWallProperties(api);
+
+        Assert.True(result.Success);
+        Assert.Equal(["CoreShaft-300", "Podium_Perimeter"], result.Data!.Names);
     }
 
     [Fact]
@@ -175,8 +303,8 @@ public sealed class ServeInspectionServiceTests : IDisposable
             string.Empty);
         public double[] Modifiers { get; init; } = Enumerable.Repeat(1d, 10).ToArray();
         public RawShellDesign ShellDesign { get; init; } = new("Rebar", 0, 0, 0, 0, 0);
-        public string[] WallPropertyNames { get; init; } = [];
-        public int GetWallPropertyNamesCalls { get; private set; }
+        public string[] ShellPropertyNames { get; init; } = [];
+        public int GetShellPropertyNamesCalls { get; private set; }
         public int GetModifiersCalls { get; private set; }
         public string[] AreaNames { get; init; } = [];
         public Dictionary<string, FakeArea> Areas { get; } = new(StringComparer.Ordinal);
@@ -200,10 +328,39 @@ public sealed class ServeInspectionServiceTests : IDisposable
             return 0;
         }
 
+        /// <summary>
+        /// The names <c>cPropArea.GetWall</c> accepts. Everything else in
+        /// <see cref="ShellPropertyNames"/> is a slab, mat or deck, exactly as a real
+        /// model's shell list is - which is the situation CLI #28 exists for.
+        /// </summary>
+        public HashSet<string> WallNames { get; init; } = new(StringComparer.Ordinal);
+
+        /// <summary>Area property names the model defines at all, wall or not.</summary>
+        public HashSet<string> DefinedAreaProperties { get; init; } = new(StringComparer.Ordinal);
+
+        public List<string> GetWallCalls { get; } = [];
+
         public int GetWall(string name, out RawWallProperty property)
         {
+            GetWallCalls.Add(name);
             property = Wall;
+            if (WallNames.Count > 0)
+            {
+                return WallNames.Contains(name) ? 0 : 1;
+            }
+
             return GetWallReturnCode;
+        }
+
+        public int GetAreaPropertyType(string name, out int propertyType)
+        {
+            propertyType = 1;
+            if (DefinedAreaProperties.Count > 0)
+            {
+                return DefinedAreaProperties.Contains(name) ? 0 : 1;
+            }
+
+            return 0;
         }
 
         public int GetModifiers(string name, out double[] modifiers)
@@ -219,10 +376,10 @@ public sealed class ServeInspectionServiceTests : IDisposable
             return 0;
         }
 
-        public int GetWallPropertyNames(out string[] names)
+        public int GetShellPropertyNames(out string[] names)
         {
-            GetWallPropertyNamesCalls++;
-            names = WallPropertyNames;
+            GetShellPropertyNamesCalls++;
+            names = ShellPropertyNames;
             return 0;
         }
 
