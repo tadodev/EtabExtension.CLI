@@ -292,6 +292,186 @@ public sealed class OperationManagerTests : IDisposable
         Assert.Equal(ManagedEtabsStartIntent.Unspecified, seen);
     }
 
+    /// <summary>
+    /// THE lease-poisoning property.
+    ///
+    /// <para>A <c>start-operation</c> that omits <c>"payload"</c> arrives here as
+    /// <c>default(JsonElement)</c> — an element with no backing document, whose
+    /// <c>Clone()</c> throws. That copy used to be taken AFTER the operation lease had been
+    /// published, so the throw escaped <c>Start</c> with <c>_activeOperationId</c> set and
+    /// nothing left alive to clear it: from then on every synchronous ETABS command
+    /// answered "a daemon operation is active" and every later start answered "Operation
+    /// already active", until the daemon was restarted.</para>
+    ///
+    /// <para>The ROUND TRIP is the proof, not the refusal on its own: refuse the malformed
+    /// request, then accept the very next valid one.</para>
+    /// </summary>
+    [Fact]
+    public async Task AStartWithNoPayloadIsRefusedWithoutCostingTheDaemonItsOperationLease()
+    {
+        var runs = 0;
+        _manager = CreateManager(new DelegateOperation("payload", (_, _) =>
+        {
+            Interlocked.Increment(ref runs);
+            return Task.FromResult<object>(Result.Ok());
+        }));
+
+        var refused = _manager.Start("payload", default);
+
+        Assert.False(refused.Success);
+        Assert.Contains("payload", refused.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.False(_manager.HasActiveOperation);
+        Assert.Equal(0, Volatile.Read(ref runs));
+
+        var accepted = _manager.Start("payload", EmptyPayload());
+
+        Assert.True(accepted.Success);
+        _ = await AwaitOperationAsync(accepted.Data!.OperationId);
+        Assert.Equal(1, Volatile.Read(ref runs));
+    }
+
+    /// <summary>
+    /// An explicit <c>"payload": null</c> is refused for the same reason. It is a
+    /// well-formed element and copies fine, but it carries no operation request — and every
+    /// definition would only discover that after the lease was taken, the STA worker
+    /// occupied, and a queued/started/failed trio journalled for work that could never have
+    /// succeeded. The protocol requires a payload; this fails closed at the door.
+    /// </summary>
+    [Fact]
+    public void AJsonNullPayloadIsRefusedForTheSameReason()
+    {
+        _manager = CreateManager(new DelegateOperation("payload", (_, _) =>
+            Task.FromResult<object>(Result.Ok())));
+
+        var refused = _manager.Start("payload", JsonSerializer.Deserialize<JsonElement>("null"));
+
+        Assert.False(refused.Success);
+        Assert.Contains("payload", refused.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.False(_manager.HasActiveOperation);
+    }
+
+    /// <summary>
+    /// The other half of the same protocol requirement: <c>start-operation</c> carries a
+    /// kind AND a payload. A missing kind used to reach the definition dictionary and come
+    /// back out as an <c>ArgumentNullException</c>, which a caller can only read as an
+    /// internal fault rather than as its own malformed request.
+    /// </summary>
+    [Fact]
+    public void AStartWithNoKindIsRefusedWithAnExplicitError()
+    {
+        _manager = CreateManager(new DelegateOperation("payload", (_, _) =>
+            Task.FromResult<object>(Result.Ok())));
+
+        var refused = _manager.Start(null!, EmptyPayload());
+
+        Assert.False(refused.Success);
+        Assert.Contains("kind", refused.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.False(_manager.HasActiveOperation);
+    }
+
+    /// <summary>
+    /// And a refused start journals nothing. The old order recorded
+    /// <c>operation-queued</c> and only then blew up on the payload, leaving a durable
+    /// spill file asserting that work had been accepted which no worker would ever pick up.
+    /// </summary>
+    [Fact]
+    public void ARefusedStartLeavesNoJournalClaimingWorkWasQueued()
+    {
+        _manager = CreateManager(new DelegateOperation("payload", (_, _) =>
+            Task.FromResult<object>(Result.Ok())));
+
+        var refused = _manager.Start("payload", default);
+
+        Assert.False(refused.Success);
+        Assert.False(
+            Directory.Exists(_directory),
+            "a refused start must not have created an operation journal");
+    }
+
+    /// <summary>
+    /// The ordering rule proven from the other side: when the JOURNAL is the thing that
+    /// fails, the operation was never published either. The lease is taken last, once
+    /// everything that can fail already has not.
+    /// </summary>
+    [Fact]
+    public void AStartWhoseJournalCannotBeWrittenTakesNoLease()
+    {
+        _manager = CreateManagerJournalling(new FailingJournalFactory(failFromAppend: 1));
+
+        var refused = _manager.Start("payload", EmptyPayload());
+
+        Assert.False(refused.Success);
+        Assert.Contains("journal", refused.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.False(_manager.HasActiveOperation);
+    }
+
+    /// <summary>
+    /// And the lease comes back even when the operation's FINAL journal write is what
+    /// fails. Anything less means one unlucky disk write costs the daemon every subsequent
+    /// command — the same permanent poisoning the payload defect caused, only triggered
+    /// later.
+    /// </summary>
+    [Fact]
+    public async Task AnOperationWhoseTerminalJournalWriteFailsStillReleasesTheLease()
+    {
+        _manager = CreateManagerJournalling(new FailingJournalFactory(failFromAppend: 3));
+
+        var started = _manager.Start("payload", EmptyPayload());
+        Assert.True(started.Success);
+        _ = await AwaitOperationAsync(started.Data!.OperationId);
+
+        Assert.False(_manager.HasActiveOperation);
+        var next = _manager.Start("payload", EmptyPayload());
+        Assert.True(next.Success);
+        _ = await AwaitOperationAsync(next.Data!.OperationId);
+    }
+
+    /// <summary>
+    /// Waits for one operation to settle, with a bound. A lease that is never released
+    /// leaves the completion unset, and an unbounded wait would turn that failure into a
+    /// hung test run instead of a red one.
+    /// </summary>
+    private async Task<object> AwaitOperationAsync(string operationId) =>
+        await _manager!
+            .WaitAsync(operationId, TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+
+    private OperationManager CreateManagerJournalling(
+        IOperationEventJournalFactory journals) => new(
+        new StaExecutionWorker(),
+        journals,
+        new SystemOperationClock(),
+        WorkEnvelopeFixtures.Consented(new NullVisibilitySession()),
+        [new DelegateOperation("payload", (_, _) => Task.FromResult<object>(Result.Ok()))]);
+
+    /// <summary>
+    /// A journal whose spill write fails from the Nth append onwards — the shape of a
+    /// directory that vanished or a disk that filled up mid-operation.
+    /// </summary>
+    private sealed class FailingJournalFactory(int failFromAppend) : IOperationEventJournalFactory
+    {
+        public IOperationEventJournal Create(string operationId) =>
+            new FailingJournal(failFromAppend);
+
+        private sealed class FailingJournal(int failFromAppend) : IOperationEventJournal
+        {
+            private long _appends;
+
+            public string FilePath => "<test-journal>";
+            public long LastSequence => Interlocked.Read(ref _appends);
+
+            public OperationEvent Append(OperationEvent item)
+            {
+                var sequence = Interlocked.Increment(ref _appends);
+                return sequence < failFromAppend
+                    ? item with { Seq = sequence }
+                    : throw new IOException("Operation journal spill file is unavailable");
+            }
+
+            public IReadOnlyList<OperationEvent> ReadSince(long sinceSequence) => [];
+        }
+    }
+
     private OperationManager CreateManagerWith(
         IEtabsWorkEnvelope envelope,
         IOperationDefinition definition) => new(

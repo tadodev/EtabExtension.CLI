@@ -666,6 +666,127 @@ esults"
         Assert.Contains("analyze-and-extract", session.Stages);
     }
 
+    /// <summary>
+    /// The lease-poisoning round trip, driven through the REAL line protocol rather than
+    /// through the manager alone — because the claim being made is about what a client
+    /// sees on the wire.
+    ///
+    /// <para>A <c>start-operation</c> that omits <c>"payload"</c> comes back as ONE bounded
+    /// failure carried on ITS OWN request id, and the very next valid start is accepted.
+    /// Before the fix the malformed request took the operation lease and never gave it
+    /// back: request 8 answered "Operation already active", and so did every request after
+    /// it until the daemon was restarted.</para>
+    /// </summary>
+    [Fact]
+    public async Task AStartOperationWithoutAPayloadFailsOnItsOwnIdAndLeavesTheDaemonServing()
+    {
+        var runs = 0;
+        _manager = CreateManager(new DelegateOperation((_, _) =>
+        {
+            Interlocked.Increment(ref runs);
+            return Task.FromResult<object>(Result.Ok());
+        }));
+
+        var responses = await RunLoopAsync(
+            _manager,
+            """{"id":7,"command":"start-operation","request":{"kind":"analyze-and-extract"}}""",
+            """{"id":8,"command":"start-operation","request":{"kind":"analyze-and-extract","payload":{"filePath":"model.edb"}}}""");
+
+        Assert.Equal(2, responses.Count);
+        Assert.Equal(7, responses[0].GetProperty("id").GetInt64());
+        Assert.False(responses[0].GetProperty("success").GetBoolean());
+        Assert.Contains(
+            "payload",
+            responses[0].GetProperty("error").GetString()!,
+            StringComparison.OrdinalIgnoreCase);
+
+        Assert.Equal(8, responses[1].GetProperty("id").GetInt64());
+        Assert.True(responses[1].GetProperty("success").GetBoolean());
+        var operationId = responses[1].GetProperty("data").GetProperty("operationId").GetString()!;
+
+        _ = await _manager
+            .WaitAsync(operationId, TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+        Assert.Equal(1, Volatile.Read(ref runs));
+        Assert.False(_manager.HasActiveOperation);
+    }
+
+    /// <summary>
+    /// And the SYNCHRONOUS lane is not collateral damage. The poisoned lease made every
+    /// ETABS-backed command answer "a daemon operation is active" — a daemon that looked
+    /// permanently busy while doing nothing at all.
+    /// </summary>
+    [Fact]
+    public async Task AStartOperationWithoutAPayloadDoesNotBlockSynchronousCommands()
+    {
+        _manager = CreateManager(new DelegateOperation((_, _) =>
+            Task.FromResult<object>(Result.Ok())));
+        var dispatcher = CreateDispatcher(
+            _manager,
+            new FakeSession(isStarted: false),
+            new FakeProcesses(new EtabsProcessObservation([Identity(42)], 0)));
+
+        var refused = Assert.IsType<Result<StartOperationData>>(await dispatcher.DispatchAsync(
+            "start-operation",
+            Json("""{"kind":"analyze-and-extract"}"""),
+            TestContext.Current.CancellationToken));
+        Assert.False(refused.Success);
+
+        var status = Assert.IsType<Result<GetStatusData>>(await dispatcher.DispatchAsync(
+            "get-status", null, TestContext.Current.CancellationToken));
+
+        Assert.True(status.Success);
+        Assert.Equal([42], status.Data!.ObservedPids);
+    }
+
+    /// <summary>
+    /// Runs real requests through the real <see cref="ServeLoop"/> over the real dispatcher
+    /// and operation manager, and returns the correlated response lines.
+    /// </summary>
+    private static async Task<List<JsonElement>> RunLoopAsync(
+        IOperationManager operations,
+        params string[] requests)
+    {
+        using var reader = new StringReader(string.Join('\n', requests) + "\n");
+        await using var writer = new StringWriter();
+        var loop = new ServeLoop(
+            CreateDispatcher(operations),
+            new NoopShutdownCoordinator(),
+            new ManagedEtabsStartIntentScope(),
+            capabilities => new ServeHandshake(
+                "etab-cli-serve",
+                1,
+                "0.1.0",
+                "0.1.0+gtest",
+                Environment.ProcessId,
+                Path.GetFullPath(Environment.ProcessPath!),
+                capabilities),
+            TextWriter.Null);
+
+        await loop.RunAsync(reader, writer, TestContext.Current.CancellationToken);
+
+        return writer.ToString()
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(line => JsonSerializer.Deserialize<JsonElement>(line))
+            .Where(element => element.TryGetProperty("id", out _))
+            .ToList();
+    }
+
+    /// <summary>Shutdown is not what these tests are about; the session here is a fake.</summary>
+    private sealed class NoopShutdownCoordinator : IServeShutdownCoordinator
+    {
+        public Task<Result<ManagedEtabsShutdownData>> ShutdownAsync() =>
+            Task.FromResult(Result.Ok(new ManagedEtabsShutdownData(
+                ManagedEtabsShutdownState.Succeeded,
+                ProcessExitConfirmed: true,
+                Forced: false,
+                RecordRetained: false,
+                ApplicationExitReturnCode: 0,
+                OwnedPid: null)));
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     private OperationManager CreateManager(
         IOperationDefinition definition,
         IEtabsSession? session = null) => new(
