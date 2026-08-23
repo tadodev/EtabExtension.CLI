@@ -1,0 +1,75 @@
+name: alpha-visibility-validation
+
+on:
+  push:
+    branches:
+      - validation/alpha-22-visibility
+
+permissions:
+  contents: read
+
+jobs:
+  offline-proof:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore EtabExtension.CLI.slnx
+
+      - name: Full ETABS-free suite
+        shell: pwsh
+        run: dotnet test EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj -c Release --no-restore
+
+      - name: Release build with immutable SidecarBuildId
+        shell: pwsh
+        run: dotnet build src/EtabExtension.CLI/EtabExtension.CLI.csproj -c Release --no-restore -warnaserror -p:SidecarBuildId=0.1.0+g1327aec97f031500d048a0d7c1b057f83db54431
+
+      - name: Mutation - queued consent must be load-bearing
+        shell: pwsh
+        run: |
+          $path = 'src/EtabExtension.CLI/Features/Serve/Operations/OperationManager.cs'
+          $text = Get-Content $path -Raw
+          $needle = 'using var intent = _startIntent.Publish(context.StartIntent);'
+          if (-not $text.Contains($needle)) { throw 'consent mutation anchor missing' }
+          $text.Replace($needle, 'using var intent = _startIntent.Publish(ManagedEtabsStartIntent.Unspecified);') | Set-Content $path
+          dotnet build EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj -c Release --no-restore
+          if ($LASTEXITCODE -ne 0) { throw 'consent mutation did not compile' }
+          dotnet test EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj -c Release --no-build --no-restore --filter 'FullyQualifiedName~Deferred_operation_keeps_request_consent'
+          if ($LASTEXITCODE -eq 0) { throw 'consent mutation survived targeted proof' }
+          git checkout -- $path
+
+      - name: Mutation - completion certification must be load-bearing
+        shell: pwsh
+        run: |
+          $path = 'src/EtabExtension.CLI/Features/Serve/Operations/OperationManager.cs'
+          $text = Get-Content $path -Raw
+          $needle = 'var certification = CertifyOrTerminate(session);'
+          if (-not $text.Contains($needle)) { throw 'certification mutation anchor missing' }
+          $text.Replace($needle, 'var certification = Result.Ok();') | Set-Content $path
+          dotnet build EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj -c Release --no-restore
+          if ($LASTEXITCODE -ne 0) { throw 'certification mutation did not compile' }
+          dotnet test EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj -c Release --no-build --no-restore --filter 'FullyQualifiedName~Action_throw_plus_visibility_breach'
+          if ($LASTEXITCODE -eq 0) { throw 'completion-certification mutation survived targeted proof' }
+          git checkout -- $path
+
+      - name: Mutation - final exact HWND census must be load-bearing
+        shell: pwsh
+        run: |
+          $path = 'src/EtabExtension.CLI/Shared/Infrastructure/Etabs/Session/EtabsSession.cs'
+          $text = Get-Content $path -Raw
+          $needle = 'var finalCensus = owned.ConfirmWindowsSuppressed();'
+          $replacement = 'var finalCensus = new ManagedEtabsWindowConfirmation(true, 0, TimeSpan.Zero, [], null);'
+          if (-not $text.Contains($needle)) { throw 'final-census mutation anchor missing' }
+          $text.Replace($needle, $replacement) | Set-Content $path
+          dotnet build EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj -c Release --no-restore
+          if ($LASTEXITCODE -ne 0) { throw 'final-census mutation did not compile' }
+          dotnet test EtabExtension.CLI.Tests/EtabExtension.CLI.Tests.csproj -c Release --no-build --no-restore --filter 'FullyQualifiedName~Async_analyze_exposure_found_by_final_forced_census'
+          if ($LASTEXITCODE -eq 0) { throw 'final-census mutation survived targeted proof' }
+          git checkout -- $path
