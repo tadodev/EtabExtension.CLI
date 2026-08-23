@@ -179,21 +179,68 @@ public sealed class AnalysisRunSelectionTests
     }
 
     /// <summary>
-    /// Absence from the model's own census IS positive evidence, so it may be reported as
-    /// such — and it is reported, in the payload, rather than vanishing.
+    /// Partial fulfilment is not success. Asking for DEAD and GHOST where the model has no
+    /// GHOST used to run DEAD, return TOP-LEVEL SUCCESS, and record the omission only in a
+    /// per-case field — and no shipping consumer reads one: <c>AnalyzeFileResult</c> in
+    /// <c>crates/ext-api/src/analyze.rs</c> carries just the legacy totals, so the product
+    /// would ask for two cases, get one, and see a clean pass. The whole request is refused
+    /// instead.
+    ///
+    /// <para>This is the same rule the all-absent case already had, at the honest boundary:
+    /// ANY absent case, not all of them.</para>
     /// </summary>
     [Fact]
-    public void ACaseTheModelDoesNotDefineIsReportedAndTheRestStillRun()
+    public void ARequestNamingEvenOneUndefinedCaseIsRefusedRatherThanPartiallyRun()
     {
         var api = new FakeAnalysisApi("DEAD", "LIVE");
 
         var result = AnalysisRunner.Run(api, ModelPath, ["DEAD", "GHOST"], null);
 
-        Assert.True(result.Success, result.Error);
+        Assert.False(result.Success);
+        Assert.Contains("GHOST", result.Error!, StringComparison.Ordinal);
+        Assert.Contains("Refusing to run a partial analysis", result.Error!, StringComparison.Ordinal);
+        Assert.Equal(0, api.RunCount);
+    }
+
+    /// <summary>
+    /// The refusal happens BEFORE any run flag moves, so it cannot leave the model in a
+    /// state the next request inherits — which is the whole failure mode this issue is
+    /// about. Nothing but the census is even called.
+    /// </summary>
+    [Fact]
+    public void RefusingAPartialRequestChangesNothingAboutTheModel()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "WIND");
+        api.SetRunCaseFlag(string.Empty, run: false, all: true);
+        api.SetRunCaseFlag("WIND", run: true, all: false);
+        api.Calls.Clear();
+
+        var refused = AnalysisRunner.Run(api, ModelPath, ["DEAD", "GHOST"], null);
+
+        Assert.False(refused.Success);
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+        Assert.Equal(["WIND"], api.SelectedCases);
+    }
+
+    /// <summary>
+    /// A refusal poisons nothing: the very next valid request still runs, and a default run
+    /// after it still restores the full set. The round-trip property CLI #30 needed.
+    /// </summary>
+    [Fact]
+    public void AValidRequestStillWorksAfterAPartialOneWasRefused()
+    {
+        var api = new FakeAnalysisApi("DEAD", "LIVE", "WIND");
+
+        var refused = AnalysisRunner.Run(api, ModelPath, ["DEAD", "GHOST"], null);
+        Assert.False(refused.Success);
+
+        var selective = AnalysisRunner.Run(api, ModelPath, ["DEAD"], null);
+        Assert.True(selective.Success, selective.Error);
         Assert.Equal(["DEAD"], api.LastRunSet);
-        Assert.Equal(["DEAD"], result.Data!.CasesRun);
-        Assert.Equal(["GHOST"], result.Data.CasesNotInModel);
-        Assert.DoesNotContain("SetRunCaseFlag('GHOST', run=True)", api.Calls);
+
+        var byDefault = AnalysisRunner.Run(api, ModelPath, null, null);
+        Assert.True(byDefault.Success, byDefault.Error);
+        Assert.Equal(["DEAD", "LIVE", "WIND"], api.LastRunSet);
     }
 
     [Fact]
@@ -206,6 +253,24 @@ public sealed class AnalysisRunSelectionTests
         Assert.False(result.Success);
         Assert.Contains("GHOST, PHANTOM", result.Error!, StringComparison.Ordinal);
         Assert.Equal(0, api.RunCount);
+        Assert.DoesNotContain(api.Calls, call => call.StartsWith("SetRunCaseFlag", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Absence is fatal now, which makes it more important, not less, that only a census
+    /// that SUCCEEDED can establish it. A failed census must still read as a failed call.
+    /// </summary>
+    [Fact]
+    public void AFailedCensusIsNeverReadAsTheCaseBeingAbsent()
+    {
+        var api = new FakeAnalysisApi("DEAD") { CensusReturnCodeForCall = _ => 5 };
+
+        var result = AnalysisRunner.Run(api, ModelPath, ["DEAD", "GHOST"], null);
+
+        Assert.False(result.Success);
+        Assert.Contains("GetRunCaseFlag failed (ret=5)", result.Error!, StringComparison.Ordinal);
+        Assert.DoesNotContain("GHOST", result.Error!, StringComparison.Ordinal);
+        Assert.DoesNotContain("partial", result.Error!, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>Requests are matched to the model's own spelling of the case name.</summary>
@@ -435,6 +500,10 @@ public sealed class AnalysisRunSelectionTests
         public IReadOnlyList<string> LastRunSet { get; private set; } = [];
 
         public int RunCount { get; private set; }
+
+        /// <summary>The cases the model currently holds a run flag for, sorted.</summary>
+        public IReadOnlyList<string> SelectedCases =>
+            [.. _modelCases.Where(name => _run[name]).Order(StringComparer.Ordinal)];
 
         /// <summary>Cases whose <c>SetRunCaseFlag</c> refuses with a nonzero return.</summary>
         public HashSet<string> SelectionFailures { get; } = new(StringComparer.OrdinalIgnoreCase);

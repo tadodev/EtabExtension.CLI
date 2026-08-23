@@ -49,13 +49,6 @@ public record RunAnalysisData
     [JsonPropertyName("casesNotFinished")]
     public IReadOnlyList<string> CasesNotFinished { get; init; } = [];
 
-    /// <summary>
-    /// Requested case names the model's own load-case census does not contain, so they
-    /// were never selected. Never inferred from a CSI call that failed.
-    /// </summary>
-    [JsonPropertyName("casesNotInModel")]
-    public IReadOnlyList<string> CasesNotInModel { get; init; } = [];
-
     [JsonPropertyName("analysisTimeMs")]
     public long AnalysisTimeMs { get; init; }
 

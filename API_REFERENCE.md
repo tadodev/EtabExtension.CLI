@@ -164,7 +164,6 @@ Returns `RunAnalysisData`:
   "casesRun": ["DEAD"],
   "casesRunFinishedCount": 1,
   "casesNotFinished": [],
-  "casesNotInModel": [],
   "analysisTimeMs": 90000,
   "units": {
     "force": "kip",
@@ -180,6 +179,12 @@ request left behind on a long-lived `serve` session. A `--cases` run establishes
 its selection outright — selecting what it asked for and deselecting the rest.
 Either way the selection is read back from the model before anything runs, and
 `casesRun` reports what the model actually held.
+
+A `--cases` run is all-or-nothing. If ANY requested case is absent from the
+model's load-case list, the command fails and names it, without changing a single
+run flag and without running analysis — partial analysis is never returned as
+success. Absence is established only from a census call that itself succeeded; a
+failed census fails the command as a failed call, never as "case not found".
 
 Success is judged against `casesRun` alone. `finishedCaseCount` is a fact about
 the whole model, including results left over from earlier runs, and cannot carry

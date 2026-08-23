@@ -79,7 +79,6 @@ internal static class AnalysisRunner
             CasesRun = runSet.Cases,
             CasesRunFinishedCount = outcome.RunSetFinishedCount,
             CasesNotFinished = outcome.NotFinished,
-            CasesNotInModel = runSet.CasesNotInModel,
             AnalysisTimeMs = stopwatch.ElapsedMilliseconds,
             Units = units
         };
@@ -110,13 +109,6 @@ internal static class AnalysisRunner
             ? $"ℹ Restored the all-cases run selection — running all {runSet.Cases.Count} case(s)"
             : $"ℹ Run selection established — running {runSet.Cases.Count} of " +
               $"{runSet.ModelCaseCount} case(s): {string.Join(", ", runSet.Cases)}");
-
-        if (runSet.CasesNotInModel.Count > 0)
-        {
-            Console.Error.WriteLine(
-                $"⚠ Requested but not defined in this model, so not run: " +
-                $"{string.Join(", ", runSet.CasesNotInModel)}");
-        }
     }
 
     /// <summary>
@@ -135,7 +127,6 @@ internal static class AnalysisRunner
             CasesRequested = requested,
             CaseCount = runSet.ModelCaseCount,
             CasesRun = runSet.Cases,
-            CasesNotInModel = runSet.CasesNotInModel,
             AnalysisTimeMs = stopwatch.ElapsedMilliseconds,
             Units = units
         };

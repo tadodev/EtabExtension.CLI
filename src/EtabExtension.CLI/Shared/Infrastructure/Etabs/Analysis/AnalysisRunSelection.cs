@@ -24,12 +24,6 @@ public sealed record AnalysisRunSet
 
     /// <summary>How many load cases the model defines in total.</summary>
     public required int ModelCaseCount { get; init; }
-
-    /// <summary>
-    /// Requested names the model's own load-case census does not contain. Populated only
-    /// from that census — never inferred from a call that failed.
-    /// </summary>
-    public IReadOnlyList<string> CasesNotInModel { get; init; } = [];
 }
 
 /// <summary>What the model says about the run set once the analysis has returned.</summary>
@@ -102,7 +96,6 @@ public static class AnalysisRunSelection
 
         var wantsAll = requestedCases is null or { Count: 0 };
         IReadOnlyList<string> intended;
-        IReadOnlyList<string> notInModel = [];
 
         if (wantsAll)
         {
@@ -122,13 +115,23 @@ public static class AnalysisRunSelection
         else
         {
             var resolution = Resolve(requestedCases!, modelCases);
-            notInModel = resolution.NotInModel;
 
-            if (resolution.Resolved.Count == 0)
+            // ANY absent case refuses the WHOLE request, and refuses it HERE — before a
+            // single run flag has moved and before any analysis. Running the rest and
+            // returning success would hand the caller a partial result labelled as a
+            // complete one, and no shipping consumer reads a per-case breakdown to notice.
+            // Note this rests on a census that SUCCEEDED: the failed-census branch above
+            // has already returned, so absence here is the model's own answer and never a
+            // failed call re-read as "case not found".
+            if (resolution.NotInModel.Count > 0)
             {
                 return Result.Fail<AnalysisRunSet>(
-                    "None of the requested cases are defined in this model: " +
-                    $"{string.Join(", ", notInModel)}. The model defines {modelCases.Length} load case(s).");
+                    "Refusing to run a partial analysis: " +
+                    $"{resolution.NotInModel.Count} of the {resolution.Resolved.Count + resolution.NotInModel.Count} " +
+                    "requested case(s) are not defined in this model: " +
+                    $"{string.Join(", ", resolution.NotInModel)}. " +
+                    "No run flag was changed and no analysis was run. " +
+                    $"The model defines {modelCases.Length} load case(s); re-request with only those.");
             }
 
             // ESTABLISH the requested selection outright: clear every flag first so the
@@ -170,8 +173,7 @@ public static class AnalysisRunSelection
         {
             Cases = intended,
             IsAllCases = wantsAll,
-            ModelCaseCount = modelCases.Length,
-            CasesNotInModel = notInModel
+            ModelCaseCount = modelCases.Length
         });
     }
 

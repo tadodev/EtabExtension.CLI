@@ -237,15 +237,16 @@ etab-cli run-analysis -f <path.edb> [-c CASE1 CASE2 ...] [-u US_Kip_Ft]
 | `-u` / `--units` | Unit preset (default: `US_Kip_Ft`) |
 
 Returns `RunAnalysisData` — `caseCount`, `finishedCaseCount`, `casesRun`,
-`casesRunFinishedCount`, `casesNotFinished`, `casesNotInModel`, `analysisTimeMs`,
-`units`.
+`casesRunFinishedCount`, `casesNotFinished`, `analysisTimeMs`, `units`.
 
 The run selection is always stated, never inherited: a default run restores the
 all-cases selection, a `--cases` run deselects everything before selecting what
 it asked for, and both read the flags back from the model before analysing.
 Success is judged against `casesRun` only — `finishedCaseCount` counts finished
 cases across the whole model, stale ones included, and cannot make a run whose
-own cases failed successful. Selection and verdict live in
+own cases failed successful. A `--cases` run is all-or-nothing: any requested case
+the model does not define fails the command before any flag is touched, rather
+than running the rest and reporting success. Selection and verdict live in
 `Shared/Infrastructure/Etabs/Analysis`, shared with `analyze-and-extract`.
 
 ---
