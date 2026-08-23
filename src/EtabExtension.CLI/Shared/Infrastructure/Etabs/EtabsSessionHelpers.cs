@@ -230,7 +230,7 @@ internal static class EtabsSessionHelpers
         await Task.CompletedTask;
 
         Console.Error.WriteLine("ℹ Collecting model metadata...");
-        _warnings = [];
+        BeginMetadataWarnings();
         var groups = ReadGroups(app);
 
         var metadata = new ModelMetadata
@@ -271,6 +271,16 @@ internal static class EtabsSessionHelpers
             return _warnings;
         }
     }
+
+    /// <summary>Starts a fresh warning collection for a metadata read on this thread.</summary>
+    internal static void BeginMetadataWarnings() => _warnings = [];
+
+    /// <summary>
+    /// The warnings raised so far by this thread's metadata read. The warning list is part
+    /// of the metadata contract — it is where everything the reader could NOT establish is
+    /// recorded — so it is readable rather than write-only.
+    /// </summary>
+    internal static IReadOnlyList<MetadataWarning> CollectedMetadataWarnings => _metadataWarnings;
 
     private static int RunSpecificCases(ETABSApplication app)
     {
@@ -618,21 +628,23 @@ internal static class EtabsSessionHelpers
         }
     }
 
+    /// <summary>
+    /// The model's area properties, each labelled with the kind ETABS can be shown to
+    /// assign it.
+    ///
+    /// <para><b>CLI #29.</b> The type used to come from
+    /// <c>cPropArea.GetPropertyType</c>, which is <c>GetTypeOAPI</c>'s PropType
+    /// (1=Shell, 2=Plane, 3=Asolid) read through an enum whose 1 means Wall. Every ETABS
+    /// area property is a Shell, so every one of them came back "Wall" - decks and slabs
+    /// included. See <see cref="AreaPropertyClassifier"/> for what replaced it and why.</para>
+    /// </summary>
     private static List<AreaSectionInfo> ReadAreaSections(ETABSApplication app)
     {
         try
         {
-            return app.Model.PropArea.GetNameList()
-                .Select(name =>
-                {
-                    var propertyType = ReadItemOrDefault(
-                        "areaSections",
-                        $"area section '{name}' type",
-                        () => app.Model.PropArea.GetPropertyType(name).ToString(),
-                        "Unknown");
-                    return new AreaSectionInfo(name, propertyType);
-                })
-                .ToList();
+            return ClassifyAreaSections(
+                app.Model.PropArea.GetNameList(),
+                new CsiAreaPropertyProbes(app.SapModel));
         }
         catch (Exception ex)
         {
@@ -640,6 +652,25 @@ internal static class EtabsSessionHelpers
             return [];
         }
     }
+
+    /// <summary>
+    /// Labels an already-censused set of area property names. A name whose kind the model
+    /// will not establish becomes an explicit <see cref="AreaPropertyClassifier.Unknown"/>
+    /// and a metadata warning carrying the probe evidence - never a guessed type, and never
+    /// a silently dropped property.
+    /// </summary>
+    internal static List<AreaSectionInfo> ClassifyAreaSections(
+        IEnumerable<string> names,
+        IAreaPropertyProbes probes) =>
+        names
+            .Select(name => new AreaSectionInfo(
+                name,
+                ReadItemOrDefault(
+                    "areaSections",
+                    $"area section '{name}' type",
+                    () => AreaPropertyClassifier.Classify(probes, name),
+                    AreaPropertyClassifier.Unknown)))
+            .ToList();
 
     private static T ReadOrDefault<T>(string label, Func<T> read, T fallback)
     {

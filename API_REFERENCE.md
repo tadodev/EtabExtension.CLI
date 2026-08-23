@@ -266,6 +266,15 @@ configuration validation.
 }
 ```
 
+`areaSections[].propertyType` is `Wall`, `Slab`, `Deck`, or `Unknown`. The kind
+comes from which typed accessor ETABS lets read the property
+(`cPropArea.GetWall` / `GetSlab` / `GetDeck`), because ETABS has no call that
+returns an area property's kind as a label. A property no accessor claims — or
+that two of them claim — is reported as `Unknown` with a `warnings` entry
+carrying the probe return codes; it is never guessed from the name, nor from
+`GetTypeOAPI`, whose PropType is 1=Shell, 2=Plane, 3=Asolid and so answers
+"Shell" for every ETABS area property.
+
 ### Run Metrics Schema v1
 
 `run-metrics.json` is written by combined-session commands next to the command
