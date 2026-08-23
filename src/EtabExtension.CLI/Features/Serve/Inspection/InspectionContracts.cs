@@ -13,6 +13,14 @@ public static class InspectionErrorCodes
 
     /// <summary>The model defines no area property with that name at all.</summary>
     public const string AreaPropertyNotFound = "ETABS_AREA_PROPERTY_NOT_FOUND";
+
+    /// <summary>
+    /// The property's kind could not be established because CSI refused the probes. An
+    /// infrastructure failure, deliberately distinct from both semantic answers above: a
+    /// caller must be able to tell "your name is wrong" from "ETABS would not answer".
+    /// </summary>
+    public const string AreaPropertyClassificationFailed =
+        "ETABS_AREA_PROPERTY_CLASSIFICATION_FAILED";
 }
 
 public sealed class InspectWallPropertyRequest

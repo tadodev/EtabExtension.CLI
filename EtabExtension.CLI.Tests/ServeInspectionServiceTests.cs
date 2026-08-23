@@ -92,30 +92,136 @@ public sealed class ServeInspectionServiceTests : IDisposable
 
     /// <summary>
     /// A refused GetWall still restores the caller's units and still skips the rest of the
-    /// read - that half is unchanged. What changed with CLI #28 is the ANSWER: the raw
-    /// CSI return code is gone, replaced by a coded reason. A caller could not act on
-    /// "ret=17"; it can act on "that name is not a wall".
+    /// read - that half is unchanged.
+    ///
+    /// <para>The ANSWER is the part that had to be repaired twice. First the raw CSI return
+    /// code was replaced by a coded reason; then the coded reason had to stop being invented
+    /// from a failure. Here CSI refuses everything - GetWall, the slab and deck probes, and
+    /// the census - so nothing about the model has been established, and the only honest
+    /// answer is that the classification failed. Not "not a wall". Not "not found".</para>
     /// </summary>
     [Fact]
-    public void ARefusedGetWallIsReportedByCodeAndUnitsAreStillRestored()
+    public void WhenEveryProbeIsRefusedTheAnswerIsAnInfrastructureFailureNotAVerdict()
     {
         var api = new FakeInspectionApi
         {
             CurrentUnits = eUnits.lb_in_F,
-            GetWallReturnCode = 17
+            GetWallReturnCode = 17,
+            AreaPropertyCensusReturnCode = 9
         };
 
         var result = _service.InspectWallProperty(api, "MissingOrBroken");
 
         Assert.False(result.Success);
         Assert.Contains(
+            InspectionErrorCodes.AreaPropertyClassificationFailed,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
             InspectionErrorCodes.AreaPropertyNotAWall,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            InspectionErrorCodes.AreaPropertyNotFound,
             result.Error,
             StringComparison.Ordinal);
         Assert.DoesNotContain("ret=17", result.Error, StringComparison.Ordinal);
         Assert.Equal([eUnits.kN_m_C, eUnits.lb_in_F], api.SetUnitsCalls);
         Assert.Equal(eUnits.lb_in_F, api.CurrentUnits);
         Assert.Equal(0, api.GetModifiersCalls);
+    }
+
+    /// <summary>
+    /// THE listing hazard the re-review named: a genuine wall whose probe glitches must not
+    /// quietly vanish from a successful-looking wall list.
+    ///
+    /// <para>An incomplete list is worse than a failed one, because nothing downstream can
+    /// tell it is incomplete. The engineer would simply not see that wall and have no reason
+    /// to suspect it exists.</para>
+    /// </summary>
+    [Fact]
+    public void AShellPropertyThatCannotBeClassifiedFailsTheListingInsteadOfBeingDropped()
+    {
+        var api = new FakeInspectionApi
+        {
+            ShellPropertyNames = ["W20_C6", "W40_C8", "W30_C8"],
+            // W40_C8 is a wall in the model, but every probe on it is refused.
+            WallNames = new(StringComparer.Ordinal) { "W20_C6", "W30_C8" },
+            AreaPropertyCensusReturnCode = 9
+        };
+
+        var result = _service.ListWallProperties(api);
+
+        Assert.False(result.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyClassificationFailed,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("name=W40_C8", result.Error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the existence half: a property the model really defines, whose probes all fail,
+    /// must not be reported as absent. "I could not ask" is not "it is not there".
+    /// </summary>
+    [Fact]
+    public void AnExistingPropertyWhoseProbesAllFailIsNotReportedAsMissing()
+    {
+        var api = new FakeInspectionApi
+        {
+            ShellPropertyNames = ["Unclassifiable"],
+            DefinedAreaProperties = new(StringComparer.Ordinal) { "Unclassifiable" },
+            GetWallReturnCode = 1
+        };
+
+        var result = _service.InspectWallProperty(api, "Unclassifiable");
+
+        Assert.False(result.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyClassificationFailed,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            InspectionErrorCodes.AreaPropertyNotFound,
+            result.Error,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// NOT_FOUND requires a census that SUCCEEDED and does not contain the name. A census
+    /// that failed proves nothing, and must not be spent as proof of absence.
+    /// </summary>
+    [Fact]
+    public void NotFoundRequiresASuccessfulCensusThatOmitsTheName()
+    {
+        var proven = new FakeInspectionApi
+        {
+            DefinedAreaProperties = new(StringComparer.Ordinal) { "W20_C6" },
+            GetWallReturnCode = 1
+        };
+        var provenResult = _service.InspectWallProperty(proven, "NoSuchProperty");
+        Assert.False(provenResult.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyNotFound,
+            provenResult.Error,
+            StringComparison.Ordinal);
+
+        var unproven = new FakeInspectionApi
+        {
+            DefinedAreaProperties = new(StringComparer.Ordinal) { "W20_C6" },
+            GetWallReturnCode = 1,
+            AreaPropertyCensusReturnCode = 9
+        };
+        var unprovenResult = _service.InspectWallProperty(unproven, "NoSuchProperty");
+        Assert.False(unprovenResult.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyClassificationFailed,
+            unprovenResult.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            InspectionErrorCodes.AreaPropertyNotFound,
+            unprovenResult.Error,
+            StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -132,7 +238,9 @@ public sealed class ServeInspectionServiceTests : IDisposable
         var api = new FakeInspectionApi
         {
             ShellPropertyNames = ["S8_C5.75-PT", "W20_C6", "Deck1", "M6ft_C5.0", "W40_C8"],
-            WallNames = new(StringComparer.Ordinal) { "W20_C6", "W40_C8" }
+            WallNames = new(StringComparer.Ordinal) { "W20_C6", "W40_C8" },
+            SlabNames = new(StringComparer.Ordinal) { "S8_C5.75-PT", "M6ft_C5.0" },
+            DeckNames = new(StringComparer.Ordinal) { "Deck1" }
         };
 
         var result = _service.ListWallProperties(api);
@@ -163,7 +271,12 @@ public sealed class ServeInspectionServiceTests : IDisposable
             WallNames = new(StringComparer.Ordinal)
             {
                 "W20_C6", "W40_C8", "W30_C8", "FNW12_C5"
-            }
+            },
+            SlabNames = new(StringComparer.Ordinal)
+            {
+                "S8_C5.75-PT", "S12_C5.75_RC", "M12ft_C5.0"
+            },
+            DeckNames = new(StringComparer.Ordinal) { "Deck1" }
         };
 
         var listed = _service.ListWallProperties(api);
@@ -191,6 +304,7 @@ public sealed class ServeInspectionServiceTests : IDisposable
         {
             ShellPropertyNames = ["S8_C5.75-PT", "W20_C6"],
             WallNames = new(StringComparer.Ordinal) { "W20_C6" },
+            SlabNames = new(StringComparer.Ordinal) { "S8_C5.75-PT" },
             DefinedAreaProperties = new(StringComparer.Ordinal) { "S8_C5.75-PT", "W20_C6" }
         };
 
@@ -213,6 +327,7 @@ public sealed class ServeInspectionServiceTests : IDisposable
         {
             ShellPropertyNames = ["W20_C6"],
             WallNames = new(StringComparer.Ordinal) { "W20_C6" },
+            // The census succeeds and does not contain W20_C7 — positive evidence of absence.
             DefinedAreaProperties = new(StringComparer.Ordinal) { "W20_C6" }
         };
 
@@ -239,7 +354,10 @@ public sealed class ServeInspectionServiceTests : IDisposable
         var api = new FakeInspectionApi
         {
             ShellPropertyNames = ["CoreShaft-300", "W20_C6", "Podium_Perimeter"],
-            WallNames = new(StringComparer.Ordinal) { "CoreShaft-300", "Podium_Perimeter" }
+            WallNames = new(StringComparer.Ordinal) { "CoreShaft-300", "Podium_Perimeter" },
+            // A "W..." name that is actually a slab, so the test fails if anyone ever
+            // reintroduces a naming heuristic in either direction.
+            SlabNames = new(StringComparer.Ordinal) { "W20_C6" }
         };
 
         var result = _service.ListWallProperties(api);
@@ -352,15 +470,26 @@ public sealed class ServeInspectionServiceTests : IDisposable
             return GetWallReturnCode;
         }
 
-        public int GetAreaPropertyType(string name, out int propertyType)
-        {
-            propertyType = 1;
-            if (DefinedAreaProperties.Count > 0)
-            {
-                return DefinedAreaProperties.Contains(name) ? 0 : 1;
-            }
+        /// <summary>Names cPropArea.GetSlab accepts.</summary>
+        public HashSet<string> SlabNames { get; init; } = new(StringComparer.Ordinal);
 
-            return 0;
+        /// <summary>Names cPropArea.GetDeck accepts.</summary>
+        public HashSet<string> DeckNames { get; init; } = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Lets a test make the existence census itself fail, which is the case that must
+        /// never be readable as "the property does not exist".
+        /// </summary>
+        public int AreaPropertyCensusReturnCode { get; init; }
+
+        public int ProbeSlab(string name) => SlabNames.Contains(name) ? 0 : 1;
+
+        public int ProbeDeck(string name) => DeckNames.Contains(name) ? 0 : 1;
+
+        public int GetAllAreaPropertyNames(out string[] names)
+        {
+            names = [.. DefinedAreaProperties];
+            return AreaPropertyCensusReturnCode;
         }
 
         public int GetModifiers(string name, out double[] modifiers)

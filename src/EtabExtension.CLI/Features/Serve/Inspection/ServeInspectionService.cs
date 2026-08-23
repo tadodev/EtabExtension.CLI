@@ -83,9 +83,19 @@ public sealed class ServeInspectionService : IServeInspectionService
             var walls = new List<string>(shellNames.Length);
             foreach (var name in shellNames)
             {
-                if (api.GetWall(name, out _) == 0)
+                switch (Classify(api, name))
                 {
-                    walls.Add(name);
+                    case AreaPropertyClass.Wall:
+                        walls.Add(name);
+                        break;
+                    case AreaPropertyClass.NotAWall:
+                        break;
+                    default:
+                        // A property nobody could classify must not be quietly dropped. The
+                        // caller asked for THE wall properties; answering with a list that
+                        // silently omits a wall whose probe failed is the same class of lie
+                        // as answering with slabs in it.
+                        throw Indeterminate(name);
                 }
             }
 
@@ -104,8 +114,8 @@ public sealed class ServeInspectionService : IServeInspectionService
             // CLI #28: say WHICH way it went wrong. "cPropArea.GetWall failed (ret=1)" is a
             // CSI return code, and a caller cannot tell from it whether it typed the name
             // wrong or asked about a slab. Those need different fixes, so they get
-            // different answers.
-            throw NotAWall(api, name);
+            // different answers - but only when the evidence actually supports one.
+            throw Diagnose(api, name);
         }
 
         ret = api.GetModifiers(name, out var modifiers);
@@ -222,27 +232,100 @@ public sealed class ServeInspectionService : IServeInspectionService
 
     private static InspectionUnitData ToUnitData(eUnits units) => new(units.ToString(), (int)units);
 
-    /// <summary>
-    /// Turns a refused <c>GetWall</c> into the specific reason it was refused, using
-    /// <c>GetTypeOAPI</c> purely as an existence probe.
-    /// </summary>
-    private static InvalidOperationException NotAWall(IEtabsInspectionApi api, string name)
+    /// <summary>What the model can be shown to say about one area property.</summary>
+    private enum AreaPropertyClass
     {
-        var exists = api.GetAreaPropertyType(name, out _) == 0;
-        return new InvalidOperationException(exists
-            ? string.Join(
+        /// <summary>Nothing could be established. Never an answer; always a failure.</summary>
+        Indeterminate,
+
+        /// <summary><c>cPropArea.GetWall</c> accepted it.</summary>
+        Wall,
+
+        /// <summary>A different typed accessor accepted it - slab or deck.</summary>
+        NotAWall,
+
+        /// <summary>A successful census of every area property does not contain the name.</summary>
+        NotDefined
+    }
+
+    /// <summary>
+    /// Classifies one area property from POSITIVE evidence only.
+    ///
+    /// <para>The distinction this method exists for: a nonzero CSI status is a probe that
+    /// FAILED, not a fact about the model. Reading "GetWall returned 1" as "this is not a
+    /// wall" silently converts an infrastructure failure into a semantic answer - a wall
+    /// whose probe glitched would vanish from a successful-looking wall list, which is the
+    /// unknown-as-clean conversion the Alpha contract refuses everywhere else.</para>
+    ///
+    /// <para>So each verdict needs its own affirmative evidence: another typed accessor
+    /// accepting the name for <see cref="AreaPropertyClass.NotAWall"/>, and a census that
+    /// itself succeeded for <see cref="AreaPropertyClass.NotDefined"/>. Anything less is
+    /// <see cref="AreaPropertyClass.Indeterminate"/> and becomes a bounded failure.</para>
+    /// </summary>
+    private static AreaPropertyClass Classify(IEtabsInspectionApi api, string name)
+    {
+        if (api.GetWall(name, out _) == 0)
+        {
+            return AreaPropertyClass.Wall;
+        }
+
+        // Positive classification as something else. ETABS has no call that returns a
+        // property's kind as a label, so the kind IS which accessor accepts it.
+        if (api.ProbeSlab(name) == 0 || api.ProbeDeck(name) == 0)
+        {
+            return AreaPropertyClass.NotAWall;
+        }
+
+        // Absence has to be proven by a census that succeeded, not inferred from a probe
+        // that did not.
+        if (api.GetAllAreaPropertyNames(out var defined) == 0)
+        {
+            return defined.Contains(name, StringComparer.Ordinal)
+                ? AreaPropertyClass.Indeterminate
+                : AreaPropertyClass.NotDefined;
+        }
+
+        return AreaPropertyClass.Indeterminate;
+    }
+
+    /// <summary>Turns a refused <c>GetWall</c> into the reason the evidence supports.</summary>
+    private static InvalidOperationException Diagnose(IEtabsInspectionApi api, string name) =>
+        Classify(api, name) switch
+        {
+            AreaPropertyClass.NotAWall => new InvalidOperationException(string.Join(
                 "; ",
                 InspectionErrorCodes.AreaPropertyNotAWall,
                 $"name={name}",
-                "the model defines this area property but it is not a wall (ETABS classifies " +
-                "shell properties by which typed accessor accepts them, and cPropArea.GetWall " +
-                "refused this one); list-wall-properties returns only the names that are")
-            : string.Join(
+                "the model defines this area property and classifies it as a slab or deck, " +
+                "not a wall; list-wall-properties returns only the names that are walls")),
+
+            AreaPropertyClass.NotDefined => new InvalidOperationException(string.Join(
                 "; ",
                 InspectionErrorCodes.AreaPropertyNotFound,
                 $"name={name}",
-                "the model defines no area property with this name"));
-    }
+                "a successful census of every area property in the model does not contain " +
+                "this name")),
+
+            // Includes the case where GetWall now succeeds on a retry: the first refusal was
+            // then a transient failure, and reporting success off the back of it would be
+            // answering from evidence this call did not actually gather.
+            _ => Indeterminate(name)
+        };
+
+    /// <summary>
+    /// The honest answer when the model could not be made to say anything definite.
+    /// Explicitly NOT one of the semantic codes: the caller must be able to tell "your name
+    /// is wrong" from "ETABS would not answer me".
+    /// </summary>
+    private static InvalidOperationException Indeterminate(string name) =>
+        new(string.Join(
+            "; ",
+            InspectionErrorCodes.AreaPropertyClassificationFailed,
+            $"name={name}",
+            "cPropArea refused every classification probe (GetWall, GetSlab, GetDeck) and " +
+            "the area-property census did not succeed either, so this property's kind " +
+            "could not be established; this is an ETABS/CSI failure, not a statement " +
+            "about the model"));
 
     private static void RequireSuccess(string member, int returnCode)
     {
