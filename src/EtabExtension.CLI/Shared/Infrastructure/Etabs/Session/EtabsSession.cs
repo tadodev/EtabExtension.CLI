@@ -53,6 +53,7 @@ public sealed class EtabsSession : IEtabsSession
     private readonly object _gate = new();
     private IManagedEtabsApplication? _owned;
     private bool _ready;
+    private string? _visibilityStage;
     private EtabsLaunchException? _launchFailure;
     private ManagedEtabsShutdownResult? _shutdownResult;
 
@@ -195,6 +196,16 @@ public sealed class EtabsSession : IEtabsSession
                 }
 
                 _ready = true;
+
+                // MarkVisibilityStage can arrive before a COLD session exists. Initialization
+                // temporarily labels its own readiness work above; once readiness is proven,
+                // restore the immutable request/operation stage BEFORE the application is
+                // handed back so the first command can never inherit "InitializeNewModel".
+                if (_visibilityStage is not null)
+                {
+                    _owned.MarkVisibilityStage(_visibilityStage);
+                }
+
                 _diagnostics.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
             }
 
@@ -233,6 +244,26 @@ public sealed class EtabsSession : IEtabsSession
     /// uncertain-session case CLI #24 exists to refuse.</para>
     /// </summary>
     private Result FailRevealTerminally(IManagedEtabsApplication owned, string diagnostic)
+    {
+        var cleanup = _shutdownMachine.Shutdown(owned);
+        _shutdownResult = cleanup;
+        if (cleanup.Data.ProcessExitConfirmed)
+        {
+            _owned = null;
+        }
+
+        _ready = false;
+        return Result.Fail(WithTerminalFacts(diagnostic, cleanup));
+    }
+
+    /// <summary>
+    /// Ends a background session whose terminal exact-owned certification failed.
+    /// There is deliberately no recovery-to-running path: either a material exposure was
+    /// observed, or Windows could not prove the protected state at the response boundary.
+    /// </summary>
+    private Result FailBackgroundCertificationTerminally(
+        IManagedEtabsApplication owned,
+        string diagnostic)
     {
         var cleanup = _shutdownMachine.Shutdown(owned);
         _shutdownResult = cleanup;
@@ -446,8 +477,10 @@ public sealed class EtabsSession : IEtabsSession
     /// <inheritdoc />
     public void MarkVisibilityStage(string stage)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(stage);
         lock (_gate)
         {
+            _visibilityStage = stage;
             if (_owned is not null && _ready)
             {
                 _owned.MarkVisibilityStage(stage);
@@ -487,28 +520,41 @@ public sealed class EtabsSession : IEtabsSession
                 return Result.Ok();
             }
 
-            var exposure = _owned.Exposure;
-            if (!exposure.Observed)
-            {
-                return Result.Ok();
-            }
-
             var owned = _owned;
-            var cleanup = _shutdownMachine.Shutdown(owned);
-            _shutdownResult = cleanup;
-            if (cleanup.Data.ProcessExitConfirmed)
+
+            // Force one LAST synchronous census of the exact-owned HWNDs before reading
+            // sticky evidence. The WinEvent callback can be delayed behind the ETABS call
+            // that just returned; this observation closes that race. ConfirmWindowsSuppressed
+            // is read-only: Windows observes, CSI alone mutates visibility.
+            var finalCensus = owned.ConfirmWindowsSuppressed();
+
+            // The census itself records material BackgroundHidden windows into the sticky
+            // #24 evidence. Read only AFTER it, so exposure discovered here is indistinguishable
+            // from exposure already delivered by WinEvent — as it should be.
+            var exposure = owned.Exposure;
+            if (exposure.Observed)
             {
-                _owned = null;
+                return FailBackgroundCertificationTerminally(
+                    owned,
+                    EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        exposure.Describe(),
+                        "the managed ETABS session was materially on screen during background " +
+                        "work the engineer did not ask to see; this request is failed and the " +
+                        "session has been ended"));
             }
 
-            _ready = false;
-            return Result.Fail(WithTerminalFacts(
-                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
-                    exposure.Describe(),
-                    "the managed ETABS session was materially on screen during background " +
-                    "work the engineer did not ask to see; this request is failed and the " +
-                    "session has been ended"),
-                cleanup));
+            if (!finalCensus.Confirmed)
+            {
+                return FailBackgroundCertificationTerminally(
+                    owned,
+                    EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                        finalCensus.Diagnostic
+                            ?? "Managed ETABS background visibility could not be certified.",
+                        "the final exact-owned HWND census did not prove BackgroundHidden; " +
+                        "the request is failed and the session has been ended"));
+            }
+
+            return Result.Ok();
         }
     }
 
@@ -569,7 +615,7 @@ public sealed class EtabsSession : IEtabsSession
                 $"visibleOwnedWindows={windows.ObservedWindows.Count}, " +
                 $"csiReturnCode={csi.ReturnCode}, state={owned.VisibilityState})");
 
-                        return Result.Ok();
+            return Result.Ok();
         }
     }
 

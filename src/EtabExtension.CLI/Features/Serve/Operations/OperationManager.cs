@@ -1,6 +1,8 @@
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 namespace EtabExtension.CLI.Features.Serve.Operations;
 
@@ -25,20 +27,33 @@ public interface IOperationDefinition
 public interface IOperationManager : IDisposable
 {
     bool HasActiveOperation { get; }
+    EtabsOperationContext CaptureEtabsContext(string visibilityStage);
     Result<StartOperationData> Start(string kind, JsonElement payload);
+    Result<StartOperationData> Start(
+        string kind,
+        JsonElement payload,
+        EtabsOperationContext context,
+        IEtabsSession session);
     Result<OperationStatusData> GetStatus(string operationId);
     Result<GetOperationEventsData> GetEvents(string operationId, long sinceSequence);
     Result<CancelOperationData> Cancel(string operationId);
     Task<object> WaitAsync(string operationId, CancellationToken cancellationToken = default);
     Task<T> ExecuteSynchronousAsync<T>(Func<Task<T>> action);
+    Task<object> ExecuteSynchronousEtabsAsync(
+        IEtabsSession session,
+        EtabsOperationContext context,
+        Func<Task<object>> action);
 }
 
 public sealed class OperationManager : IOperationManager
 {
+    private const int CombinedDiagnosticPartLimit = 900;
+
     private readonly object _gate = new();
     private readonly IStaExecutionWorker _worker;
     private readonly IOperationEventJournalFactory _journals;
     private readonly IOperationClock _clock;
+    private readonly IManagedEtabsStartIntentScope _startIntent;
     private readonly Dictionary<string, IOperationDefinition> _definitions;
     private readonly Dictionary<string, OperationState> _operations = new(StringComparer.Ordinal);
     private string? _activeOperationId;
@@ -47,11 +62,13 @@ public sealed class OperationManager : IOperationManager
         IStaExecutionWorker worker,
         IOperationEventJournalFactory journals,
         IOperationClock clock,
-        IEnumerable<IOperationDefinition> definitions)
+        IEnumerable<IOperationDefinition> definitions,
+        IManagedEtabsStartIntentScope? startIntent = null)
     {
         _worker = worker;
         _journals = journals;
         _clock = clock;
+        _startIntent = startIntent ?? new ManagedEtabsStartIntentScope();
         _definitions = definitions.ToDictionary(item => item.Kind, StringComparer.Ordinal);
     }
 
@@ -66,7 +83,31 @@ public sealed class OperationManager : IOperationManager
         }
     }
 
-    public Result<StartOperationData> Start(string kind, JsonElement payload)
+    public EtabsOperationContext CaptureEtabsContext(string visibilityStage)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(visibilityStage);
+        return new EtabsOperationContext(_startIntent.Current, visibilityStage);
+    }
+
+    public Result<StartOperationData> Start(string kind, JsonElement payload) =>
+        StartCore(kind, payload, CaptureEtabsContext(kind), session: null);
+
+    public Result<StartOperationData> Start(
+        string kind,
+        JsonElement payload,
+        EtabsOperationContext context,
+        IEtabsSession session)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(session);
+        return StartCore(kind, payload, context, session);
+    }
+
+    private Result<StartOperationData> StartCore(
+        string kind,
+        JsonElement payload,
+        EtabsOperationContext context,
+        IEtabsSession? session)
     {
         if (!_definitions.TryGetValue(kind, out var definition))
         {
@@ -92,7 +133,9 @@ public sealed class OperationManager : IOperationManager
                     now,
                     definition.OperationBudget,
                     definition.StepBudget,
-                    _journals.Create(operationId));
+                    _journals.Create(operationId),
+                    context,
+                    session);
                 _operations.Add(operationId, state);
                 _activeOperationId = operationId;
                 Append(state, "operation-queued", OperationPhase.Queued, "Operation accepted");
@@ -210,6 +253,17 @@ public sealed class OperationManager : IOperationManager
 
     public Task<T> ExecuteSynchronousAsync<T>(Func<Task<T>> action) => _worker.ExecuteAsync(action);
 
+    public Task<object> ExecuteSynchronousEtabsAsync(
+        IEtabsSession session,
+        EtabsOperationContext context,
+        Func<Task<object>> action)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(action);
+        return _worker.ExecuteAsync(() => ExecuteEtabsCompletionAsync(session, context, action));
+    }
+
     private async Task RunAsync(OperationState state, IOperationDefinition definition, JsonElement payload)
     {
         object result;
@@ -226,9 +280,16 @@ public sealed class OperationManager : IOperationManager
                 }
 
                 var context = new OperationExecutionContext(
+                    state.EtabsContext,
                     (index, total, csiOperation, action) => RunStepAsync(
                         state, index, total, csiOperation, action));
-                return await definition.ExecuteAsync(payload, context);
+
+                return state.Session is null
+                    ? await definition.ExecuteAsync(payload, context)
+                    : await ExecuteEtabsCompletionAsync(
+                        state.Session,
+                        state.EtabsContext,
+                        () => definition.ExecuteAsync(payload, context));
             });
 
             lock (_gate)
@@ -282,6 +343,104 @@ public sealed class OperationManager : IOperationManager
             state.Completion.TrySetResult(result);
         }
     }
+
+    /// <summary>
+    /// The single ETABS operation boundary for synchronous commands and queued operations.
+    /// It republishes the immutable request intent on the STA, labels visibility evidence,
+    /// and certifies terminal visibility state even when the ETABS-backed action throws.
+    /// </summary>
+    private async Task<object> ExecuteEtabsCompletionAsync(
+        IEtabsSession session,
+        EtabsOperationContext context,
+        Func<Task<object>> action)
+    {
+        using var intent = _startIntent.Publish(context.StartIntent);
+        session.MarkVisibilityStage(context.VisibilityStage);
+
+        object? result = null;
+        Exception? actionFailure = null;
+        try
+        {
+            result = await action();
+        }
+        catch (Exception ex)
+        {
+            actionFailure = ex;
+        }
+
+        // A cold session temporarily labels InitializeNewModel while readiness is being
+        // established. EtabsSession restores the pending command stage before handing the
+        // application back; reassert it here as well so the final exact-owned census is
+        // unquestionably attributed to the command/operation being certified.
+        session.MarkVisibilityStage(context.VisibilityStage);
+        var certification = CertifyOrTerminate(session);
+        if (!certification.Success)
+        {
+            return actionFailure is null
+                ? certification
+                : Result.Fail(CombineFailures(context, actionFailure, certification));
+        }
+
+        if (actionFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(actionFailure).Throw();
+        }
+
+        return result!;
+    }
+
+    private static Result CertifyOrTerminate(IEtabsSession session)
+    {
+        try
+        {
+            return session.CertifyNoUnconsentedExposure();
+        }
+        catch (Exception certificationFailure)
+        {
+            var diagnostic = EtabsApiDiagnosticFormatter.InfrastructureException(
+                "IEtabsSession.CertifyNoUnconsentedExposure",
+                certificationFailure);
+            try
+            {
+                var cleanup = session.Shutdown();
+                diagnostic = EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    diagnostic,
+                    $"certificationCleanupState={cleanup.Data.State}; " +
+                    $"processExitConfirmed={cleanup.Data.ProcessExitConfirmed}; " +
+                    $"recordRetained={cleanup.Data.RecordRetained}");
+            }
+            catch (Exception cleanupFailure)
+            {
+                diagnostic = EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    diagnostic,
+                    "certificationCleanupException=" +
+                    EtabsApiDiagnosticFormatter.Bounded(cleanupFailure.Message));
+            }
+
+            return Result.Fail(diagnostic);
+        }
+    }
+
+    private static string CombineFailures(
+        EtabsOperationContext context,
+        Exception actionFailure,
+        Result certification)
+    {
+        var actionDiagnostic = EtabsApiDiagnosticFormatter.InfrastructureException(
+            $"ETABS-backed action ({context.VisibilityStage})",
+            actionFailure);
+        var certificationDiagnostic = EtabsApiDiagnosticFormatter.Bounded(
+            certification.Error ?? "visibility certification failed without a diagnostic");
+
+        return EtabsApiDiagnosticFormatter.Bounded(
+            "actionFailure=" + BoundCombinedPart(actionDiagnostic) +
+            "; visibilityCertification=" + BoundCombinedPart(certificationDiagnostic));
+    }
+
+    private static string BoundCombinedPart(string value) =>
+        value.Length <= CombinedDiagnosticPartLimit
+            ? value
+            : string.Concat(value.AsSpan(0, CombinedDiagnosticPartLimit - 1), "…");
 
     private async Task<T> RunStepAsync<T>(
         OperationState state,
@@ -359,7 +518,9 @@ public sealed class OperationManager : IOperationManager
         DateTimeOffset startedAt,
         TimeSpan operationBudget,
         TimeSpan stepBudget,
-        IOperationEventJournal journal)
+        IOperationEventJournal journal,
+        EtabsOperationContext etabsContext,
+        IEtabsSession? session)
     {
         public string OperationId { get; } = operationId;
         public string Kind { get; } = kind;
@@ -367,6 +528,8 @@ public sealed class OperationManager : IOperationManager
         public TimeSpan OperationBudget { get; } = operationBudget;
         public TimeSpan StepBudget { get; } = stepBudget;
         public IOperationEventJournal Journal { get; } = journal;
+        public EtabsOperationContext EtabsContext { get; } = etabsContext;
+        public IEtabsSession? Session { get; } = session;
         public TaskCompletionSource<object> Completion { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         public OperationPhase Phase { get; set; } = OperationPhase.Queued;
@@ -384,7 +547,14 @@ public sealed class OperationExecutionContext : IEtabsOperationProgress
     private readonly Func<int, int, string, Func<Task<object?>>, Task<object?>> _runStep;
 
     internal OperationExecutionContext(
-        Func<int, int, string, Func<Task<object?>>, Task<object?>> runStep) => _runStep = runStep;
+        EtabsOperationContext etabs,
+        Func<int, int, string, Func<Task<object?>>, Task<object?>> runStep)
+    {
+        Etabs = etabs;
+        _runStep = runStep;
+    }
+
+    public EtabsOperationContext Etabs { get; }
 
     public async Task<T> RunStepAsync<T>(
         int index,

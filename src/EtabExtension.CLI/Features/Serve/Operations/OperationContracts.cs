@@ -1,10 +1,20 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 namespace EtabExtension.CLI.Features.Serve.Operations;
 
 public enum OperationPhase { Queued, Running, Cancelling, Succeeded, Failed, Cancelled }
 public enum OperationCancellationState { NotRequested, Requested, Honored }
+
+/// <summary>
+/// Immutable request intent captured before ETABS work crosses onto the queued STA.
+/// A later protocol request can neither replace the cold-start consent nor relabel the
+/// visibility evidence for work that is already queued or running.
+/// </summary>
+public sealed record EtabsOperationContext(
+    ManagedEtabsStartIntent StartIntent,
+    string VisibilityStage);
 
 public sealed record StartOperationRequest(
     [property: JsonPropertyName("kind")] string Kind,

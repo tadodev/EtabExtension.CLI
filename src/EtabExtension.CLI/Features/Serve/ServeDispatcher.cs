@@ -127,11 +127,11 @@ public sealed class ServeDispatcher : IServeDispatcher
         // Label the interval for CLI #24 evidence, so an exposure observation says which
         // command was running and not only how many milliseconds in it happened.
         //
-        // Recorded here but APPLIED on the COM worker below. The protocol thread must never
-        // touch the session: while an async operation is running the worker holds the
-        // session lock for the whole operation, and a protocol thread that blocked on it
-        // would stop answering get-operation-status - which is the one thing that must keep
-        // working during a long run.
+        // The protocol thread records only the request-local name. Every ETABS path below
+        // copies it, together with the current visible-start intent, into an immutable
+        // EtabsOperationContext BEFORE work can cross onto the COM worker. A later request
+        // may update this field for itself, but it cannot relabel work that is already
+        // queued or running.
         _dispatchingCommand = command;
 
         return _handlers.TryGetValue(command, out var handler)
@@ -182,7 +182,12 @@ public sealed class ServeDispatcher : IServeDispatcher
     {
         _ = ct;
         var req = Deserialize<StartOperationRequest>(request);
-        return Task.FromResult<object>(_operations.Start(req.Kind, req.Payload));
+        var context = _operations.CaptureEtabsContext(req.Kind);
+        return Task.FromResult<object>(_operations.Start(
+            req.Kind,
+            req.Payload,
+            context,
+            _session));
     }
 
     private Task<object> DispatchGetOperationStatusAsync(
@@ -267,7 +272,12 @@ public sealed class ServeDispatcher : IServeDispatcher
         // Frozen Rust compatibility: start through the generic envelope,
         // then internally wait and return the original Result<T> unchanged.
         var payload = RequirePayload(request);
-        var started = _operations.Start("analyze-and-extract", payload);
+        var context = _operations.CaptureEtabsContext("analyze-and-extract");
+        var started = _operations.Start(
+            "analyze-and-extract",
+            payload,
+            context,
+            _session);
         if (!started.Success || started.Data is null)
         {
             return Result.Fail<AnalyzeAndExtractData>(
@@ -425,36 +435,27 @@ public sealed class ServeDispatcher : IServeDispatcher
         ?? throw new InvalidOperationException("Missing 'request' payload for this command");
 
     /// <summary>
-    /// The command currently being dispatched, for CLI #24 stage labelling only.
-    ///
-    /// <para>Written on the protocol thread and read on the COM worker without a lock,
-    /// which is safe because the serve loop dispatches strictly one request at a time. It
-    /// is evidence LABELLING: a stale value could at worst mis-name a stage in a
-    /// diagnostic, and can never change a decision.</para>
+    /// The command currently being dispatched long enough to snapshot it into an immutable
+    /// <see cref="EtabsOperationContext"/>. It is never read by queued ETABS work directly.
     /// </summary>
     private volatile string _dispatchingCommand = "unknown";
 
     /// <summary>
-    /// Every ETABS-backed command runs through here, which makes it the one place a
-    /// CLI #24 certification can cover them all.
-    ///
-    /// <para>The check runs AFTER the work and BEFORE the response leaves: a background
-    /// command that put ETABS on screen must not answer success just because ETABS hid
-    /// itself again first. A failed certification replaces the result outright rather than
-    /// annotating it - a partially-successful export whose session breached the visibility
-    /// contract is not a success the desktop should act on.</para>
+    /// Every synchronous ETABS-backed command enters the same completion boundary used by
+    /// queued operations. Intent and stage are captured before the STA handoff; terminal
+    /// visibility certification therefore runs for success and throw paths alike.
     /// </summary>
-    private Task<object> ExecuteComAsync(Func<Task<object>> action) =>
-        _operations.HasActiveOperation
-            ? Task.FromResult<object>(Result.Fail(
-                "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"))
-            : _operations.ExecuteSynchronousAsync(async () =>
-            {
-                _session.MarkVisibilityStage(_dispatchingCommand);
-                var result = await action();
-                var certified = _session.CertifyNoUnconsentedExposure();
-                return certified.Success ? result : certified;
-            });
+    private Task<object> ExecuteComAsync(Func<Task<object>> action)
+    {
+        if (_operations.HasActiveOperation)
+        {
+            return Task.FromResult<object>(Result.Fail(
+                "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"));
+        }
+
+        var context = _operations.CaptureEtabsContext(_dispatchingCommand);
+        return _operations.ExecuteSynchronousEtabsAsync(_session, context, action);
+    }
 
     private Result<GetStatusData> ReadActiveStatus()
     {

@@ -58,28 +58,28 @@ public static class ManagedEtabsStartIntents
 }
 
 /// <summary>
-/// Carries the current request's declared start intent to the one place that can act on
-/// it — the session, at the moment it would otherwise create a process.
+/// Carries the current request or queued operation's declared start intent to the one place
+/// that can act on it — the session, at the moment it would otherwise create a process.
 ///
 /// <para><b>Why an ambient scope rather than a parameter on every command.</b> The intent
 /// belongs to the REQUEST, not to any one command's payload. Threading it through all
-/// twenty command signatures would duplicate the field twenty times, and each new command
-/// would be one more place to forget it — which is the failure mode this gate exists to
-/// prevent. The serve loop dispatches strictly one request at a time (ETABS COM is
-/// single-threaded and the loop is serial by construction), so a single ambient value is
-/// unambiguous for the request in flight.</para>
+/// command signatures would duplicate the field and create more places to forget the
+/// cold-start gate.</para>
 ///
-/// <para>It is cleared after every request so an earlier consent can never be reused by a
-/// later one that did not declare it.</para>
+/// <para><b>Why the value is execution-context local.</b> A queued operation runs on the
+/// dedicated STA while the protocol thread remains free to serve later status requests.
+/// Those requests must not overwrite the operation's captured consent, and the operation
+/// must not leak its consent back to them. <see cref="AsyncLocal{T}"/> gives each logical
+/// execution flow its own scope while still surviving async continuations on that flow.</para>
 /// </summary>
 public interface IManagedEtabsStartIntentScope
 {
-    /// <summary>The intent declared by the request currently being dispatched.</summary>
+    /// <summary>The intent declared by the request or operation currently executing.</summary>
     ManagedEtabsStartIntent Current { get; }
 
     /// <summary>
-    /// Publishes the intent for one request and returns a scope that clears it. Always use
-    /// with <c>using</c>: a leaked value would let the NEXT request inherit consent.
+    /// Publishes one immutable captured intent for the current logical execution flow and
+    /// returns a scope that restores the previous value. Always use with <c>using</c>.
     /// </summary>
     IDisposable Publish(ManagedEtabsStartIntent intent);
 }
@@ -87,20 +87,35 @@ public interface IManagedEtabsStartIntentScope
 /// <inheritdoc />
 public sealed class ManagedEtabsStartIntentScope : IManagedEtabsStartIntentScope
 {
-    private ManagedEtabsStartIntent _current = ManagedEtabsStartIntent.Unspecified;
+    private readonly AsyncLocal<ManagedEtabsStartIntent?> _current = new();
 
     /// <inheritdoc />
-    public ManagedEtabsStartIntent Current => _current;
+    public ManagedEtabsStartIntent Current =>
+        _current.Value ?? ManagedEtabsStartIntent.Unspecified;
 
     /// <inheritdoc />
     public IDisposable Publish(ManagedEtabsStartIntent intent)
     {
-        _current = intent;
-        return new Reset(this);
+        var previous = _current.Value;
+        _current.Value = intent;
+        return new Reset(this, previous);
     }
 
-    private sealed class Reset(ManagedEtabsStartIntentScope owner) : IDisposable
+    private sealed class Reset(
+        ManagedEtabsStartIntentScope owner,
+        ManagedEtabsStartIntent? previous) : IDisposable
     {
-        public void Dispose() => owner._current = ManagedEtabsStartIntent.Unspecified;
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            owner._current.Value = previous;
+        }
     }
 }
