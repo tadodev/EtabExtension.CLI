@@ -404,6 +404,26 @@ public interface IManagedEtabsWindowGuard : IDisposable
     ManagedEtabsWindowConfirmation ConfirmRevealed();
 
     /// <summary>
+    /// CLI&#160;#24's certification step: forces ONE synchronous exact-owned census and
+    /// reads the sticky evidence, under a single hold of the lock.
+    ///
+    /// <para><b>Why a forced census and not just a read.</b> Evidence accumulates from
+    /// WinEvent callbacks, which are delivered asynchronously on the monitor's pump thread.
+    /// A window can therefore surface, the command can finish, and the callback can still
+    /// be in flight when the response is about to be written - so a plain read of the
+    /// accumulated evidence can return clean for an exposure that has already happened on
+    /// screen. Observing here closes that gap: whatever is materially visible AT THIS
+    /// INSTANT is recorded before the verdict is taken.</para>
+    ///
+    /// <para><b>Why the sticky evidence and not just the census.</b> The opposite gap. A
+    /// window that surfaced and was taken down again mid-command is invisible to any
+    /// point-in-time look, and it is exactly the exposure the engineer saw. Neither half is
+    /// sufficient; the contract is temporal evidence PLUS a forced final look, decided
+    /// together so nothing can slip between them.</para>
+    /// </summary>
+    ManagedEtabsExposureEvidence CertifyExposure();
+
+    /// <summary>
     /// Marks an explicit reveal as in flight, BEFORE the CSI call is issued.
     ///
     /// <para>The observer stays ALIVE across this. A window appearing now is what the
@@ -545,24 +565,43 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
         {
             lock (_gate)
             {
-                if (!_exposureObserved)
-                {
-                    return ManagedEtabsExposureEvidence.None;
-                }
-
-                // A run that is still open at read time counts toward the totals without
-                // being closed — reading the evidence must not mutate it.
-                var openRun = _openRunStartMs is { } start ? _openRunLastMs - start : 0;
-                return new ManagedEtabsExposureEvidence(
-                    true,
-                    _exposureObservations,
-                    _firstExposure,
-                    _lastExposure,
-                    _totalVisibleMs + openRun,
-                    Math.Max(_maxContiguousVisibleMs, openRun),
-                    ObservationDurationMs());
+                return ExposureLocked();
             }
         }
+    }
+
+    /// <inheritdoc />
+    public ManagedEtabsExposureEvidence CertifyExposure()
+    {
+        lock (_gate)
+        {
+            // One lock, two halves of the same question. Observing and then reading in two
+            // separate acquisitions would reopen the race this method exists to close: a
+            // callback could land in between and be judged by nobody.
+            ObserveLocked();
+            return ExposureLocked();
+        }
+    }
+
+    /// <summary>The evidence as it stands. Callers hold the gate.</summary>
+    private ManagedEtabsExposureEvidence ExposureLocked()
+    {
+        if (!_exposureObserved)
+        {
+            return ManagedEtabsExposureEvidence.None;
+        }
+
+        // A run that is still open at read time counts toward the totals without
+        // being closed — reading the evidence must not mutate it.
+        var openRun = _openRunStartMs is { } start ? _openRunLastMs - start : 0;
+        return new ManagedEtabsExposureEvidence(
+            true,
+            _exposureObservations,
+            _firstExposure,
+            _lastExposure,
+            _totalVisibleMs + openRun,
+            Math.Max(_maxContiguousVisibleMs, openRun),
+            ObservationDurationMs());
     }
 
     /// <summary>Observation passes prompted by an operating-system window event.</summary>

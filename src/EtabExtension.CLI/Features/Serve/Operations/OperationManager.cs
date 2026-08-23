@@ -1,6 +1,7 @@
 using System.Text.Json;
 using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 
 namespace EtabExtension.CLI.Features.Serve.Operations;
 
@@ -39,6 +40,7 @@ public sealed class OperationManager : IOperationManager
     private readonly IStaExecutionWorker _worker;
     private readonly IOperationEventJournalFactory _journals;
     private readonly IOperationClock _clock;
+    private readonly IEtabsWorkEnvelope _envelope;
     private readonly Dictionary<string, IOperationDefinition> _definitions;
     private readonly Dictionary<string, OperationState> _operations = new(StringComparer.Ordinal);
     private string? _activeOperationId;
@@ -47,11 +49,13 @@ public sealed class OperationManager : IOperationManager
         IStaExecutionWorker worker,
         IOperationEventJournalFactory journals,
         IOperationClock clock,
+        IEtabsWorkEnvelope envelope,
         IEnumerable<IOperationDefinition> definitions)
     {
         _worker = worker;
         _journals = journals;
         _clock = clock;
+        _envelope = envelope;
         _definitions = definitions.ToDictionary(item => item.Kind, StringComparer.Ordinal);
     }
 
@@ -84,11 +88,18 @@ public sealed class OperationManager : IOperationManager
 
             var operationId = Guid.NewGuid().ToString("N");
             var now = _clock.UtcNow;
+
+            // Captured HERE, on the protocol thread, while the request that declared it is
+            // still in flight. The operation executes later on the STA worker, long after
+            // this request returned and possibly while a polling request is publishing its
+            // own (undeclared) intent - so the consent has to travel WITH the work.
+            var work = _envelope.Capture(kind);
             try
             {
                 state = new OperationState(
                     operationId,
                     kind,
+                    work,
                     now,
                     definition.OperationBudget,
                     definition.StepBudget,
@@ -228,7 +239,15 @@ public sealed class OperationManager : IOperationManager
                 var context = new OperationExecutionContext(
                     (index, total, csiOperation, action) => RunStepAsync(
                         state, index, total, csiOperation, action));
-                return await definition.ExecuteAsync(payload, context);
+
+                // The same envelope the synchronous lane uses. Queued work gets the stage
+                // label and the completion certification by construction rather than by
+                // each operation definition remembering to ask for them - and a breach
+                // here fails the OPERATION, so its journal and its terminal phase both say
+                // so instead of recording a success the engineer should not act on.
+                return await _envelope.RunAsync(
+                    state.Work,
+                    () => definition.ExecuteAsync(payload, context));
             });
 
             lock (_gate)
@@ -356,6 +375,7 @@ public sealed class OperationManager : IOperationManager
     private sealed class OperationState(
         string operationId,
         string kind,
+        EtabsWorkContext work,
         DateTimeOffset startedAt,
         TimeSpan operationBudget,
         TimeSpan stepBudget,
@@ -363,6 +383,10 @@ public sealed class OperationManager : IOperationManager
     {
         public string OperationId { get; } = operationId;
         public string Kind { get; } = kind;
+
+        /// <summary>The consent and stage this operation was accepted with. Immutable.</summary>
+        public EtabsWorkContext Work { get; } = work;
+
         public DateTimeOffset StartedAt { get; } = startedAt;
         public TimeSpan OperationBudget { get; } = operationBudget;
         public TimeSpan StepBudget { get; } = stepBudget;

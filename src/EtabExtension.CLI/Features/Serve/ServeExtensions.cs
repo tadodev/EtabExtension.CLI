@@ -18,6 +18,8 @@ public static class ServeExtensions
         services.AddScoped<IManagedEtabsLauncher, ManagedEtabsLauncher>();
         services.AddScoped<IOrphanSessionCleaner, OrphanSessionCleaner>();
         services.AddScoped<IManagedEtabsStartIntentScope, ManagedEtabsStartIntentScope>();
+        services.AddScoped<IEtabsWorkScope, EtabsWorkScope>();
+        services.AddScoped<IEtabsWorkEnvelope, EtabsWorkEnvelope>();
         services.AddScoped<IEtabsSession, EtabsSession>();
         services.AddScoped<IStaExecutionWorker, StaExecutionWorker>();
         services.AddScoped<IServeShutdownCoordinator, ServeShutdownCoordinator>();

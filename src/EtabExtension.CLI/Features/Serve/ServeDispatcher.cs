@@ -48,6 +48,7 @@ public sealed class ServeDispatcher : IServeDispatcher
     private readonly ICachedSessionStatus _cachedStatus;
     private readonly IProcessInspector _processes;
     private readonly IRunAnalysisService _runAnalysis;
+    private readonly IEtabsWorkEnvelope _envelope;
     private readonly Dictionary<
         string,
         Func<JsonElement?, CancellationToken, Task<object>>> _handlers;
@@ -71,7 +72,8 @@ public sealed class ServeDispatcher : IServeDispatcher
         IOperationManager operations,
         ICachedSessionStatus cachedStatus,
         IProcessInspector processes,
-        IRunAnalysisService runAnalysis)
+        IRunAnalysisService runAnalysis,
+        IEtabsWorkEnvelope envelope)
     {
         _session = session;
         _status = status;
@@ -90,6 +92,7 @@ public sealed class ServeDispatcher : IServeDispatcher
         _cachedStatus = cachedStatus;
         _processes = processes;
         _runAnalysis = runAnalysis;
+        _envelope = envelope;
 
         var handlers = new Dictionary<
             string,
@@ -124,15 +127,12 @@ public sealed class ServeDispatcher : IServeDispatcher
         JsonElement? request,
         CancellationToken ct)
     {
-        // Label the interval for CLI #24 evidence, so an exposure observation says which
-        // command was running and not only how many milliseconds in it happened.
-        //
-        // Recorded here but APPLIED on the COM worker below. The protocol thread must never
-        // touch the session: while an async operation is running the worker holds the
-        // session lock for the whole operation, and a protocol thread that blocked on it
-        // would stop answering get-operation-status - which is the one thing that must keep
-        // working during a long run.
-        _dispatchingCommand = command;
+        // Freeze this request's declared intent and its CLI #24 label into one immutable
+        // context, on the thread where the declaration is valid. Nothing about the session
+        // is touched here: while an async operation runs, the worker holds the session lock
+        // for its whole duration, and a protocol thread that blocked on it would stop
+        // answering get-operation-status - the one thing that must keep working.
+        _pendingWork = _envelope.Capture(command);
 
         return _handlers.TryGetValue(command, out var handler)
             ? handler(request, ct)
@@ -153,7 +153,8 @@ public sealed class ServeDispatcher : IServeDispatcher
             return ReadActiveStatus();
         }
 
-        return await _operations.ExecuteSynchronousAsync(() =>
+        var work = _pendingWork;
+        return await _operations.ExecuteSynchronousAsync(() => _envelope.RunAsync(work, () =>
         {
             try
             {
@@ -173,7 +174,7 @@ public sealed class ServeDispatcher : IServeDispatcher
                 return Task.FromResult<object>(Result.Fail<GetStatusData>(
                     $"ETABS process observation failed: {ex.Message}"));
             }
-        });
+        }));
     }
 
     private Task<object> DispatchStartOperationAsync(
@@ -425,14 +426,16 @@ public sealed class ServeDispatcher : IServeDispatcher
         ?? throw new InvalidOperationException("Missing 'request' payload for this command");
 
     /// <summary>
-    /// The command currently being dispatched, for CLI #24 stage labelling only.
+    /// The context captured for the request currently being dispatched.
     ///
-    /// <para>Written on the protocol thread and read on the COM worker without a lock,
-    /// which is safe because the serve loop dispatches strictly one request at a time. It
-    /// is evidence LABELLING: a stale value could at worst mis-name a stage in a
-    /// diagnostic, and can never change a decision.</para>
+    /// <para>Written on the protocol thread at the top of
+    /// <see cref="DispatchAsync"/> and read there again when the synchronous lane hands
+    /// work to the COM worker - both on the same thread, and the serve loop dispatches
+    /// strictly one request at a time. From the hand-off onwards the value travels as an
+    /// immutable copy, so nothing the worker relies on can be overwritten underneath
+    /// it.</para>
     /// </summary>
-    private volatile string _dispatchingCommand = "unknown";
+    private EtabsWorkContext _pendingWork = EtabsWorkContext.None;
 
     /// <summary>
     /// Every ETABS-backed command runs through here, which makes it the one place a
@@ -444,17 +447,22 @@ public sealed class ServeDispatcher : IServeDispatcher
     /// annotating it - a partially-successful export whose session breached the visibility
     /// contract is not a success the desktop should act on.</para>
     /// </summary>
-    private Task<object> ExecuteComAsync(Func<Task<object>> action) =>
-        _operations.HasActiveOperation
-            ? Task.FromResult<object>(Result.Fail(
-                "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"))
-            : _operations.ExecuteSynchronousAsync(async () =>
-            {
-                _session.MarkVisibilityStage(_dispatchingCommand);
-                var result = await action();
-                var certified = _session.CertifyNoUnconsentedExposure();
-                return certified.Success ? result : certified;
-            });
+    /// <summary>
+    /// The synchronous ETABS lane. Same envelope as the queued lane - captured context in,
+    /// stage labelled, completion certified - so the two lanes cannot drift apart in what
+    /// the visibility contract means.
+    /// </summary>
+    private Task<object> ExecuteComAsync(Func<Task<object>> action)
+    {
+        if (_operations.HasActiveOperation)
+        {
+            return Task.FromResult<object>(Result.Fail(
+                "A daemon operation is active; synchronous ETABS commands are unavailable until it completes"));
+        }
+
+        var work = _pendingWork;
+        return _operations.ExecuteSynchronousAsync(() => _envelope.RunAsync(work, action));
+    }
 
     private Result<GetStatusData> ReadActiveStatus()
     {

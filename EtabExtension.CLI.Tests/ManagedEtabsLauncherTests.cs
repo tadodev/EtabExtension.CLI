@@ -886,6 +886,28 @@ public sealed class ManagedEtabsLauncherTests
         public ManagedEtabsExposureEvidence Exposure { get; set; } =
             ManagedEtabsExposureEvidence.None;
 
+        /// <summary>
+        /// Evidence that only a FORCED census would find: the window surfaced, but its
+        /// event callback has not been delivered yet, so a plain read of
+        /// <c>Exposure</c> still reports clean. This is the exact race the certification
+        /// primitive exists to close, so the fake has to be able to reproduce it.
+        /// </summary>
+        public ManagedEtabsExposureEvidence? UndeliveredObservation { get; set; }
+
+        public int CertifyExposureCalls { get; private set; }
+
+        public ManagedEtabsExposureEvidence CertifyExposure()
+        {
+            CertifyExposureCalls++;
+            if (UndeliveredObservation is { } pending)
+            {
+                Exposure = pending;
+                UndeliveredObservation = null;
+            }
+
+            return Exposure;
+        }
+
         public int EnterBackgroundHiddenCalls { get; private set; }
 
         public int EnterUserVisibleCalls { get; private set; }

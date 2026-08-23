@@ -444,6 +444,14 @@ public interface IManagedEtabsApplication
     /// </summary>
     ManagedEtabsExposureEvidence Exposure { get; }
 
+    /// <summary>
+    /// Forces one synchronous exact-owned census and reads the sticky evidence as a single
+    /// step. This - not <see cref="Exposure"/> - is what a completion certification must
+    /// use, because a plain read cannot see a window whose event callback has not been
+    /// delivered yet.
+    /// </summary>
+    ManagedEtabsExposureEvidence CertifyExposure();
+
     /// <summary>Marks an explicit reveal as in flight, before the CSI call is issued.</summary>
     void BeginExplicitReveal();
 
@@ -536,6 +544,9 @@ public sealed class ManagedEtabsApplication(
 
     /// <inheritdoc />
     public ManagedEtabsExposureEvidence Exposure => windowGuard.Exposure;
+
+    /// <inheritdoc />
+    public ManagedEtabsExposureEvidence CertifyExposure() => windowGuard.CertifyExposure();
 
     /// <inheritdoc />
     public void BeginExplicitReveal() => windowGuard.BeginExplicitReveal();

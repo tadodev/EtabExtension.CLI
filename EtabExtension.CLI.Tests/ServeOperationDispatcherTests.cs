@@ -577,10 +577,102 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Contains("snapshot-export", session.Stages);
     }
 
-    private OperationManager CreateManager(IOperationDefinition definition) => new(
+    /// <summary>
+    /// The ASYNC lane, which R5 did not reach. <c>analyze-and-extract</c> and
+    /// <c>start-operation</c> do not run through the synchronous COM wrapper at all - they
+    /// queue work on the STA worker and answer later - so a certification bolted onto the
+    /// synchronous wrapper left the daemon's longest-running command as the one path that
+    /// could expose ETABS and still finish successfully.
+    /// </summary>
+    [Fact]
+    public async Task AQueuedOperationThatExposedEtabsCannotFinishSuccessfully()
+    {
+        var session = new FakeSession
+        {
+            ExposureCertification = Result.Fail(
+                "ETABS_WINDOW_UNCONSENTED_EXPOSURE; observations=5; totalVisibleMs=4210")
+        };
+        _manager = CreateManager(
+            new DelegateOperation((_, _) => Task.FromResult<object>(
+                Result.Ok(new AnalyzeAndExtractData
+                {
+                    FilePath = @"C:\model.edb",
+                    OutputDir = @"C:
+esults"
+                }))),
+            session);
+        var dispatcher = CreateDispatcher(_manager, session);
+
+        var response = await dispatcher.DispatchAsync(
+            "analyze-and-extract",
+            Json("""{"filePath":"C:\\model.edb","outputDir":"C:\\results","units":"SI_kN_m_C","tables":{}}"""),
+            TestContext.Current.CancellationToken);
+
+        var result = Assert.IsType<Result>(response, exactMatch: false);
+        Assert.False(result.Success);
+        Assert.Contains(
+            "ETABS_WINDOW_UNCONSENTED_EXPOSURE",
+            result.Error,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the OPERATION itself is terminal-failed, not merely the response. A desktop that
+    /// polls status rather than waiting on the reply must reach the same conclusion.
+    /// </summary>
+    [Fact]
+    public async Task AQueuedOperationThatExposedEtabsEndsInTheFailedPhase()
+    {
+        var session = new FakeSession
+        {
+            ExposureCertification = Result.Fail(
+                "ETABS_WINDOW_UNCONSENTED_EXPOSURE; observations=2")
+        };
+        _manager = CreateManager(
+            new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())),
+            session);
+        var dispatcher = CreateDispatcher(_manager, session);
+
+        var start = Assert.IsType<Result<StartOperationData>>(await dispatcher.DispatchAsync(
+            "start-operation",
+            Json("""{"kind":"analyze-and-extract","payload":{"filePath":"model.edb"}}"""),
+            TestContext.Current.CancellationToken));
+        _ = await _manager.WaitAsync(
+            start.Data!.OperationId,
+            TestContext.Current.CancellationToken);
+
+        var status = Assert.IsType<Result<OperationStatusData>>(await dispatcher.DispatchAsync(
+            "get-operation-status",
+            Json($$"""{"operationId":"{{start.Data.OperationId}}"}"""),
+            TestContext.Current.CancellationToken));
+
+        Assert.Equal(OperationPhase.Failed, status.Data!.Phase);
+    }
+
+    /// <summary>A queued operation is labelled with its kind, so #24 evidence attributes it.</summary>
+    [Fact]
+    public async Task AQueuedOperationLabelsTheVisibilityStageWithItsKind()
+    {
+        var session = new FakeSession();
+        _manager = CreateManager(
+            new DelegateOperation((_, _) => Task.FromResult<object>(Result.Ok())),
+            session);
+
+        var started = _manager.Start("analyze-and-extract", Json("{}"));
+        _ = await _manager.WaitAsync(
+            started.Data!.OperationId,
+            TestContext.Current.CancellationToken);
+
+        Assert.Contains("analyze-and-extract", session.Stages);
+    }
+
+    private OperationManager CreateManager(
+        IOperationDefinition definition,
+        IEtabsSession? session = null) => new(
         new StaExecutionWorker(),
         new OperationEventJournalFactory(_directory, memoryCapacity: 4),
         new SystemOperationClock(),
+        WorkEnvelopeFixtures.Consented(session ?? new FakeSession()),
         [definition]);
 
     [Fact]
@@ -624,7 +716,8 @@ public sealed class ServeOperationDispatcherTests : IDisposable
             operations,
             cachedStatus ?? new CachedSessionStatus(),
             processes ?? new FakeProcesses(new EtabsProcessObservation([], 0)),
-            runAnalysis ?? null!);
+            runAnalysis ?? null!,
+            WorkEnvelopeFixtures.Consented(session ?? new FakeSession()));
 
     private static JsonElement Json(string value) => JsonSerializer.Deserialize<JsonElement>(value);
 

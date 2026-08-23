@@ -33,6 +33,7 @@ public sealed class AnalyzeAndExtractOperationTests : IDisposable
             new StaExecutionWorker(),
             new OperationEventJournalFactory(_directory),
             new SystemOperationClock(),
+            WorkEnvelopeFixtures.Consented(session),
             [definition]);
         var payload = JsonSerializer.Deserialize<JsonElement>(
             """{"filePath":"C:\\v1\\model.edb","outputDir":"C:\\v1\\results","units":"US_Kip_Ft","cases":["DEAD"],"tables":{"baseReactions":{"loadCases":["*"]}}}""");

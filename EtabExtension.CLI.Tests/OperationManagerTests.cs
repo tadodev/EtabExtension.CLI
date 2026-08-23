@@ -1,5 +1,8 @@
 using System.Text.Json;
+using EtabSharp.Core;
 using EtabExtension.CLI.Features.Serve.Operations;
+using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using Xunit;
 
 namespace EtabExtension.CLI.Tests;
@@ -185,11 +188,33 @@ public sealed class OperationManagerTests : IDisposable
         Assert.Equal(ApartmentState.STA, apartment);
     }
 
-    private OperationManager CreateManager(IOperationDefinition definition, IOperationClock? clock = null) => new(
+    private OperationManager CreateManager(
+        IOperationDefinition definition,
+        IOperationClock? clock = null,
+        IEtabsSession? session = null) => new(
         new StaExecutionWorker(),
         new OperationEventJournalFactory(_directory, memoryCapacity: 4),
         clock ?? new SystemOperationClock(),
+        WorkEnvelopeFixtures.Consented(session ?? new NullVisibilitySession()),
         [definition]);
+
+    /// <summary>
+    /// A session that is not started at all. These tests are about operation lifecycle -
+    /// phases, journals, cancellation - and a session with no ETABS behind it certifies
+    /// clean, which keeps the envelope in the path without it deciding anything here.
+    /// </summary>
+    private sealed class NullVisibilitySession : IEtabsSession
+    {
+        public bool IsStarted => false;
+        public int? ProcessId => null;
+        public ETABSApplication GetOrStart() => throw new InvalidOperationException();
+        public IManagedEtabsApplication GetOrStartOwned() => throw new InvalidOperationException();
+        public Result RevealForExplicitUserRequest() => Result.Ok();
+        public Result CertifyNoUnconsentedExposure() => Result.Ok();
+        public void MarkVisibilityStage(string stage) { }
+        public ManagedEtabsShutdownResult Shutdown() => throw new InvalidOperationException();
+        public void Dispose() { }
+    }
 
     private static JsonElement EmptyPayload() => JsonSerializer.Deserialize<JsonElement>("{}");
 

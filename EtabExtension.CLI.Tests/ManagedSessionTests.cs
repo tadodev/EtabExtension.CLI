@@ -1253,7 +1253,7 @@ public sealed class ManagedSessionTests
         var events = new List<string>();
         var managed = Managed(events);
         var launcher = new FakeLauncher(managed, events);
-        var scope = new ManagedEtabsStartIntentScope();
+        var scope = new EtabsWorkScope();
         var session = new EtabsSession(
             launcher,
             new FakeProcesses { Live = Identity },
@@ -1266,7 +1266,9 @@ public sealed class ManagedSessionTests
         Assert.Equal(0, launcher.LaunchCount);
 
         // Request 2: the desktop prompted, the engineer agreed.
-        using (scope.Publish(ManagedEtabsStartIntent.VisibleByConsent))
+        using (scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "retry")))
         {
             Assert.Same(managed, session.GetOrStartOwned());
         }
@@ -1284,7 +1286,7 @@ public sealed class ManagedSessionTests
         var events = new List<string>();
         var managed = Managed(events);
         var launcher = new FakeLauncher(managed, events);
-        var scope = new ManagedEtabsStartIntentScope();
+        var scope = new EtabsWorkScope();
         var session = new EtabsSession(
             launcher,
             new FakeProcesses { Live = Identity },
@@ -1296,7 +1298,9 @@ public sealed class ManagedSessionTests
             _ = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
         }
 
-        using (scope.Publish(ManagedEtabsStartIntent.VisibleByConsent))
+        using (scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "retry")))
         {
             Assert.Same(managed, session.GetOrStartOwned());
         }
@@ -1337,6 +1341,74 @@ public sealed class ManagedSessionTests
 
         Assert.False(result.Success);
         Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// The certification must FORCE a census, not read the accumulated evidence.
+    ///
+    /// <para>The window surfaced moments ago and its event callback has not been delivered
+    /// yet, so the sticky evidence still reads clean. A certification that only reads would
+    /// let the request that caused the exposure answer success, and the callback would land
+    /// immediately afterwards - recorded faithfully, and far too late to matter.</para>
+    /// </summary>
+    [Fact]
+    public void CertificationForcesAFinalCensusRatherThanReadingStaleEvidence()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+
+        // Clean to a reader; a forced census would find the window.
+        fixture.Managed.UndeliveredObservation = new ManagedEtabsExposureEvidence(
+            Observed: true,
+            Observations: 1,
+            First: new ManagedEtabsExposureObservation(
+                (nint)0x3C1, new WindowBounds(0, 0, 1920, 1080), 210, "snapshot-export"),
+            Last: new ManagedEtabsExposureObservation(
+                (nint)0x3C1, new WindowBounds(0, 0, 1920, 1080), 210, "snapshot-export"),
+            ObservedTotalVisibleMs: 0,
+            ObservedMaxContiguousVisibleMs: 0,
+            ObservationDurationMs: 3000);
+        Assert.False(fixture.Managed.Exposure.Observed);
+
+        var certified = fixture.Session.CertifyNoUnconsentedExposure();
+
+        Assert.False(certified.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.UnconsentedExposure,
+            certified.Error,
+            StringComparison.Ordinal);
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// CLI #24 evidence has to name the command that caused the exposure. The FIRST command
+    /// on a cold daemon marks its stage before the session exists; the launch then walks
+    /// through its own stages, and without handing the label back afterwards an exposure
+    /// during the actual work is filed under an initialization step that had already
+    /// finished.
+    /// </summary>
+    [Fact]
+    public void TheCommandStageIsReappliedOnceTheColdStartIsReady()
+    {
+        var fixture = VisibilityFixture.Create();
+
+        fixture.Session.MarkVisibilityStage("snapshot-export");
+        fixture.Session.GetOrStartOwned();
+
+        Assert.Equal("cSapModel.InitializeNewModel", fixture.Managed.Stages[0]);
+        Assert.Equal("snapshot-export", fixture.Managed.Stages[^1]);
+    }
+
+    /// <summary>And on a warm session the label is applied immediately, not deferred.</summary>
+    [Fact]
+    public void AWarmSessionTakesTheCommandStageStraightAway()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+
+        fixture.Session.MarkVisibilityStage("run-analysis");
+
+        Assert.Equal("run-analysis", fixture.Managed.Stages[^1]);
     }
 
     /// <summary>
@@ -1426,7 +1498,7 @@ public sealed class ManagedSessionTests
             launcher,
             new FakeProcesses { Live = Identity },
             new MemoryStore(events),
-            new ManagedEtabsStartIntentScope());
+            new EtabsWorkScope());
 
         var error = Assert.Throws<EtabsLaunchException>(() => session.GetOrStartOwned());
 
@@ -1449,8 +1521,10 @@ public sealed class ManagedSessionTests
     {
         var events = new List<string>();
         var launcher = new FakeLauncher(Managed(events), events);
-        var scope = new ManagedEtabsStartIntentScope();
-        _ = scope.Publish(ManagedEtabsStartIntents.Parse(wireValue));
+        var scope = new EtabsWorkScope();
+        _ = scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntents.Parse(wireValue),
+            "cold-start"));
         var session = new EtabsSession(
             launcher,
             new FakeProcesses { Live = Identity },
@@ -1470,9 +1544,10 @@ public sealed class ManagedSessionTests
         var events = new List<string>();
         var managed = Managed(events);
         var launcher = new FakeLauncher(managed, events);
-        var scope = new ManagedEtabsStartIntentScope();
-        _ = scope.Publish(
-            ManagedEtabsStartIntents.Parse(ManagedEtabsStartIntents.VisibleByConsent));
+        var scope = new EtabsWorkScope();
+        _ = scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntents.Parse(ManagedEtabsStartIntents.VisibleByConsent),
+            "cold-start"));
         var session = new EtabsSession(
             launcher,
             new FakeProcesses { Live = Identity },
@@ -1490,16 +1565,18 @@ public sealed class ManagedSessionTests
     /// answered minutes ago for something else.
     /// </summary>
     [Fact]
-    public void ConsentIsClearedWhenTheRequestScopeEnds()
+    public void ConsentIsClearedWhenTheExecutionScopeEnds()
     {
-        var scope = new ManagedEtabsStartIntentScope();
+        var scope = new EtabsWorkScope();
 
-        using (scope.Publish(ManagedEtabsStartIntent.VisibleByConsent))
+        using (scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "retry")))
         {
-            Assert.Equal(ManagedEtabsStartIntent.VisibleByConsent, scope.Current);
+            Assert.Equal(ManagedEtabsStartIntent.VisibleByConsent, scope.Current.StartIntent);
         }
 
-        Assert.Equal(ManagedEtabsStartIntent.Unspecified, scope.Current);
+        Assert.Equal(ManagedEtabsStartIntent.Unspecified, scope.Current.StartIntent);
     }
 
     /// <summary>
@@ -1514,20 +1591,22 @@ public sealed class ManagedSessionTests
         var events = new List<string>();
         var managed = Managed(events);
         var launcher = new FakeLauncher(managed, events);
-        var scope = new ManagedEtabsStartIntentScope();
+        var scope = new EtabsWorkScope();
         var session = new EtabsSession(
             launcher,
             new FakeProcesses { Live = Identity },
             new MemoryStore(events),
             scope);
 
-        using (scope.Publish(ManagedEtabsStartIntent.VisibleByConsent))
+        using (scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "retry")))
         {
             _ = session.GetOrStartOwned();
         }
 
         // A later request declaring nothing at all.
-        Assert.Equal(ManagedEtabsStartIntent.Unspecified, scope.Current);
+        Assert.Equal(ManagedEtabsStartIntent.Unspecified, scope.Current.StartIntent);
         Assert.Same(managed, session.GetOrStartOwned());
         Assert.Equal(1, launcher.LaunchCount);
     }
@@ -1693,10 +1772,12 @@ public sealed class ManagedSessionTests
     /// the consent gate. The refusal path has its own tests, which deliberately do NOT
     /// use this.
     /// </summary>
-    private static IManagedEtabsStartIntentScope Consented()
+    private static IEtabsWorkScope Consented()
     {
-        var scope = new ManagedEtabsStartIntentScope();
-        _ = scope.Publish(ManagedEtabsStartIntent.VisibleByConsent);
+        var scope = new EtabsWorkScope();
+        _ = scope.Enter(new EtabsWorkContext(
+            ManagedEtabsStartIntent.VisibleByConsent,
+            "test-command"));
         return scope;
     }
 
@@ -1819,6 +1900,28 @@ public sealed class ManagedSessionTests
         /// <summary>CLI #24 evidence the test can plant, to prove readiness reads it.</summary>
         public ManagedEtabsExposureEvidence Exposure { get; set; } =
             ManagedEtabsExposureEvidence.None;
+
+        /// <summary>
+        /// Evidence that only a FORCED census would find: the window surfaced, but its
+        /// event callback has not been delivered yet, so a plain read of
+        /// <c>Exposure</c> still reports clean. This is the exact race the certification
+        /// primitive exists to close, so the fake has to be able to reproduce it.
+        /// </summary>
+        public ManagedEtabsExposureEvidence? UndeliveredObservation { get; set; }
+
+        public int CertifyExposureCalls { get; private set; }
+
+        public ManagedEtabsExposureEvidence CertifyExposure()
+        {
+            CertifyExposureCalls++;
+            if (UndeliveredObservation is { } pending)
+            {
+                Exposure = pending;
+                UndeliveredObservation = null;
+            }
+
+            return Exposure;
+        }
 
         public int EnterBackgroundHiddenCalls { get; private set; }
 

@@ -41,7 +41,8 @@ public sealed class EtabsSession : IEtabsSession
     private readonly IProcessInspector _processes;
     private readonly ISessionRecordStore _records;
     private readonly IManagedEtabsShutdownMachine _shutdownMachine;
-    private readonly IManagedEtabsStartIntentScope _startIntent;
+    private readonly IEtabsWorkScope _work;
+    private string? _commandStage;
 
     // Borrowed, never owned: this is Console.Error in production and a test's buffer under
     // test, so the session must not close it when it disposes.
@@ -60,8 +61,8 @@ public sealed class EtabsSession : IEtabsSession
         IManagedEtabsLauncher launcher,
         IProcessInspector processes,
         ISessionRecordStore records,
-        IManagedEtabsStartIntentScope startIntent)
-        : this(launcher, processes, records, new ManagedEtabsShutdownMachine(records), startIntent)
+        IEtabsWorkScope work)
+        : this(launcher, processes, records, new ManagedEtabsShutdownMachine(records), work)
     {
     }
 
@@ -70,8 +71,8 @@ public sealed class EtabsSession : IEtabsSession
         IProcessInspector processes,
         ISessionRecordStore records,
         IManagedEtabsShutdownMachine shutdownMachine,
-        IManagedEtabsStartIntentScope startIntent)
-        : this(launcher, processes, records, shutdownMachine, startIntent, Console.Error)
+        IEtabsWorkScope work)
+        : this(launcher, processes, records, shutdownMachine, work, Console.Error)
     {
     }
 
@@ -80,14 +81,14 @@ public sealed class EtabsSession : IEtabsSession
         IProcessInspector processes,
         ISessionRecordStore records,
         IManagedEtabsShutdownMachine shutdownMachine,
-        IManagedEtabsStartIntentScope startIntent,
+        IEtabsWorkScope work,
         TextWriter diagnostics)
     {
         _launcher = launcher;
         _processes = processes;
         _records = records;
         _shutdownMachine = shutdownMachine;
-        _startIntent = startIntent;
+        _work = work;
         _diagnostics = diagnostics;
     }
 
@@ -196,6 +197,14 @@ public sealed class EtabsSession : IEtabsSession
 
                 _ready = true;
                 _diagnostics.WriteLine($"✓ ETABS started hidden (PID {_owned.Identity.Pid})");
+
+                // The launch owned the stage until now. Hand it back to whatever command
+                // is actually running, so the next observation is attributed to the work
+                // and not to the initialization that preceded it.
+                if (_commandStage is { } pending)
+                {
+                    _owned.MarkVisibilityStage(pending);
+                }
             }
 
             try
@@ -260,7 +269,11 @@ public sealed class EtabsSession : IEtabsSession
     /// </summary>
     private void RequireVisibleStartConsent()
     {
-        var intent = _startIntent.Current;
+        // Read from the EXECUTION context. Reading a request-lifetime value here was the
+        // defect: a queued operation runs after its request returned, so it would see
+        // whatever the ambient field had decayed to - or worse, whatever a later polling
+        // request had just published into it.
+        var intent = _work.Current.StartIntent;
         if (intent == ManagedEtabsStartIntent.VisibleByConsent)
         {
             return;
@@ -448,6 +461,12 @@ public sealed class EtabsSession : IEtabsSession
     {
         lock (_gate)
         {
+            // Remembered unconditionally. The first command on a cold daemon marks its
+            // stage BEFORE the session exists, and the launch then walks through its own
+            // stages - cOAPI.ApplicationStart, cSapModel.InitializeNewModel. Without this
+            // memory, nobody reapplied the command's label afterwards and an exposure
+            // during the actual work was filed under a stage that had already finished.
+            _commandStage = stage;
             if (_owned is not null && _ready)
             {
                 _owned.MarkVisibilityStage(stage);
@@ -487,7 +506,11 @@ public sealed class EtabsSession : IEtabsSession
                 return Result.Ok();
             }
 
-            var exposure = _owned.Exposure;
+            // A forced census, not a read. The accumulated evidence alone cannot see a
+            // window that surfaced moments ago whose event callback has not been delivered
+            // yet - which is precisely the window this command would otherwise report
+            // success over.
+            var exposure = _owned.CertifyExposure();
             if (!exposure.Observed)
             {
                 return Result.Ok();

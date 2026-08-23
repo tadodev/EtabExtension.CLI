@@ -8,6 +8,7 @@ using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using EtabExtension.CLI.Features.Serve;
+using EtabExtension.CLI.Features.Serve.Operations;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using Xunit;
 
@@ -583,6 +584,88 @@ public sealed class EtabsVisibilityWiringTests
                 .Where(name => !name.StartsWith(
                     $"{typeof(ManagedEtabsApplication).FullName}.",
                     StringComparison.Ordinal))
+                .Order(StringComparer.Ordinal)
+                .ToArray());
+    }
+
+    /// <summary>
+    /// The certification is reached ONLY through the envelope.
+    ///
+    /// <para>The previous head certified inside the dispatcher's synchronous COM wrapper,
+    /// which is why the queued lane - the daemon's longest-running command - had no
+    /// certification at all. Pinning the call site to a single production method is what
+    /// stops that from being re-decided per handler: a new command cannot acquire, or
+    /// forget, its own visibility rule.</para>
+    /// </summary>
+    [Fact]
+    public void OnlyTheWorkEnvelopeCertifiesTheVisibilityContract()
+    {
+        var certify = $"{typeof(IEtabsSession).FullName}." +
+            nameof(IEtabsSession.CertifyNoUnconsentedExposure);
+
+        Assert.Equal(
+            [$"{typeof(EtabsWorkEnvelope).FullName}.{nameof(EtabsWorkEnvelope.RunAsync)}"],
+            ProductionCalls
+                .Where(method => method.Value.Contains(certify, StringComparer.Ordinal))
+                .Select(method => method.Key)
+                .Order(StringComparer.Ordinal)
+                .ToArray());
+    }
+
+    /// <summary>
+    /// And BOTH execution lanes go through it. The synchronous wrapper every ETABS-backed
+    /// command funnels into, and the queued-operation runner - one rule, two lanes.
+    /// </summary>
+    [Fact]
+    public void BothExecutionLanesRunWorkThroughTheEnvelope()
+    {
+        var run = $"{typeof(IEtabsWorkEnvelope).FullName}." +
+            nameof(IEtabsWorkEnvelope.RunAsync);
+
+        Assert.Contains(run, Calls($"{typeof(ServeDispatcher).FullName}.ExecuteComAsync"));
+        Assert.Contains(run, Calls($"{typeof(OperationManager).FullName}.RunAsync"));
+    }
+
+    /// <summary>
+    /// The session cannot consult a request-lifetime value even if a future change wanted
+    /// it to: the request scope is not reachable from it at all. Consent arrives only as a
+    /// captured context, which is what makes deferred work honest about what it was
+    /// authorised to do.
+    /// </summary>
+    [Fact]
+    public void TheSessionNeverReadsTheRequestScopedIntent()
+    {
+        var requestScope = typeof(IManagedEtabsStartIntentScope).FullName!;
+
+        Assert.Equal(
+            [],
+            ProductionCalls
+                .Where(method => method.Key.StartsWith(
+                    $"{typeof(EtabsSession).FullName}.",
+                    StringComparison.Ordinal))
+                .Where(method => method.Value.Any(call => call.StartsWith(
+                    $"{requestScope}.",
+                    StringComparison.Ordinal)))
+                .Select(method => method.Key)
+                .Order(StringComparer.Ordinal)
+                .ToArray());
+    }
+
+    /// <summary>
+    /// The request scope is read in exactly one place: the capture. Anything else reading
+    /// it would be reading a value whose lifetime it does not control.
+    /// </summary>
+    [Fact]
+    public void TheRequestScopedIntentIsReadOnlyWhereItIsCaptured()
+    {
+        var current = $"{typeof(IManagedEtabsStartIntentScope).FullName}." +
+            $"get_{nameof(IManagedEtabsStartIntentScope.Current)}";
+
+        Assert.Equal(
+            [$"{typeof(EtabsWorkEnvelope).FullName}.{nameof(EtabsWorkEnvelope.Capture)}"],
+            ProductionCalls
+                .Where(method => method.Value.Contains(current, StringComparer.Ordinal))
+                .Select(method => method.Key)
                 .Order(StringComparer.Ordinal)
                 .ToArray());
     }

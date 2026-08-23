@@ -379,6 +379,71 @@ public sealed class ManagedEtabsWindowGuardTests
     }
 
     /// <summary>
+    /// The certification race, stated as a test.
+    ///
+    /// <para>Evidence accumulates from WinEvent callbacks delivered on the monitor's pump
+    /// thread. A window can therefore be materially on screen while the accumulated
+    /// evidence still reads clean, because nobody has observed yet. A certification that
+    /// only READS - as this one did - would clear a session that is in front of the
+    /// engineer at that very instant.</para>
+    ///
+    /// <para>No <c>ObserveOnce</c> here on purpose: the window surfaces and the
+    /// certification is asked immediately, which is the ordering the daemon actually
+    /// hits when a command finishes.</para>
+    /// </summary>
+    [Fact]
+    public void CertifyingForcesACensusAndSeesAWindowNoEventHasReportedYet()
+    {
+        var windows = new FakeWindows();
+        using var guard = Guard(windows, out _, out _);
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+
+        windows.Surface((nint)0x51, Owned.Pid, FullScreen);
+
+        // What a plain read sees: nothing, because no observation has run.
+        Assert.False(guard.Exposure.Observed);
+
+        var certified = guard.CertifyExposure();
+
+        Assert.True(certified.Observed);
+        Assert.Equal((nint)0x51, certified.First!.Value.Handle);
+    }
+
+    /// <summary>
+    /// And the opposite half, which a census alone cannot do: a window that surfaced and
+    /// was gone again before the certification runs is still a breach. The engineer saw it.
+    /// Temporal evidence and a forced census are both required; neither is sufficient.
+    /// </summary>
+    [Fact]
+    public void CertifyingStillReportsAnExposureThatIsAlreadyOffScreenAgain()
+    {
+        var windows = new FakeWindows();
+        using var guard = Guard(windows, out _, out var clock);
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+
+        windows.Surface((nint)0x52, Owned.Pid, FullScreen);
+        guard.ObserveOnce();
+        clock.Wait(TimeSpan.FromMilliseconds(120));
+        windows.SetVisible((nint)0x52, visible: false);
+
+        var certified = guard.CertifyExposure();
+
+        Assert.True(certified.Observed);
+        Assert.Equal((nint)0x52, certified.First!.Value.Handle);
+    }
+
+    /// <summary>A session that was never on screen certifies clean, so the gate is not always-on.</summary>
+    [Fact]
+    public void CertifyingAHiddenSessionReportsNoExposure()
+    {
+        var windows = new FakeWindows();
+        using var guard = Guard(windows, out _, out _);
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+
+        Assert.False(guard.CertifyExposure().Observed);
+    }
+
+    /// <summary>
     /// A foreign window on screen during the protected interval is not our exposure. The
     /// engineer seeing Excel is not an ETABS contract breach.
     /// </summary>
