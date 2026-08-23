@@ -83,7 +83,8 @@ public sealed class ServeInspectionService : IServeInspectionService
             var walls = new List<string>(shellNames.Length);
             foreach (var name in shellNames)
             {
-                switch (Classify(api, name))
+                var classification = Classify(api, name);
+                switch (classification)
                 {
                     case AreaPropertyClass.Wall:
                         walls.Add(name);
@@ -95,7 +96,7 @@ public sealed class ServeInspectionService : IServeInspectionService
                         // caller asked for THE wall properties; answering with a list that
                         // silently omits a wall whose probe failed is the same class of lie
                         // as answering with slabs in it.
-                        throw Indeterminate(name);
+                        throw Indeterminate(name, classification);
                 }
             }
 
@@ -235,8 +236,21 @@ public sealed class ServeInspectionService : IServeInspectionService
     /// <summary>What the model can be shown to say about one area property.</summary>
     private enum AreaPropertyClass
     {
-        /// <summary>Nothing could be established. Never an answer; always a failure.</summary>
-        Indeterminate,
+        /// <summary>
+        /// The evidence itself could not be gathered: every typed accessor refused AND the
+        /// property census failed. Nothing is known about the model. Never an answer;
+        /// always a failure.
+        /// </summary>
+        IndeterminateNoEvidence,
+
+        /// <summary>
+        /// The census SUCCEEDED and lists this property, but no typed accessor claimed it.
+        /// The property demonstrably exists; only its kind is unestablished — an ETABS
+        /// shell property outside the wall/slab/deck accessors this build probes. Also
+        /// never an answer, but a materially different situation from having no evidence,
+        /// and the diagnostic must not confuse the two.
+        /// </summary>
+        IndeterminateUnclassified,
 
         /// <summary><c>cPropArea.GetWall</c> accepted it.</summary>
         Wall,
@@ -281,11 +295,11 @@ public sealed class ServeInspectionService : IServeInspectionService
         if (api.GetAllAreaPropertyNames(out var defined) == 0)
         {
             return defined.Contains(name, StringComparer.Ordinal)
-                ? AreaPropertyClass.Indeterminate
+                ? AreaPropertyClass.IndeterminateUnclassified
                 : AreaPropertyClass.NotDefined;
         }
 
-        return AreaPropertyClass.Indeterminate;
+        return AreaPropertyClass.IndeterminateNoEvidence;
     }
 
     /// <summary>Turns a refused <c>GetWall</c> into the reason the evidence supports.</summary>
@@ -309,23 +323,33 @@ public sealed class ServeInspectionService : IServeInspectionService
             // Includes the case where GetWall now succeeds on a retry: the first refusal was
             // then a transient failure, and reporting success off the back of it would be
             // answering from evidence this call did not actually gather.
-            _ => Indeterminate(name)
+            var other => Indeterminate(name, other)
         };
 
     /// <summary>
     /// The honest answer when the model could not be made to say anything definite.
-    /// Explicitly NOT one of the semantic codes: the caller must be able to tell "your name
-    /// is wrong" from "ETABS would not answer me".
+    ///
+    /// <para>Explicitly NOT one of the semantic codes: the caller must be able to tell "your
+    /// name is wrong" from "ETABS would not answer me". And the two indeterminate cases get
+    /// their own wording, because a diagnostic that claims the census failed when it
+    /// succeeded is itself a false statement about the run — the same defect class as
+    /// reporting a failed probe as a verdict, just one layer further out.</para>
     /// </summary>
-    private static InvalidOperationException Indeterminate(string name) =>
+    private static InvalidOperationException Indeterminate(
+        string name,
+        AreaPropertyClass reason) =>
         new(string.Join(
             "; ",
             InspectionErrorCodes.AreaPropertyClassificationFailed,
             $"name={name}",
-            "cPropArea refused every classification probe (GetWall, GetSlab, GetDeck) and " +
-            "the area-property census did not succeed either, so this property's kind " +
-            "could not be established; this is an ETABS/CSI failure, not a statement " +
-            "about the model"));
+            reason == AreaPropertyClass.IndeterminateUnclassified
+                ? "the area-property census succeeded and lists this property, but none of " +
+                  "cPropArea.GetWall, GetSlab or GetDeck accepted it, so its kind could " +
+                  "not be established"
+                : "cPropArea refused every classification probe (GetWall, GetSlab, " +
+                  "GetDeck) and the area-property census did not succeed either, so no " +
+                  "evidence about this property could be gathered",
+            "this is a CSI/classification failure, not a statement about the model"));
 
     private static void RequireSuccess(string member, int returnCode)
     {

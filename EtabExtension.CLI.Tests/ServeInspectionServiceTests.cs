@@ -185,6 +185,77 @@ public sealed class ServeInspectionServiceTests : IDisposable
             InspectionErrorCodes.AreaPropertyNotFound,
             result.Error,
             StringComparison.Ordinal);
+
+        // And the diagnostic must not claim the census failed - it succeeded, and said
+        // this property exists. A failure message that misstates what happened during the
+        // run is the same defect class as a probe failure reported as a verdict.
+        Assert.DoesNotContain(
+            "census did not succeed",
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "census succeeded",
+            result.Error,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other indeterminate case, so the two cannot collapse into one wording again:
+    /// here the census really did fail, and the diagnostic is allowed - required - to say
+    /// so.
+    /// </summary>
+    [Fact]
+    public void WhenTheCensusItselfFailedTheDiagnosticSaysThatAndNotThatThePropertyExists()
+    {
+        var api = new FakeInspectionApi
+        {
+            GetWallReturnCode = 1,
+            AreaPropertyCensusReturnCode = 9
+        };
+
+        var result = _service.InspectWallProperty(api, "Unknowable");
+
+        Assert.False(result.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyClassificationFailed,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "census did not succeed",
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "census succeeded",
+            result.Error,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The listing's diagnostic is held to the same standard: the shell it could not
+    /// classify demonstrably exists, so the message must not blame the census.
+    /// </summary>
+    [Fact]
+    public void TheListingFailureAlsoDescribesTheEvidenceItActuallyHad()
+    {
+        var api = new FakeInspectionApi
+        {
+            ShellPropertyNames = ["W20_C6", "Oddity"],
+            WallNames = new(StringComparer.Ordinal) { "W20_C6" },
+            DefinedAreaProperties = new(StringComparer.Ordinal) { "W20_C6", "Oddity" }
+        };
+
+        var result = _service.ListWallProperties(api);
+
+        Assert.False(result.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyClassificationFailed,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("name=Oddity", result.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "census did not succeed",
+            result.Error,
+            StringComparison.Ordinal);
     }
 
     /// <summary>
