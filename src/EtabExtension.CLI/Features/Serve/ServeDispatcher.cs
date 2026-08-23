@@ -132,6 +132,11 @@ public sealed class ServeDispatcher : IServeDispatcher
         // is touched here: while an async operation runs, the worker holds the session lock
         // for its whole duration, and a protocol thread that blocked on it would stop
         // answering get-operation-status - the one thing that must keep working.
+        //
+        // That guarantee is now true of the legacy analyze-and-extract lane as well: it
+        // ACCEPTS here and defers its answer, rather than awaiting the whole operation and
+        // taking the reader down with it. Exactly one dispatch is ever executing, so the
+        // ambient request state below stays single-writer.
         _pendingWork = _envelope.Capture(command);
 
         return _handlers.TryGetValue(command, out var handler)
@@ -261,21 +266,38 @@ public sealed class ServeDispatcher : IServeDispatcher
                 $"modelOpened={opened.Data?.FilePath}"));
     }
 
-    private async Task<object> DispatchAnalyzeAndExtractAsync(
+    /// <summary>
+    /// The legacy synchronous command, kept synchronous ON THE WIRE without holding the
+    /// protocol reader hostage for the length of an analysis.
+    ///
+    /// <para>Frozen Rust compatibility is unchanged: one request in, one response out, on
+    /// the same id, carrying the original <c>Result&lt;AnalyzeAndExtractData&gt;</c>. What
+    /// changed is WHO waits. This method used to <c>await</c> the entire operation - up to
+    /// the 60-minute operation budget - and because <see cref="ServeLoop"/> awaits each
+    /// dispatch before reading the next line, the daemon read NOTHING for that whole time.
+    /// <c>get-operation-status</c>, <c>get-operation-events</c>, <c>cancel-operation</c>
+    /// and even <c>shutdown</c> were unreachable exactly while they mattered most - the
+    /// opposite of the guarantee stated in <see cref="DispatchAsync"/>.</para>
+    ///
+    /// <para>So only the WAITING moves. Everything that needs the live request - accepting
+    /// the operation, and with it the <c>EtabsWorkContext</c> capture that has to happen on
+    /// the protocol thread while the declaring request is alive - still happens here,
+    /// synchronously, before this returns.</para>
+    /// </summary>
+    private Task<object> DispatchAnalyzeAndExtractAsync(
         JsonElement? request,
         CancellationToken ct)
     {
-        // Frozen Rust compatibility: start through the generic envelope,
-        // then internally wait and return the original Result<T> unchanged.
         var payload = RequirePayload(request);
         var started = _operations.Start("analyze-and-extract", payload);
         if (!started.Success || started.Data is null)
         {
-            return Result.Fail<AnalyzeAndExtractData>(
-                started.Error ?? "Could not start analyze-and-extract operation");
+            return Task.FromResult<object>(Result.Fail<AnalyzeAndExtractData>(
+                started.Error ?? "Could not start analyze-and-extract operation"));
         }
 
-        return await _operations.WaitAsync(started.Data.OperationId, ct);
+        return Task.FromResult<object>(new DeferredServeResponse(
+            _operations.WaitAsync(started.Data.OperationId, ct)));
     }
 
     private async Task<object> DispatchSnapshotExportAsync(
@@ -434,6 +456,12 @@ public sealed class ServeDispatcher : IServeDispatcher
     /// strictly one request at a time. From the hand-off onwards the value travels as an
     /// immutable copy, so nothing the worker relies on can be overwritten underneath
     /// it.</para>
+    ///
+    /// <para>A DEFERRED response does not weaken that. The deferring handler reads this
+    /// field (if at all) before it returns, and the loop only reads the next line once the
+    /// dispatch task has completed - so a later request's write still cannot land while an
+    /// earlier dispatch is looking at it. What outlives the request is the captured
+    /// <see cref="EtabsWorkContext"/> copy, never this field.</para>
     /// </summary>
     private EtabsWorkContext _pendingWork = EtabsWorkContext.None;
 

@@ -62,10 +62,28 @@ public sealed class ServeLoop
     /// throws for a bad request — malformed lines and failing handlers both get a
     /// correlated error response and the loop keeps serving. Only transport and
     /// cancellation failures end the run.
+    ///
+    /// <para>A handler may ACCEPT a request and answer it later by returning a
+    /// <see cref="DeferredServeResponse"/>. The reader then goes straight back to stdin
+    /// instead of waiting, which is what keeps <c>get-operation-status</c>,
+    /// <c>get-operation-events</c>, <c>cancel-operation</c> and <c>shutdown</c> reachable
+    /// while a long operation runs. It introduces no concurrent ETABS work: exactly one
+    /// dispatch executes at a time, and every COM call still goes through the single STA
+    /// worker.</para>
     /// </summary>
     public async Task RunAsync(TextReader input, TextWriter output, CancellationToken ct = default)
     {
         var explicitShutdown = false;
+
+        // Accepted-but-unanswered requests. The operation lease permits one at a time, so
+        // this holds at most one live entry; completed ones are pruned as they land.
+        var deferred = new List<Task>();
+
+        // One line at a time on stdout: a deferred answer is written from its own
+        // continuation, and two responses interleaved mid-line would corrupt the protocol
+        // for every request after them, not just those two. Owned by this run and released
+        // only once every accepted request has been settled in the finally below.
+        using var writes = new SemaphoreSlim(1, 1);
         try
         {
             await output.WriteLineAsync(JsonSerializer.Serialize(
@@ -95,6 +113,7 @@ public sealed class ServeLoop
                 catch (JsonException exception)
                 {
                     await WriteAsync(
+                        writes,
                         output,
                         id: 0,
                         Result.Fail($"Invalid request JSON: {exception.Message}"));
@@ -104,6 +123,7 @@ public sealed class ServeLoop
                 if (request is null || string.IsNullOrWhiteSpace(request.Command))
                 {
                     await WriteAsync(
+                        writes,
                         output,
                         request?.Id ?? 0,
                         Result.Fail("Malformed request: missing command"));
@@ -117,18 +137,43 @@ public sealed class ServeLoop
                 {
                     explicitShutdown = true;
                     var terminal = await _shutdown.ShutdownAsync();
-                    await WriteAsync(output, request.Id, terminal);
+
+                    // Answer everything already accepted before announcing the daemon is
+                    // gone. An id a caller is still blocked on must not be dropped.
+                    await DrainAsync(deferred);
+                    await WriteAsync(writes, output, request.Id, terminal);
                     return;
                 }
 
-                await WriteAsync(
-                    output,
-                    request.Id,
-                    await DispatchIsolatedAsync(request, ct));
+                var response = await DispatchIsolatedAsync(request, ct);
+                if (response is DeferredServeResponse pending)
+                {
+                    // Accepted, not answered. Straight back to stdin so control commands
+                    // stay reachable for the whole run.
+                    deferred.RemoveAll(item => item.IsCompleted);
+                    deferred.Add(AnswerWhenReadyAsync(
+                        writes, output, request.Id, request.Command, pending));
+                    continue;
+                }
+
+                await WriteAsync(writes, output, request.Id, response);
             }
         }
         finally
         {
+            // Settle accepted requests first, then release the session - in that order and
+            // in separate guards, because a stuck answer must not be the reason ETABS is
+            // left running, and a failing cleanup must not be the reason a caller waits
+            // forever.
+            try
+            {
+                await DrainAsync(deferred);
+            }
+            catch (Exception deferredException)
+            {
+                await WriteCleanupExceptionAsync(deferredException);
+            }
+
             try
             {
                 var cleanup = await _shutdown.ShutdownAsync();
@@ -217,15 +262,78 @@ public sealed class ServeLoop
     }
 
     /// <summary>
+    /// Writes the answer to a request that was ACCEPTED earlier, once its work finishes.
+    ///
+    /// <para>Every failure becomes a response, cancellation included. A caller blocked on
+    /// an id that never gets answered is a worse outcome than any diagnostic: the accepted
+    /// request must be settled exactly once, whatever happened to the work behind it.</para>
+    /// </summary>
+    private static async Task AnswerWhenReadyAsync(
+        SemaphoreSlim writes,
+        TextWriter output,
+        long id,
+        string command,
+        DeferredServeResponse pending)
+    {
+        object result;
+        try
+        {
+            result = await pending.Completion;
+        }
+        catch (Exception exception)
+        {
+            result = Result.Fail(
+                EtabsApiDiagnosticFormatter.AppendTerminalFacts(
+                    EtabsApiDiagnosticFormatter.InfrastructureException(
+                        "IServeDispatcher deferred completion",
+                        exception),
+                    $"command={command}"));
+        }
+
+        await WriteAsync(writes, output, id, result);
+    }
+
+    /// <summary>Settles every accepted-but-unanswered request before the loop exits.</summary>
+    private static async Task DrainAsync(List<Task> deferred)
+    {
+        if (deferred.Count == 0)
+        {
+            return;
+        }
+
+        var outstanding = deferred.ToArray();
+        deferred.Clear();
+        await Task.WhenAll(outstanding);
+    }
+
+    /// <summary>
     /// Serialize the feature result by its <b>runtime</b> type (so the concrete
     /// <c>Result&lt;T&gt;.data</c> is emitted, not an empty <c>object</c>), inject
     /// the correlation <c>id</c>, and write one compact line.
+    ///
+    /// <para>Serialized on the run's write gate: a deferred answer is written from its own
+    /// continuation, and two responses interleaved mid-line would corrupt stdout for every
+    /// request after them, not just those two.</para>
     /// </summary>
-    private static async Task WriteAsync(TextWriter output, long id, object result)
+    private static async Task WriteAsync(
+        SemaphoreSlim writes,
+        TextWriter output,
+        long id,
+        object result)
     {
         var node = JsonSerializer.SerializeToNode(result, result.GetType(), ServeJson.Options)!.AsObject();
         node["id"] = id;
-        await output.WriteLineAsync(node.ToJsonString(ServeJson.Options));
-        await output.FlushAsync();
+        var line = node.ToJsonString(ServeJson.Options);
+
+        await writes.WaitAsync();
+        try
+        {
+            await output.WriteLineAsync(line);
+            await output.FlushAsync();
+        }
+        finally
+        {
+            writes.Release();
+        }
     }
 }

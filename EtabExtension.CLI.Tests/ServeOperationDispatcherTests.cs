@@ -1,4 +1,7 @@
-﻿using System.Text.Json;
+﻿using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Threading.Channels;
 using EtabExtension.CLI.Features.AnalyzeAndExtract.Models;
 using EtabExtension.CLI.Features.GetStatus.Models;
 using EtabExtension.CLI.Features.OpenModel;
@@ -240,8 +243,14 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         Assert.Equal(0, session.GetOrStartCalls);
     }
 
+    /// <summary>
+    /// The legacy command ACCEPTS on the protocol thread and answers later — but what it
+    /// answers with is unchanged: the original <c>Result&lt;AnalyzeAndExtractData&gt;</c>.
+    /// The dispatch itself must complete immediately, because the serve loop awaits it
+    /// before reading the next line.
+    /// </summary>
     [Fact]
-    public async Task Legacy_analyze_command_waits_and_returns_the_original_result_shape()
+    public async Task Legacy_analyze_command_defers_and_answers_with_the_original_result_shape()
     {
         _manager = CreateManager(new DelegateOperation((payload, _) =>
         {
@@ -255,15 +264,31 @@ public sealed class ServeOperationDispatcherTests : IDisposable
         }));
         var dispatcher = CreateDispatcher(_manager);
 
-        var response = Assert.IsType<Result<AnalyzeAndExtractData>>(await dispatcher.DispatchAsync(
+        var dispatch = dispatcher.DispatchAsync(
             "analyze-and-extract",
             Json("""{"filePath":"C:\\model.edb","outputDir":"C:\\results","units":"SI_kN_m_C","tables":{}}"""),
-            TestContext.Current.CancellationToken));
+            TestContext.Current.CancellationToken);
 
+        Assert.True(dispatch.IsCompleted, "the dispatch must not block the protocol thread");
+        var deferred = Assert.IsType<DeferredServeResponse>(await dispatch);
+
+        var response = Assert.IsType<Result<AnalyzeAndExtractData>>(await ResolveAsync(deferred));
         Assert.True(response.Success);
         Assert.Equal(@"C:\model.edb", response.Data!.FilePath);
         Assert.Equal(@"C:\results", response.Data.OutputDir);
     }
+
+    /// <summary>
+    /// Resolves whatever the dispatcher returned. <c>analyze-and-extract</c> accepts on the
+    /// protocol thread and answers later, so a dispatcher-level test has to do what
+    /// <see cref="ServeLoop"/> does and take the deferred completion.
+    /// </summary>
+    private static async Task<object> ResolveAsync(object response) =>
+        response is DeferredServeResponse deferred
+            ? await deferred.Completion.WaitAsync(
+                TimeSpan.FromSeconds(15),
+                TestContext.Current.CancellationToken)
+            : response;
 
     [Fact]
     public async Task Run_analysis_uses_the_shared_serve_session()
@@ -603,10 +628,10 @@ esults"
             session);
         var dispatcher = CreateDispatcher(_manager, session);
 
-        var response = await dispatcher.DispatchAsync(
+        var response = await ResolveAsync(await dispatcher.DispatchAsync(
             "analyze-and-extract",
             Json("""{"filePath":"C:\\model.edb","outputDir":"C:\\results","units":"SI_kN_m_C","tables":{}}"""),
-            TestContext.Current.CancellationToken);
+            TestContext.Current.CancellationToken));
 
         var result = Assert.IsType<Result>(response, exactMatch: false);
         Assert.False(result.Success);
@@ -749,27 +774,381 @@ esults"
     {
         using var reader = new StringReader(string.Join('\n', requests) + "\n");
         await using var writer = new StringWriter();
-        var loop = new ServeLoop(
-            CreateDispatcher(operations),
-            new NoopShutdownCoordinator(),
-            new ManagedEtabsStartIntentScope(),
-            capabilities => new ServeHandshake(
-                "etab-cli-serve",
-                1,
-                "0.1.0",
-                "0.1.0+gtest",
-                Environment.ProcessId,
-                Path.GetFullPath(Environment.ProcessPath!),
-                capabilities),
-            TextWriter.Null);
 
-        await loop.RunAsync(reader, writer, TestContext.Current.CancellationToken);
+        await CreateLoop(CreateDispatcher(operations))
+            .RunAsync(reader, writer, TestContext.Current.CancellationToken);
 
         return writer.ToString()
             .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(line => JsonSerializer.Deserialize<JsonElement>(line))
             .Where(element => element.TryGetProperty("id", out _))
             .ToList();
+    }
+
+    private static ServeLoop CreateLoop(IServeDispatcher dispatcher) => new(
+        dispatcher,
+        new NoopShutdownCoordinator(),
+        new ManagedEtabsStartIntentScope(),
+        capabilities => new ServeHandshake(
+            "etab-cli-serve",
+            1,
+            "0.1.0",
+            "0.1.0+gtest",
+            Environment.ProcessId,
+            Path.GetFullPath(Environment.ProcessPath!),
+            capabilities),
+        TextWriter.Null);
+
+    /// <summary>
+    /// THE responsiveness property. <c>ServeLoop</c> awaits each dispatch before reading
+    /// the next line, and the legacy <c>analyze-and-extract</c> used to await the whole
+    /// operation inside its dispatch — so for up to the 60-minute operation budget the
+    /// daemon read NOTHING. <c>get-operation-status</c>, <c>get-operation-events</c> and
+    /// <c>cancel-operation</c> were unreachable exactly while they mattered.
+    ///
+    /// <para>Driven through a stdin the test feeds one line at a time on purpose: a
+    /// <c>StringReader</c> hands the loop every line up front and would prove nothing about
+    /// WHEN they were read.</para>
+    /// </summary>
+    [Fact]
+    public async Task ControlCommandsAreAnsweredWhileTheLegacyAnalyzeIsStillRunning()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager = CreateManager(new DelegateOperation(async (_, context) =>
+        {
+            await context.RunStepAsync(1, 1, "Fake.LongCsiCall", async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return true;
+            });
+            return Result.Ok(new AnalyzeAndExtractData());
+        }));
+
+        using var reader = new ScriptedReader();
+        var writer = new ResponseCollector();
+        var run = CreateLoop(CreateDispatcher(_manager)).RunAsync(
+            reader, writer, TestContext.Current.CancellationToken);
+
+        try
+        {
+            reader.Send(AnalyzeRequest(1));
+            await entered.Task.WaitAsync(
+                TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+
+            var operationId = RunningOperationId();
+            reader.Send(Request(2, "get-operation-status", new { operationId }));
+            reader.Send(Request(3, "get-operation-events", new { operationId, sinceSeq = 0 }));
+            reader.Send(Request(4, "cancel-operation", new { operationId }));
+
+            await WaitUntilAsync(
+                () => writer.Responses().Count >= 3,
+                "the daemon must answer control commands while the analysis is still running");
+
+            // Answered WHILE the analysis is still inside its CSI call: the analyze request
+            // is accepted and unanswered, and these three came back ahead of it.
+            var duringTheRun = writer.Responses();
+            Assert.Equal([2L, 3L, 4L], duringTheRun.Select(Id).ToArray());
+            Assert.All(
+                duringTheRun,
+                response => Assert.True(response.GetProperty("success").GetBoolean()));
+            Assert.Equal(
+                "Fake.LongCsiCall",
+                duringTheRun[0].GetProperty("data").GetProperty("currentCsiOperation").GetString());
+            Assert.True(_manager.HasActiveOperation);
+
+            release.SetResult();
+            reader.Close();
+            await run.WaitAsync(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken);
+
+            // And the accepted request is still settled, on its own id, last.
+            var all = writer.Responses();
+            Assert.Equal([2L, 3L, 4L, 1L], all.Select(Id).ToArray());
+            Assert.Equal(OperationPhase.Cancelled, _manager.GetStatus(operationId).Data!.Phase);
+        }
+        finally
+        {
+            await UnblockAsync(release, reader, run);
+        }
+    }
+
+    /// <summary>
+    /// <c>shutdown</c> has to be reachable too — a daemon that cannot be told to stop for
+    /// an hour is a daemon the desktop can only kill.
+    ///
+    /// <para>The discriminating fact is that the shutdown LINE IS READ while the analysis
+    /// is still blocked. Asserting on response order alone would pass against the old code,
+    /// which would simply read it an hour later and answer in the same order.</para>
+    /// </summary>
+    [Fact]
+    public async Task ShutdownIsReadWhileTheAnalysisIsStillRunning()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager = CreateManager(new DelegateOperation(async (_, context) =>
+        {
+            await context.RunStepAsync(1, 1, "Fake.LongCsiCall", async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return true;
+            });
+            return Result.Ok(new AnalyzeAndExtractData());
+        }));
+
+        using var reader = new ScriptedReader();
+        var writer = new ResponseCollector();
+        var run = CreateLoop(CreateDispatcher(_manager)).RunAsync(
+            reader, writer, TestContext.Current.CancellationToken);
+
+        try
+        {
+            reader.Send(AnalyzeRequest(1));
+            await entered.Task.WaitAsync(
+                TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+
+            reader.Send(Request(9, "shutdown"));
+            await WaitUntilAsync(
+                () => reader.LinesRead == 2,
+                "the daemon must read the shutdown request while the analysis is still running");
+
+            release.SetResult();
+            await run.WaitAsync(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken);
+
+            // The accepted analysis is answered before the daemon announces it is gone.
+            Assert.Equal([1L, 9L], writer.Responses().Select(Id).ToArray());
+        }
+        finally
+        {
+            await UnblockAsync(release, reader, run);
+        }
+    }
+
+    /// <summary>
+    /// Responsiveness must come from not blocking the READER, never from running two things
+    /// against ETABS at once. A synchronous COM command arriving mid-analysis is still
+    /// refused, and the feature service behind it is never called.
+    /// </summary>
+    [Fact]
+    public async Task ASynchronousComCommandIsStillRefusedWhileTheAnalysisHoldsTheWorker()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager = CreateManager(new DelegateOperation(async (_, context) =>
+        {
+            await context.RunStepAsync(1, 1, "Fake.LongCsiCall", async () =>
+            {
+                entered.SetResult();
+                await release.Task;
+                return true;
+            });
+            return Result.Ok(new AnalyzeAndExtractData());
+        }));
+        var session = new FakeSession();
+        var snapshot = new FakeSnapshotExportService();
+
+        using var reader = new ScriptedReader();
+        var writer = new ResponseCollector();
+        var run = CreateLoop(CreateDispatcher(_manager, session, snapshot: snapshot)).RunAsync(
+            reader, writer, TestContext.Current.CancellationToken);
+
+        try
+        {
+            reader.Send(AnalyzeRequest(1));
+            await entered.Task.WaitAsync(
+                TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+
+            reader.Send(Request(
+                5,
+                "snapshot-export",
+                new { filePath = @"C:\m.edb", outputDir = @"C:\out", tables = new { } }));
+            await WaitUntilAsync(
+                () => writer.Responses().Count >= 1,
+                "the daemon must answer the synchronous command rather than queue it silently");
+
+            var refused = writer.Responses()[0];
+            Assert.Equal(5L, Id(refused));
+            Assert.False(refused.GetProperty("success").GetBoolean());
+            Assert.Contains(
+                "daemon operation is active",
+                refused.GetProperty("error").GetString()!,
+                StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, snapshot.SharedCalls);
+            Assert.Equal(0, session.GetOrStartCalls);
+
+            release.SetResult();
+            reader.Close();
+            await run.WaitAsync(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            await UnblockAsync(release, reader, run);
+        }
+    }
+
+    /// <summary>
+    /// The frozen wire contract, asserted on the BYTES rather than on a typed object: one
+    /// request in, exactly one response out, on the same id, flat
+    /// <c>{id, success, data}</c> with the original <c>AnalyzeAndExtractData</c> fields.
+    /// The Rust client reads the next id-bearing line and requires it to be its own answer,
+    /// so an extra line here — or a different shape — would break it.
+    /// </summary>
+    [Fact]
+    public async Task TheLegacyAnalyzeAnswersExactlyOnceOnItsOwnIdWithTheOriginalShape()
+    {
+        _manager = CreateManager(new DelegateOperation((payload, _) => Task.FromResult<object>(
+            Result.Ok(new AnalyzeAndExtractData
+            {
+                FilePath = payload.GetProperty("filePath").GetString()!,
+                OutputDir = payload.GetProperty("outputDir").GetString()!
+            }))));
+
+        var responses = await RunLoopAsync(_manager, AnalyzeRequest(11));
+
+        var only = Assert.Single(responses);
+        Assert.Equal(11L, Id(only));
+        Assert.True(only.GetProperty("success").GetBoolean());
+        Assert.Equal(@"C:\model.edb", only.GetProperty("data").GetProperty("filePath").GetString());
+        Assert.Equal(@"C:\results", only.GetProperty("data").GetProperty("outputDir").GetString());
+    }
+
+    /// <summary>
+    /// The flattened payload <c>request_from_args</c> produces on the Rust side for
+    /// <c>analyze-and-extract</c>.
+    /// </summary>
+    private static string AnalyzeRequest(long id) => Request(
+        id,
+        "analyze-and-extract",
+        new
+        {
+            filePath = @"C:\model.edb",
+            outputDir = @"C:\results",
+            units = "SI_kN_m_C",
+            tables = new { }
+        });
+
+    /// <summary>One request line, in the envelope the daemon's stdin expects.</summary>
+    private static string Request(long id, string command, object? request = null) =>
+        JsonSerializer.Serialize(new { id, command, request }, RequestJson);
+
+    private static readonly JsonSerializerOptions RequestJson =
+        new() { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
+
+    private static long Id(JsonElement response) => response.GetProperty("id").GetInt64();
+
+    /// <summary>
+    /// The id of the operation the daemon is running, read from its own durable journal —
+    /// the legacy command never puts an operationId on the wire, so this is the only honest
+    /// way for a client-side test to name it.
+    /// </summary>
+    private string RunningOperationId() =>
+        Path.GetFileName(Directory.EnumerateDirectories(_directory).Single());
+
+    /// <summary>
+    /// Always lets the fake CSI call finish, however the test ended. Disposing the manager
+    /// joins the STA thread, so an assertion that failed while the operation was still
+    /// blocked would HANG the whole run instead of failing one test - which is exactly what
+    /// happened the first time the defect was reintroduced to check these tests catch it.
+    /// </summary>
+    private static async Task UnblockAsync(
+        TaskCompletionSource release,
+        ScriptedReader reader,
+        Task run)
+    {
+        release.TrySetResult();
+        reader.Close();
+        _ = await Task.WhenAny(run, Task.Delay(TimeSpan.FromSeconds(20)));
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, string because)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return;
+            }
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Fail(because);
+    }
+
+    /// <summary>
+    /// A stdin the test feeds one line at a time, and which counts what the daemon actually
+    /// consumed. "The loop read the next request while the previous one was still running"
+    /// is the property under test, and only the reader can witness it.
+    /// </summary>
+    private sealed class ScriptedReader : TextReader
+    {
+        private readonly Channel<string> _lines = Channel.CreateUnbounded<string>();
+        private int _read;
+
+        public int LinesRead => Volatile.Read(ref _read);
+
+        public void Send(string line) => _lines.Writer.TryWrite(line);
+
+        public void Close() => _lines.Writer.TryComplete();
+
+        public override async ValueTask<string?> ReadLineAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                var line = await _lines.Reader.ReadAsync(cancellationToken);
+                Interlocked.Increment(ref _read);
+                return line;
+            }
+            catch (ChannelClosedException)
+            {
+                return null;
+            }
+        }
+
+        public override string? ReadLine() => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// Collects the daemon's response lines so the test can read them WHILE the loop is
+    /// still writing — which a <see cref="StringWriter"/> cannot safely offer.
+    /// </summary>
+    private sealed class ResponseCollector : TextWriter
+    {
+        private readonly Lock _gate = new();
+        private readonly List<string> _lines = [];
+
+        public override Encoding Encoding => Encoding.UTF8;
+
+        public override Task WriteLineAsync(string? value)
+        {
+            lock (_gate)
+            {
+                if (value is not null)
+                {
+                    _lines.Add(value);
+                }
+            }
+            return Task.CompletedTask;
+        }
+
+        public override void Write(char value) => throw new NotSupportedException();
+
+        public override Task FlushAsync() => Task.CompletedTask;
+
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        /// <summary>Correlated responses only — the handshake banner carries no id.</summary>
+        public IReadOnlyList<JsonElement> Responses()
+        {
+            lock (_gate)
+            {
+                return _lines
+                    .Select(line => JsonSerializer.Deserialize<JsonElement>(line))
+                    .Where(element => element.TryGetProperty("id", out _))
+                    .ToArray();
+            }
+        }
     }
 
     /// <summary>Shutdown is not what these tests are about; the session here is a fake.</summary>
