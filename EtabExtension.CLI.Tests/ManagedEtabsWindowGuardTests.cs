@@ -432,6 +432,31 @@ public sealed class ManagedEtabsWindowGuardTests
         Assert.Equal((nint)0x52, certified.First!.Value.Handle);
     }
 
+    /// <summary>
+    /// A census that cannot run must not be returned as clean evidence.
+    ///
+    /// <para>The confirmation loop can answer "not confirmed" because its caller reads a
+    /// flag. This method returns EVIDENCE, and no value of that evidence honestly means "I
+    /// could not look" - so it propagates instead, and the session above it decides. The
+    /// sweep error is still recorded, for the same diagnostics the confirmation loop
+    /// feeds.</para>
+    /// </summary>
+    [Fact]
+    public void ACensusThatThrowsIsNotReportedAsCleanEvidence()
+    {
+        var windows = new FakeWindows();
+        using var guard = Guard(windows, out _, out _);
+        _ = guard.ConfirmSuppressedAndCloseConsentInterval();
+
+        var failure = new InvalidOperationException("EnumWindows failed: 0x5");
+        windows.EnumerateException = failure;
+
+        var thrown = Assert.Throws<InvalidOperationException>(() => guard.CertifyExposure());
+
+        Assert.Same(failure, thrown);
+        Assert.Same(failure, guard.LastSweepError);
+    }
+
     /// <summary>A session that was never on screen certifies clean, so the gate is not always-on.</summary>
     [Fact]
     public void CertifyingAHiddenSessionReportsNoExposure()

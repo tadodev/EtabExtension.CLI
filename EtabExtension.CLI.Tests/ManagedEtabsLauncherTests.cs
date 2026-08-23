@@ -896,9 +896,20 @@ public sealed class ManagedEtabsLauncherTests
 
         public int CertifyExposureCalls { get; private set; }
 
+        /// <summary>
+        /// Makes the forced final census fail, as a Win32 enumeration genuinely can. The
+        /// certification must treat "I could not look" as a failure, never as "clean".
+        /// </summary>
+        public Exception? CertifyExposureException { get; set; }
+
         public ManagedEtabsExposureEvidence CertifyExposure()
         {
             CertifyExposureCalls++;
+            if (CertifyExposureException is { } failure)
+            {
+                throw failure;
+            }
+
             if (UndeliveredObservation is { } pending)
             {
                 Exposure = pending;

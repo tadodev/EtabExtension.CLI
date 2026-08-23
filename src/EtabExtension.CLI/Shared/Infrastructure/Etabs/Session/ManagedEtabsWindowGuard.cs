@@ -31,6 +31,17 @@ public static class ManagedEtabsWindowErrorCodes
     /// this is sticky. A later hidden census does not clear it.
     /// </summary>
     public const string UnconsentedExposure = "ETABS_WINDOW_UNCONSENTED_EXPOSURE";
+
+    /// <summary>
+    /// The final exact-owned census could not be taken at all, so the session's on-screen
+    /// state at completion is UNKNOWN.
+    ///
+    /// <para>This is not the same as "not exposed", and the difference is the whole point:
+    /// an authority that cannot observe must not answer "clean". A session whose final
+    /// state could not be certified is the uncertain-session class, and it ends rather than
+    /// being reused.</para>
+    /// </summary>
+    public const string ExposureNotCertified = "ETABS_WINDOW_EXPOSURE_NOT_CERTIFIED";
 }
 
 /// <summary>
@@ -573,13 +584,27 @@ public sealed class ManagedEtabsWindowGuard : IManagedEtabsWindowGuard
     /// <inheritdoc />
     public ManagedEtabsExposureEvidence CertifyExposure()
     {
-        lock (_gate)
+        try
         {
-            // One lock, two halves of the same question. Observing and then reading in two
-            // separate acquisitions would reopen the race this method exists to close: a
-            // callback could land in between and be judged by nobody.
-            ObserveLocked();
-            return ExposureLocked();
+            lock (_gate)
+            {
+                // One lock, two halves of the same question. Observing and then reading in
+                // two separate acquisitions would reopen the race this method exists to
+                // close: a callback could land in between and be judged by nobody.
+                ObserveLocked();
+                return ExposureLocked();
+            }
+        }
+        catch (Exception exception)
+        {
+            // Recorded for the same diagnostics the confirmation loop feeds, then
+            // RETHROWN. The confirmation loop can return "not confirmed" because its
+            // caller reads a confirmed/unconfirmed flag; this method returns evidence, and
+            // there is no value of that evidence which honestly means "I could not look".
+            // Swallowing here would hand the caller a clean-looking record - the one
+            // failure mode this whole certification exists to prevent.
+            LastSweepError = exception;
+            throw;
         }
     }
 

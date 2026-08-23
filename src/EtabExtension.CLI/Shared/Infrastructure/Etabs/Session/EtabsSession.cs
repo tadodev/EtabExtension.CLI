@@ -231,17 +231,21 @@ public sealed class EtabsSession : IEtabsSession
     }
 
     /// <summary>
-    /// Ends the session because an explicit reveal could not be completed.
+    /// Ends the session because its on-screen state can no longer be vouched for.
     ///
-    /// <para><b>Why terminal.</b> By this point <c>cOAPI.Unhide()</c> has been issued or
-    /// attempted and the protected interval has already been left, so the session's
-    /// on-screen state is genuinely unknown: ETABS may be visible, may not be, and the
-    /// observer is no longer accumulating evidence for it. Returning a failure while
-    /// keeping the session reusable would leave later background work running against an
-    /// unwatched session that might be sitting in front of the engineer - which is the
-    /// uncertain-session case CLI #24 exists to refuse.</para>
+    /// <para><b>Why terminal.</b> Two routes reach here and they share one property. A
+    /// failed reveal has already issued or attempted <c>cOAPI.Unhide()</c> and left the
+    /// protected interval, so ETABS may be visible or may not be. A certification whose
+    /// census could not run knows even less: nothing was observed at all. In both cases the
+    /// session is UNCERTAIN, not proven clean.</para>
+    ///
+    /// <para>Returning a failure while keeping the session reusable would leave later
+    /// background work running against an unwatched session that might be sitting in front
+    /// of the engineer. That is exactly the case CLI #24 exists to refuse, so an uncertain
+    /// session is spent rather than reused - and the next request cold-starts a fresh one,
+    /// asking the engineer for consent again.</para>
     /// </summary>
-    private Result FailRevealTerminally(IManagedEtabsApplication owned, string diagnostic)
+    private Result EndUncertainSession(IManagedEtabsApplication owned, string diagnostic)
     {
         var cleanup = _shutdownMachine.Shutdown(owned);
         _shutdownResult = cleanup;
@@ -510,28 +514,49 @@ public sealed class EtabsSession : IEtabsSession
             // window that surfaced moments ago whose event callback has not been delivered
             // yet - which is precisely the window this command would otherwise report
             // success over.
-            var exposure = _owned.CertifyExposure();
+            ManagedEtabsExposureEvidence exposure;
+            try
+            {
+                exposure = _owned.CertifyExposure();
+            }
+            catch (Exception censusFailure)
+            {
+                // FAIL CLOSED. The census is the visibility authority; if it could not run,
+                // the session's on-screen state at this instant is unknown, and "unknown"
+                // must never be spent as "clean". Failing the request alone would leave the
+                // same uncertified session ready to serve the next background command -
+                // possibly in front of the engineer - which is the identical
+                // uncertain-session class that already makes a failed reveal terminal.
+                //
+                // Every exception is caught on purpose. This is the last gate before a
+                // response leaves the daemon, and there is no exception type whose arrival
+                // here would make reusing the session safe.
+                return EndUncertainSession(
+                    _owned,
+                    EtabsApiDiagnosticFormatter.Bounded(string.Join(
+                        "; ",
+                        ManagedEtabsWindowErrorCodes.ExposureNotCertified,
+                        $"ownedPid={_owned.Identity.Pid}",
+                        EtabsApiDiagnosticFormatter.InfrastructureException(
+                            "ManagedEtabsWindowGuard.CertifyExposure",
+                            censusFailure),
+                        "the visibility authority could not certify the session's final " +
+                        "on-screen state; this request is failed and the session has been " +
+                        "ended rather than reused")));
+            }
+
             if (!exposure.Observed)
             {
                 return Result.Ok();
             }
 
-            var owned = _owned;
-            var cleanup = _shutdownMachine.Shutdown(owned);
-            _shutdownResult = cleanup;
-            if (cleanup.Data.ProcessExitConfirmed)
-            {
-                _owned = null;
-            }
-
-            _ready = false;
-            return Result.Fail(WithTerminalFacts(
+            return EndUncertainSession(
+                _owned,
                 EtabsApiDiagnosticFormatter.AppendTerminalFacts(
                     exposure.Describe(),
                     "the managed ETABS session was materially on screen during background " +
                     "work the engineer did not ask to see; this request is failed and the " +
-                    "session has been ended"),
-                cleanup));
+                    "session has been ended"));
         }
     }
 
@@ -562,7 +587,7 @@ public sealed class EtabsSession : IEtabsSession
             var csi = owned.ApplyCsiUnhideForExplicitUserAction();
             if (!csi.Issued)
             {
-                return FailRevealTerminally(
+                return EndUncertainSession(
                     owned,
                     EtabsApiDiagnosticFormatter.AppendTerminalFacts(
                         csi.Diagnostic ?? "cOAPI.Unhide could not be issued.",
@@ -575,7 +600,7 @@ public sealed class EtabsSession : IEtabsSession
             var windows = owned.ConfirmWindowsRevealed();
             if (!windows.Confirmed)
             {
-                return FailRevealTerminally(
+                return EndUncertainSession(
                     owned,
                     EtabsApiDiagnosticFormatter.AppendTerminalFacts(
                         windows.Diagnostic

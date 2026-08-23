@@ -1,4 +1,5 @@
 ﻿using EtabExtension.CLI.Shared.Infrastructure.Etabs;
+using EtabExtension.CLI.Shared.Common;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Session;
 using EtabSharp.Core;
 using Xunit;
@@ -1344,6 +1345,110 @@ public sealed class ManagedSessionTests
     }
 
     /// <summary>
+    /// A census that cannot RUN is not a clean census.
+    ///
+    /// <para>The forced observation is a Win32 enumeration and it can fail. Failing only
+    /// the request would leave this same session ready, with its final on-screen state
+    /// never established, to serve the next background command - possibly in front of the
+    /// engineer. "Unknown" is not spendable as "clean", so the session ends, exactly as it
+    /// does for a reveal that could not be confirmed.</para>
+    /// </summary>
+    [Fact]
+    public void ACensusThatCannotRunFailsTheRequestAndEndsTheSession()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        Assert.True(fixture.Session.IsStarted);
+
+        fixture.Managed.CertifyExposureException =
+            new InvalidOperationException("EnumWindows failed: 0x5");
+
+        var certified = fixture.Session.CertifyNoUnconsentedExposure();
+
+        Assert.False(certified.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.ExposureNotCertified,
+            certified.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("EnumWindows failed", certified.Error, StringComparison.Ordinal);
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// And it does not propagate. The envelope calls this as its last act before a response
+    /// leaves the daemon; an exception escaping here would replace whatever the command
+    /// itself reported, losing the failure the engineer actually asked about.
+    /// </summary>
+    [Fact]
+    public void ACensusFailureIsReportedAsAResultRatherThanThrown()
+    {
+        var fixture = VisibilityFixture.Create();
+        fixture.Session.GetOrStartOwned();
+        fixture.Managed.CertifyExposureException = new InvalidOperationException("boom");
+
+        var certified = fixture.Session.CertifyNoUnconsentedExposure();
+
+        Assert.False(certified.Success);
+    }
+
+    /// <summary>
+    /// End to end through the envelope, case 1: the work SUCCEEDED and the final census
+    /// could not run. The successful result must not reach the caller, and the session must
+    /// be gone.
+    /// </summary>
+    [Fact]
+    public async Task SuccessfulWorkWhoseFinalCensusFailsIsFailedAndEndsTheSession()
+    {
+        var fixture = VisibilityFixture.Create();
+        var envelope = WorkEnvelopeFixtures.Consented(fixture.Session);
+
+        var returned = await envelope.RunAsync(envelope.Capture("snapshot-export"), () =>
+        {
+            fixture.Session.GetOrStartOwned();
+            fixture.Managed.CertifyExposureException =
+                new InvalidOperationException("EnumWindows failed: 0x5");
+            return Task.FromResult<object>(Result.Ok());
+        });
+
+        var result = Assert.IsType<Result>(returned, exactMatch: false);
+        Assert.False(result.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.ExposureNotCertified,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
+    /// Case 2: the work THREW and the final census could not run either. Both facts have to
+    /// survive - the command failure is what the engineer asked about, the certification
+    /// failure is why the session is gone - and the session must still be terminal.
+    /// </summary>
+    [Fact]
+    public async Task WorkThatThrewAndACensusThatFailedBothSurviveAndTheSessionEnds()
+    {
+        var fixture = VisibilityFixture.Create();
+        var envelope = WorkEnvelopeFixtures.Consented(fixture.Session);
+
+        var returned = await envelope.RunAsync(envelope.Capture("extract-results"), () =>
+        {
+            fixture.Session.GetOrStartOwned();
+            fixture.Managed.CertifyExposureException =
+                new InvalidOperationException("EnumWindows failed: 0x5");
+            throw new InvalidOperationException("cSapModel.Results.BaseReact returned 1");
+        });
+
+        var result = Assert.IsType<Result>(returned, exactMatch: false);
+        Assert.False(result.Success);
+        Assert.Contains(
+            ManagedEtabsWindowErrorCodes.ExposureNotCertified,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("BaseReact returned 1", result.Error, StringComparison.Ordinal);
+        Assert.False(fixture.Session.IsStarted);
+    }
+
+    /// <summary>
     /// The certification must FORCE a census, not read the accumulated evidence.
     ///
     /// <para>The window surfaced moments ago and its event callback has not been delivered
@@ -1911,9 +2016,20 @@ public sealed class ManagedSessionTests
 
         public int CertifyExposureCalls { get; private set; }
 
+        /// <summary>
+        /// Makes the forced final census fail, as a Win32 enumeration genuinely can. The
+        /// certification must treat "I could not look" as a failure, never as "clean".
+        /// </summary>
+        public Exception? CertifyExposureException { get; set; }
+
         public ManagedEtabsExposureEvidence CertifyExposure()
         {
             CertifyExposureCalls++;
+            if (CertifyExposureException is { } failure)
+            {
+                throw failure;
+            }
+
             if (UndeliveredObservation is { } pending)
             {
                 Exposure = pending;
