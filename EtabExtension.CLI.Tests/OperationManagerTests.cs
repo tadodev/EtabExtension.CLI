@@ -188,6 +188,119 @@ public sealed class OperationManagerTests : IDisposable
         Assert.Equal(ApartmentState.STA, apartment);
     }
 
+    /// <summary>
+    /// THE deferred-consent property, proven against the real queue rather than a fixture
+    /// that keeps the request alive forever.
+    ///
+    /// <para>The STA worker is deliberately occupied first, so the queued operation cannot
+    /// begin until after the request that accepted it has ENDED. That is the ordering the
+    /// daemon actually produces - <c>start-operation</c> answers with an id immediately,
+    /// the serve loop closes the request scope, and the work begins afterwards - and it is
+    /// the ordering under which reading the ambient scope at execution time yields
+    /// <c>Unspecified</c> for a cold start the engineer did consent to.</para>
+    /// </summary>
+    [Fact]
+    public async Task AQueuedOperationKeepsTheConsentItWasAcceptedWithAfterItsRequestEnded()
+    {
+        var declared = new ManagedEtabsStartIntentScope();
+        var execution = new EtabsWorkScope();
+        var envelope = WorkEnvelopeFixtures.Over(
+            new NullVisibilitySession(),
+            declared,
+            execution);
+
+        var seen = ManagedEtabsStartIntent.VisibleByConsent;
+        var worker = new StaExecutionWorker();
+        _manager = new OperationManager(
+            worker,
+            new OperationEventJournalFactory(_directory, memoryCapacity: 4),
+            new SystemOperationClock(),
+            envelope,
+            [new DelegateOperation("deferred", (_, _) =>
+            {
+                seen = execution.Current.StartIntent;
+                return Task.FromResult<object>(Result.Ok());
+            })]);
+
+        // Occupy the single STA thread so the operation cannot start yet.
+        var occupied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var released = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blocker = worker.ExecuteAsync(async () =>
+        {
+            occupied.SetResult();
+            await released.Task;
+            return true;
+        });
+        await occupied.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Result<StartOperationData> started;
+        using (declared.Publish(ManagedEtabsStartIntent.VisibleByConsent))
+        {
+            started = _manager.Start("deferred", EmptyPayload());
+        }
+
+        // The request is over before the work has run a single line.
+        Assert.Equal(ManagedEtabsStartIntent.Unspecified, declared.Current);
+        released.SetResult();
+        _ = await blocker;
+        _ = await _manager.WaitAsync(
+            started.Data!.OperationId,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(ManagedEtabsStartIntent.VisibleByConsent, seen);
+    }
+
+    /// <summary>
+    /// And an operation accepted WITHOUT a declaration does not acquire one from a later
+    /// request that happens to be in flight while it runs. Polling for status during a long
+    /// analysis is exactly this shape.
+    /// </summary>
+    [Fact]
+    public async Task AQueuedOperationCannotBorrowConsentFromALaterRequest()
+    {
+        var declared = new ManagedEtabsStartIntentScope();
+        var execution = new EtabsWorkScope();
+        var envelope = WorkEnvelopeFixtures.Over(
+            new NullVisibilitySession(),
+            declared,
+            execution);
+
+        var seen = ManagedEtabsStartIntent.VisibleByConsent;
+        var running = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _manager = CreateManagerWith(envelope, new DelegateOperation("deferred", async (_, _) =>
+        {
+            running.SetResult();
+            await release.Task;
+            seen = execution.Current.StartIntent;
+            return Result.Ok();
+        }));
+
+        // Accepted with nothing declared.
+        var started = _manager.Start("deferred", EmptyPayload());
+        await running.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        // A later request declares consent while the operation is still running.
+        using (declared.Publish(ManagedEtabsStartIntent.VisibleByConsent))
+        {
+            release.SetResult();
+            _ = await _manager.WaitAsync(
+                started.Data!.OperationId,
+                TestContext.Current.CancellationToken);
+        }
+
+        Assert.Equal(ManagedEtabsStartIntent.Unspecified, seen);
+    }
+
+    private OperationManager CreateManagerWith(
+        IEtabsWorkEnvelope envelope,
+        IOperationDefinition definition) => new(
+        new StaExecutionWorker(),
+        new OperationEventJournalFactory(_directory, memoryCapacity: 4),
+        new SystemOperationClock(),
+        envelope,
+        [definition]);
+
     private OperationManager CreateManager(
         IOperationDefinition definition,
         IOperationClock? clock = null,
