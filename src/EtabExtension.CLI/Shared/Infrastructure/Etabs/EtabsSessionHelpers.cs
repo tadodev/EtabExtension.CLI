@@ -3,6 +3,7 @@ using EtabExtension.CLI.Features.ExtractResults.Models;
 using EtabExtension.CLI.Features.ExtractResults.Tables;
 using EtabExtension.CLI.Features.RunAnalysis.Models;
 using EtabExtension.CLI.Shared.Common;
+using EtabExtension.CLI.Shared.Infrastructure.Etabs.Analysis;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Metadata;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Table;
 using EtabExtension.CLI.Shared.Infrastructure.Etabs.Unit;
@@ -10,7 +11,6 @@ using EtabExtension.CLI.Shared.Infrastructure.Parquet;
 using EtabSharp.Core;
 using EtabSharp.System.Models;
 using ETABSv1;
-using System.Diagnostics;
 
 namespace EtabExtension.CLI.Shared.Infrastructure.Etabs;
 
@@ -53,6 +53,11 @@ internal static class EtabsSessionHelpers
         return unitSnapshot;
     }
 
+    /// <summary>
+    /// Runs analysis on an already-open model through the one shared
+    /// <see cref="AnalysisRunner"/>, so the selection and the success verdict cannot
+    /// drift from the standalone <c>run-analysis</c> command's.
+    /// </summary>
     internal static async Task<Result<RunAnalysisData>> RunAnalysisOnOpenModelAsync(
         ETABSApplication app,
         string filePath,
@@ -61,104 +66,14 @@ internal static class EtabsSessionHelpers
     {
         await Task.CompletedTask;
 
-        var hasSpecificCases = cases is { Count: > 0 };
-        var stopwatch = Stopwatch.StartNew();
-
         if (app.Model.ModelInfo.IsLocked())
         {
             Console.Error.WriteLine("ℹ Clearing analysis lock...");
             app.Model.ModelInfo.SetLocked(false);
         }
 
-        if (hasSpecificCases)
-        {
-            app.Model.Analyze.SetRunCaseFlag(caseName: string.Empty, run: false, all: true);
-            Console.Error.WriteLine("ℹ Set all cases to skip");
-
-            var notFound = new List<string>();
-            foreach (var caseName in cases!)
-            {
-                try
-                {
-                    app.Model.Analyze.SetRunCaseFlag(caseName: caseName, run: true, all: false);
-                    Console.Error.WriteLine($"  ✓ '{caseName}' set to run");
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"  ⚠ '{caseName}' not found: {ex.Message}");
-                    notFound.Add(caseName);
-                }
-            }
-
-            if (notFound.Count == cases!.Count)
-            {
-                return Result.Fail<RunAnalysisData>(
-                    $"None of the requested cases were found: {string.Join(", ", notFound)}");
-            }
-        }
-        else
-        {
-            Console.Error.WriteLine("ℹ Running all cases (default)");
-        }
-
-        Console.Error.WriteLine("ℹ Running analysis...");
-
-        int analysisRet = hasSpecificCases
-            ? RunSpecificCases(app)
-            : app.Model.Analyze.RunCompleteAnalysis();
-
-        stopwatch.Stop();
-
-        if (analysisRet != 0)
-        {
-            return Result.Fail<RunAnalysisData>($"Analysis failed (ret={analysisRet})")
-                with
-            {
-                Data = new RunAnalysisData
-                {
-                    FilePath = filePath,
-                    CasesRequested = hasSpecificCases ? cases : null,
-                    AnalysisTimeMs = stopwatch.ElapsedMilliseconds
-                }
-            };
-        }
-
-        var caseStatuses = app.Model.Analyze.GetCaseStatus();
-        var finishedCount = caseStatuses.Count(cs => cs.IsFinished);
-
-        Console.Error.WriteLine(
-            $"✓ Analysis complete ({caseStatuses.Count} cases, {finishedCount} finished, {stopwatch.ElapsedMilliseconds} ms)");
-
-        if (finishedCount == 0)
-        {
-            return Result.Fail<RunAnalysisData>(
-                "Analysis completed, but no cases were marked finished. Check ETABS run-case selections.")
-                with
-            {
-                Data = new RunAnalysisData
-                {
-                    FilePath = filePath,
-                    CasesRequested = hasSpecificCases ? cases : null,
-                    CaseCount = caseStatuses.Count,
-                    FinishedCaseCount = finishedCount,
-                    AnalysisTimeMs = stopwatch.ElapsedMilliseconds,
-                    Units = unitSnapshot.Active
-                }
-            };
-        }
-
-        Console.Error.WriteLine(
-            "ℹ Results written to sidecar files — skipping SaveFile() to preserve them");
-
-        return Result.Ok(new RunAnalysisData
-        {
-            FilePath = filePath,
-            CasesRequested = hasSpecificCases ? cases : null,
-            CaseCount = caseStatuses.Count,
-            FinishedCaseCount = finishedCount,
-            AnalysisTimeMs = stopwatch.ElapsedMilliseconds,
-            Units = unitSnapshot.Active
-        });
+        return AnalysisRunner.Run(
+            new EtabsAnalysisApi(app), filePath, cases, unitSnapshot.Active);
     }
 
     internal static async Task<Dictionary<string, TableExtractionOutcome>> ExtractTablesOnOpenModelAsync(
@@ -270,12 +185,6 @@ internal static class EtabsSessionHelpers
             _warnings ??= [];
             return _warnings;
         }
-    }
-
-    private static int RunSpecificCases(ETABSApplication app)
-    {
-        app.SapModel.Analyze.CreateAnalysisModel();
-        return app.SapModel.Analyze.RunAnalysis();
     }
 
     private static List<LoadPatternInfo> ReadLoadPatterns(ETABSApplication app)

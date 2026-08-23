@@ -161,6 +161,10 @@ Returns `RunAnalysisData`:
   "casesRequested": ["DEAD"],
   "caseCount": 12,
   "finishedCaseCount": 12,
+  "casesRun": ["DEAD"],
+  "casesRunFinishedCount": 1,
+  "casesNotFinished": [],
+  "casesNotInModel": [],
   "analysisTimeMs": 90000,
   "units": {
     "force": "kip",
@@ -169,6 +173,18 @@ Returns `RunAnalysisData`:
   }
 }
 ```
+
+A default run (no `--cases`) explicitly RESTORES the all-cases selection before
+analysing, so it never inherits the narrowed selection an earlier `--cases`
+request left behind on a long-lived `serve` session. A `--cases` run establishes
+its selection outright — selecting what it asked for and deselecting the rest.
+Either way the selection is read back from the model before anything runs, and
+`casesRun` reports what the model actually held.
+
+Success is judged against `casesRun` alone. `finishedCaseCount` is a fact about
+the whole model, including results left over from earlier runs, and cannot carry
+a run: if a requested case does not finish, the command fails and names it in
+`casesNotFinished`.
 
 ### `extract-results`
 
