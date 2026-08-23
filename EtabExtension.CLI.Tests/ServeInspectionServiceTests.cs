@@ -231,6 +231,77 @@ public sealed class ServeInspectionServiceTests : IDisposable
     }
 
     /// <summary>
+    /// The transient-probe path. GetWall refuses, the diagnosis re-probes, and this time it
+    /// succeeds.
+    ///
+    /// <para>Reporting that as a wall would be answering from evidence the first probe
+    /// contradicts; reporting it as "every probe failed and the census failed too" would be
+    /// describing a run that did not happen - the census was never even reached. Both are
+    /// false accounts, so the answer is that the evidence contradicted itself.</para>
+    /// </summary>
+    [Fact]
+    public void AProbeThatRefusesThenSucceedsIsReportedAsContradictoryNotAsAWall()
+    {
+        var api = new FakeInspectionApi { GetWallRefusesOnlyOnce = true };
+
+        var result = _service.InspectWallProperty(api, "Flickering");
+
+        Assert.False(result.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyClassificationFailed,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("inconsistent answers", result.Error, StringComparison.Ordinal);
+
+        // It must not claim probes and census failed - the census was never reached.
+        Assert.DoesNotContain(
+            "census did not succeed",
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "refused every classification probe",
+            result.Error,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The disagreeing-census path. The shell census advertised this name; the
+    /// all-properties census then succeeded and denied it exists.
+    ///
+    /// <para>The listing must not report that as "the census did not succeed" - it did - and
+    /// must not report NOT_FOUND for a name ETABS itself just handed over. It reports the
+    /// disagreement.</para>
+    /// </summary>
+    [Fact]
+    public void CensusesThatDisagreeAreReportedAsInconsistentEvidence()
+    {
+        var api = new FakeInspectionApi
+        {
+            ShellPropertyNames = ["W20_C6", "Ghost"],
+            WallNames = new(StringComparer.Ordinal) { "W20_C6" },
+            CensusesDisagree = true
+        };
+
+        var result = _service.ListWallProperties(api);
+
+        Assert.False(result.Success);
+        Assert.Contains(
+            InspectionErrorCodes.AreaPropertyClassificationFailed,
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("name=Ghost", result.Error, StringComparison.Ordinal);
+        Assert.Contains("disagree", result.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "census did not succeed",
+            result.Error,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            InspectionErrorCodes.AreaPropertyNotFound,
+            result.Error,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// The listing's diagnostic is held to the same standard: the shell it could not
     /// classify demonstrably exists, so the message must not blame the census.
     /// </summary>
@@ -529,10 +600,21 @@ public sealed class ServeInspectionServiceTests : IDisposable
 
         public List<string> GetWallCalls { get; } = [];
 
+        /// <summary>
+        /// Makes the FIRST GetWall refuse and every later one accept, reproducing a
+        /// transient CSI failure inside a single request.
+        /// </summary>
+        public bool GetWallRefusesOnlyOnce { get; init; }
+
         public int GetWall(string name, out RawWallProperty property)
         {
             GetWallCalls.Add(name);
             property = Wall;
+            if (GetWallRefusesOnlyOnce)
+            {
+                return GetWallCalls.Count == 1 ? 1 : 0;
+            }
+
             if (WallNames.Count > 0)
             {
                 return WallNames.Contains(name) ? 0 : 1;
@@ -540,6 +622,13 @@ public sealed class ServeInspectionServiceTests : IDisposable
 
             return GetWallReturnCode;
         }
+
+        /// <summary>
+        /// Lets the two censuses disagree: the SHELL list advertises a name that the
+        /// ALL-properties list then denies. One of them is wrong and the service cannot
+        /// know which.
+        /// </summary>
+        public bool CensusesDisagree { get; init; }
 
         /// <summary>Names cPropArea.GetSlab accepts.</summary>
         public HashSet<string> SlabNames { get; init; } = new(StringComparer.Ordinal);
@@ -559,7 +648,7 @@ public sealed class ServeInspectionServiceTests : IDisposable
 
         public int GetAllAreaPropertyNames(out string[] names)
         {
-            names = [.. DefinedAreaProperties];
+            names = CensusesDisagree ? [] : [.. DefinedAreaProperties];
             return AreaPropertyCensusReturnCode;
         }
 
