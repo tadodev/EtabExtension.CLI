@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - validation/alpha-22-visibility
+  pull_request:
+    branches:
+      - feat/alpha-22-intent-aware-visibility
 
 permissions:
   contents: read
